@@ -207,13 +207,8 @@ static void CCGQLThumbAsync(NSString *path, NSString *name, NSIndexPath *ip, __w
                 dispatch_async(dispatch_get_main_queue(), ^{
                     @try {
                         CCGBrowserViewController *s = wself;
-                        if (!s || !s->_cv || s->_thumbs == nil) return;
-                        [s->_thumbs setObject:img forKey:name];
-                        if ([s->_cv cellForItemAtIndexPath:ip]) {
-                            UICollectionViewCell *cell = [s->_cv cellForItemAtIndexPath:ip];
-                            UIImageView *iv = (UIImageView *)[cell viewWithTag:930];
-                            [iv setImage:img];
-                        }
+                        if (!s) return;
+                        [s qlGotThumb:img forName:name atIp:ip];
                     } @catch (id e) {}
                 });
             } @catch (id e) { CCGDbg(@"QL: completion exception"); }
@@ -259,6 +254,7 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 - (void)closeTapped;
 - (void)importTapped;
 - (void)reloadFiles;
+- (void)qlGotThumb:(UIImage *)img forName:(NSString *)name atIp:(NSIndexPath *)ip;
 @end
 
 @implementation CCGBrowserViewController
@@ -450,6 +446,20 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 - (void)recordTap:(UITapGestureRecognizer *)g {
     _lastTapPt = [g locationInView:_cv];
     _lastTapAt = CFAbsoluteTimeGetCurrent();
+}
+
+// QuickLook 异步回调: 缓存缩略图并就地刷新可见 cell
+- (void)qlGotThumb:(UIImage *)img forName:(NSString *)name atIp:(NSIndexPath *)ip {
+    @try {
+        if (!img || !_cv || _thumbs == nil) return;
+        [_thumbs setObject:img forKey:name];
+        [_qlPending removeObject:name];
+        UICollectionViewCell *cell = [_cv cellForItemAtIndexPath:ip];
+        if (cell) {
+            UIImageView *iv = (UIImageView *)[cell viewWithTag:930];
+            [iv setImage:img];
+        }
+    } @catch (id e) {}
 }
 
 - (void)longPressTapped:(UILongPressGestureRecognizer *)lp {
