@@ -1,0 +1,887 @@
+/**
+ * CCAudioPlayPres — 网格素材库 loader
+ *
+ * 原理: 本二进制替换偏好设置 bundle 的主程序(CFBundleExecutable),
+ *       +load 时 dlopen 同目录下的 CCAudioPlayPresCore(原二进制),
+ *       原有全部设置逻辑(滑条/颜色/遮罩/3x2 自定义...)原样保留;
+ *       仅 swizzle CCAssetCell 的 -selectExistingAsset,
+ *       把图一那种列表式 SandboxFileBrowser 换成图二那种网格素材库:
+ *       三列网格 + GIF/视频 角标 + 名字胶囊 + 选中圆点,
+ *       长按进入抖动编辑态(红-删除 + 点名字行内改名), 右上角导入(相册/文件)。
+ *
+ * 与原 CCAssetCell 的对接(与旧 SandboxFileBrowser 完全一致的委托调用):
+ *   选中: fileBrowser:didSelectFilePath:fileName:
+ *   取消: fileBrowserDidCancel:
+ *   删除: fileBrowser:deleteFileName:filePath:     (本 UI 先删文件再回调)
+ *   改名: fileBrowser:renameNewFileName:oldFileName:filePath: (本 UI 先 move 再回调)
+ * 存储逻辑(写 plist/发 Darwin 通知/更新行文字)全部在 CCAssetCell 原实现里, 不做任何改动。
+ */
+
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <ImageIO/ImageIO.h>
+#import <dlfcn.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <pthread.h>
+
+#define CCG_SEL(s) sel_registerName(s)
+#define CCG_CLS(s) ((id)objc_getClass(s))
+static inline id CCG_MSG1(id o, SEL s, id a) { return ((id(*)(id, SEL, id))objc_msgSend)(o, s, a); }
+static inline id CCG_MSG0(id o, SEL s) { return ((id(*)(id, SEL))objc_msgSend)(o, s); }
+static inline BOOL CCG_RESP(id o, SEL s) { return ((BOOL(*)(id, SEL, SEL))objc_msgSend)(o, sel_registerName("respondsToSelector:"), s); }
+static inline CGRect CCGRect(double x, double y, double w, double h) { CGRect r = {x, y, w, h}; return r; }
+
+// 媒体扩展名分类
+static NSSet *CCGImageExts(void) {
+    static NSSet *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s = [NSSet setWithArray:@[@"png", @"jpg", @"jpeg", @"gif", @"webp", @"heic", @"bmp", @"tiff"]];
+    });
+    return s;
+}
+static NSSet *CCGVideoExts(void) {
+    static NSSet *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s = [NSSet setWithArray:@[@"mp4", @"mov", @"m4v"]];
+    });
+    return s;
+}
+
+// ---------- 缩略图 ----------
+static void *gImageIOLib = NULL;
+static void *fnCGSrcCreate = NULL, *fnCGSrcImg = NULL, *fnCGSrcCount = NULL;
+static void CCGEnsureLibs(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gImageIOLib = dlopen("/System/Library/Frameworks/ImageIO.framework/ImageIO", RTLD_LAZY);
+        if (gImageIOLib) {
+            fnCGSrcCreate = dlsym(gImageIOLib, "CGImageSourceCreateWithData");
+            fnCGSrcImg = dlsym(gImageIOLib, "CGImageSourceCreateImageAtIndex");
+            fnCGSrcCount = dlsym(gImageIOLib, "CGImageSourceGetCount");
+        }
+    });
+}
+
+static UIImage *CCGThumbForPath(NSString *path) {
+    CCGEnsureLibs();
+    if (!path || !fnCGSrcCreate || !fnCGSrcImg) return nil;
+    NSString *ext = [[path pathExtension] lowercaseString];
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (!data) return nil;
+    CGImageSourceRef src = ((CGImageSourceRef(*)(CFDataRef, CFDictionaryRef))fnCGSrcCreate)((__bridge CFDataRef)data, NULL);
+    if (!src) return nil;
+    CGImageRef cg = ((CGImageRef(*)(CGImageSourceRef, size_t, CFDictionaryRef))fnCGSrcImg)(src, 0, NULL);
+    CFRelease(src);
+    if (!cg) return nil;
+    UIImage *img = [UIImage imageWithCGImage:cg];
+    CGImageRelease(cg);
+    return img;
+}
+
+static UIImage *CCGVideoThumbForPath(NSString *path) {
+    Class assetCls = objc_getClass("AVURLAsset");
+    Class genCls = objc_getClass("AVAssetImageGenerator");
+    if (!assetCls || !genCls) return nil;
+    NSURL *url = [NSURL fileURLWithPath:path];
+    id asset = ((id(*)(id, SEL, id, id))objc_msgSend)(assetCls, CCG_SEL("URLAssetWithURL:options:"), url, nil);
+    if (!asset) return nil;
+    id gen = ((id(*)(id, SEL, id))objc_msgSend)(genCls, CCG_SEL("assetImageGeneratorWithAsset:"), asset);
+    if (!gen) return nil;
+    ((void(*)(id, SEL, id))objc_msgSend)(gen, CCG_SEL("setAppliesPreferredTrackTransform:"), (id)kCFBooleanTrue);
+    // 手工构造 CMTime{value=0, timescale=1, flags=Valid, epoch=0}, 不引入 CoreMedia 链接依赖
+    typedef struct { long long value; int timescale; unsigned flags; long long epoch; } CCGTime;
+    CCGTime t; t.value = 0; t.timescale = 1; t.flags = 1; t.epoch = 0;
+    CGImageRef cg = ((CGImageRef(*)(id, SEL, CCGTime, void *))objc_msgSend)(gen, CCG_SEL("copyCGImageAtTime:actualTime:"), t, NULL);
+    if (!cg) return nil;
+    UIImage *img = [UIImage imageWithCGImage:cg];
+    CGImageRelease(cg);
+    return img;
+}
+
+// ---------- 编辑态 associated key ----------
+static const char kCCGDelKey = 0;   // 删除按钮手势 -> 文件名
+static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
+
+// ============ 网格素材库 ============
+@interface CCGBrowserViewController : UIViewController <UICollectionViewDataSource, UICollectionViewDelegate,
+                                                        UIImagePickerControllerDelegate, UINavigationControllerDelegate,
+                                                        UIDocumentPickerDelegate, UITextFieldDelegate>
+{
+    __weak id _cell;                 // CCAssetCell (SandboxFileBrowserDelegate)
+    NSString *_dir;                  // 当前目录
+    NSMutableArray *_files;          // 文件/目录名(仅末级)
+    NSMutableDictionary *_thumbs;    // 名字 -> UIImage
+    NSString *_selName;              // 当前选中素材名
+    UICollectionView *_cv;
+    // 导入暂存
+    id _pendImg;
+    NSURL *_pendURL;
+    BOOL _pendVideo;
+    // 编辑态
+    BOOL _editMode;
+    UILongPressGestureRecognizer *_editLP;
+    UITextField *_activeField;
+    NSString *_activeName;
+    id _activeCell;
+    id _activeLabel;
+    id _activeIp;
+    double _preKbdOY;
+    BOOL _isRoot;                    // 是否根目录(决定"关闭"行为)
+}
+- (instancetype)initWithCell:(id)cell directory:(NSString *)dir isRoot:(BOOL)root;
+- (void)closeTapped;
+- (void)importTapped;
+- (void)reloadFiles;
+@end
+
+@implementation CCGBrowserViewController
+
+- (instancetype)initWithCell:(id)cell directory:(NSString *)dir isRoot:(BOOL)root {
+    if ((self = [super initWithNibName:nil bundle:nil])) {
+        _cell = cell;
+        _dir = [dir copy];
+        _isRoot = root;
+        _files = [NSMutableArray array];
+        _thumbs = [NSMutableDictionary dictionary];
+    }
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    [self setTitle:@"素材库"];
+    [self view].backgroundColor = [UIColor colorWithWhite:0.94 alpha:1.0];
+
+    UIBarButtonItem *close = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain
+                                                             target:self action:@selector(closeTapped)];
+    [self navigationItem].leftBarButtonItem = close;
+    UIBarButtonItem *imp = [[UIBarButtonItem alloc] initWithTitle:@"导入" style:UIBarButtonItemStylePlain
+                                                           target:self action:@selector(importTapped)];
+    [self navigationItem].rightBarButtonItem = imp;
+
+    // 当前选中素材名
+    @try {
+        id c = _cell;
+        if (c && [c respondsToSelector:@selector(Key)] && [c respondsToSelector:@selector(assetNameWithKey:)]) {
+            _selName = [c assetNameWithKey:[c Key]];
+        }
+    } @catch (id e) { _selName = nil; }
+
+    UICollectionViewFlowLayout *flow = [[UICollectionViewFlowLayout alloc] init];
+    [flow setMinimumInteritemSpacing:0];
+    [flow setMinimumLineSpacing:0];
+    [flow setSectionInset:UIEdgeInsetsMake(14, 16, 70, 16)];
+    CGRect sb = [UIScreen mainScreen].bounds;
+    double iw = (sb.size.width - 32.0) / 3.0;
+    double ih = (iw - 12.0) + 56.0;
+    [flow setItemSize:CGSizeMake(iw, ih)];
+
+    _cv = [[UICollectionView alloc] initWithFrame:[self view].bounds collectionViewLayout:flow];
+    [_cv setBackgroundColor:[UIColor clearColor]];
+    [_cv setDelegate:self];
+    [_cv setDataSource:self];
+    [_cv setAlwaysBounceVertical:YES];
+    [_cv setAutoresizingMask:UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight];
+    [_cv registerClass:[UICollectionViewCell class] forCellWithReuseIdentifier:@"ccgm"];
+    _editLP = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(longPressTapped:)];
+    [_editLP setMinimumPressDuration:0.4];
+    [_cv addGestureRecognizer:_editLP];
+    [[self view] addSubview:_cv];
+
+    [self reloadFiles];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(kbdWillShow:) name:UIKeyboardWillShowNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(kbdDidShow:) name:UIKeyboardDidShowNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(kbdWillHide:) name:UIKeyboardWillHideNotification object:nil];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    if (!_cv) return;
+    // 兜底: 任何宽度下保证一行恰好 3 个
+    UICollectionViewFlowLayout *fl = (UICollectionViewFlowLayout *)_cv.collectionViewLayout;
+    double want = (_cv.bounds.size.width - 32.0) / 3.0;
+    if (want > 1.0 && fabs(fl.itemSize.width - want) > 1.0) {
+        [fl setItemSize:CGSizeMake(want, (want - 12.0) + 56.0)];
+        [fl setMinimumInteritemSpacing:0];
+        [fl setMinimumLineSpacing:0];
+        [fl setSectionInset:UIEdgeInsetsMake(14, 16, 70, 16)];
+        [fl invalidateLayout];
+    }
+}
+
+// ---------- 数据 ----------
+- (void)reloadFiles {
+    [self reloadFiles:NO];
+}
+
+- (void)reloadFiles:(BOOL)keepThumbs {
+    NSMutableArray *arr = [NSMutableArray array];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *all = [fm contentsOfDirectoryAtPath:_dir error:nil];
+    for (NSString *nm in all) {
+        if (!nm || [nm hasPrefix:@"."]) continue;
+        NSString *full = [_dir stringByAppendingPathComponent:nm];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:full isDirectory:&isDir] && isDir) {
+            [arr addObject:nm];
+            continue;
+        }
+        NSString *ext = [[nm pathExtension] lowercaseString];
+        if ([CCGImageExts() containsObject:ext] || [CCGVideoExts() containsObject:ext]) {
+            [arr addObject:nm];
+        }
+    }
+    [arr sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    if (!keepThumbs) {
+        // 丢弃已不存在的缩略图
+        NSArray *keys = [_thumbs allKeys];
+        for (NSString *k in keys) {
+            if (![arr containsObject:k]) [_thumbs removeObjectForKey:k];
+        }
+    }
+    _files = arr;
+    NSString *cnt = [NSString stringWithFormat:@"素材库 (%lu)", (unsigned long)[_files count]];
+    if (_editMode) cnt = @"长按完成退出";
+    [self setTitle:cnt];
+    [_cv reloadData];
+    if (_editMode) [self startJiggling];
+}
+
+- (NSInteger)collectionView:(UICollectionView *)cv numberOfItemsInSection:(NSInteger)s {
+    return (NSInteger)[_files count];
+}
+
+- (void)jiggleCard:(UIView *)card {
+    CABasicAnimation *anim = [CABasicAnimation animationWithKeyPath:@"transform.rotation"];
+    [anim setFromValue:@(-0.03)];
+    [anim setToValue:@(0.03)];
+    [anim setDuration:0.12];
+    [anim setAutoreverses:YES];
+    [anim setRepeatCount:100000];
+    [card.layer addAnimation:anim forKey:@"ccgJiggle"];
+}
+
+- (void)startJiggling {
+    for (UICollectionViewCell *c in [_cv visibleCells]) {
+        UIView *card = [c viewWithTag:911];
+        if (card) [self jiggleCard:card];
+    }
+}
+
+- (void)stopJiggling {
+    for (UICollectionViewCell *c in [_cv visibleCells]) {
+        UIView *card = [c viewWithTag:911];
+        if (card) [card.layer removeAnimationForKey:@"ccgJiggle"];
+    }
+}
+
+- (void)enterEditing {
+    if (_editMode) return;
+    _editMode = YES;
+    [self setTitle:@"长按完成退出"];
+    UIBarButtonItem *done = [[UIBarButtonItem alloc] initWithTitle:@"完成" style:UIBarButtonItemStylePlain
+                                                            target:self action:@selector(exitEditing)];
+    [self navigationItem].rightBarButtonItem = done;
+    [_editLP setEnabled:NO]; // 编辑态禁用长按, 防抢占删除钮点击
+    [_cv reloadData];
+    [self startJiggling];
+}
+
+- (void)exitEditing {
+    if (!_editMode) return;
+    if (_activeField) [_activeField resignFirstResponder];
+    [self stopJiggling];
+    _editMode = NO;
+    [_editLP setEnabled:YES];
+    UIBarButtonItem *imp = [[UIBarButtonItem alloc] initWithTitle:@"导入" style:UIBarButtonItemStylePlain
+                                                           target:self action:@selector(importTapped)];
+    [self navigationItem].rightBarButtonItem = imp;
+    [self setTitle:[NSString stringWithFormat:@"素材库 (%lu)", (unsigned long)[_files count]]];
+    [_cv reloadData];
+}
+
+- (void)longPressTapped:(UILongPressGestureRecognizer *)lp {
+    if ([lp state] != UIGestureRecognizerStateBegan) return;
+    CGPoint p = [lp locationInView:_cv];
+    NSIndexPath *ip = [_cv indexPathForItemAtPoint:p];
+    if (!ip) return;
+    NSInteger row = [ip item];
+    if (row >= (NSInteger)[_files count]) return;
+    [self enterEditing];
+}
+
+- (void)delBtnTapped:(UITapGestureRecognizer *)g {
+    NSString *name = objc_getAssociatedObject(g, &kCCGDelKey);
+    if (name) [self confirmDelete:name];
+}
+
+- (void)nameTapped:(UITapGestureRecognizer *)g {
+    NSString *name = objc_getAssociatedObject(g, &kCCGNameKey);
+    if (!name) return;
+    UIView *pill = [g view];
+    UIView *contentV = [pill superview];
+    UICollectionViewCell *cell = (UICollectionViewCell *)[contentV superview];
+    if (!cell) return;
+    [self beginRename:name inCell:cell atPill:pill];
+}
+
+// ---------- cell ----------
+- (UICollectionViewCell *)collectionView:(UICollectionView *)cv cellForItemAtIndexPath:(NSIndexPath *)ip {
+    UICollectionViewCell *cell = [cv dequeueReusableCellWithReuseIdentifier:@"ccgm" forIndexPath:ip];
+    for (UIView *v in [cell contentView].subviews) [v removeFromSuperview];
+
+    NSInteger row = [ip item];
+    if (row >= (NSInteger)[_files count]) return cell;
+    NSString *name = [_files objectAtIndex:row];
+    NSString *full = [_dir stringByAppendingPathComponent:name];
+
+    BOOL isDir = NO;
+    [[NSFileManager defaultManager] fileExistsAtPath:full isDirectory:&isDir];
+
+    double w = [UIScreen mainScreen].bounds.size.width;
+    if (self.view.window) w = [self view].bounds.size.width;
+    double cardW = w / 3.0 - 12.0;
+    double imgH = cardW;
+
+    // 白色圆角卡片(不裁切, 让删除钮伸出右上角)
+    UIView *card = [[UIView alloc] initWithFrame:CCGRect(6, 0, cardW, imgH)];
+    [card setBackgroundColor:[UIColor whiteColor]];
+    [card setTag:911];
+    [card.layer setCornerRadius:14.0];
+
+    if (isDir) {
+        // 目录: 简单文件夹样式
+        UILabel *dirLabel = [[UILabel alloc] initWithFrame:card.bounds];
+        [dirLabel setText:@"📁"];
+        [dirLabel setTextAlignment:NSTextAlignmentCenter];
+        [dirLabel setFont:[UIFont systemFontOfSize:44.0]];
+        [dirLabel setBackgroundColor:[UIColor colorWithWhite:0.92 alpha:1.0]];
+        [dirLabel.layer setCornerRadius:14.0];
+        [dirLabel.layer setMasksToBounds:YES];
+        [card addSubview:dirLabel];
+        UILabel *badge = [[UILabel alloc] initWithFrame:CCGRect(6, 6, 34, 16)];
+        [badge setText:@"目录"];
+        [badge setFont:[UIFont systemFontOfSize:9.0]];
+        [badge setTextAlignment:NSTextAlignmentCenter];
+        [badge setBackgroundColor:[UIColor colorWithWhite:0.0 alpha:0.55]];
+        [badge setTextColor:[UIColor whiteColor]];
+        [badge.layer setCornerRadius:8.0];
+        [badge.layer setMasksToBounds:YES];
+        [card addSubview:badge];
+        [[cell contentView] addSubview:card];
+    } else {
+        NSString *ext = [[name pathExtension] lowercaseString];
+        BOOL isVideo = [CCGVideoExts() containsObject:ext];
+        BOOL isGif = [ext isEqualToString:@"gif"];
+        NSString *typeTag = isVideo ? @"视频" : (isGif ? @"GIF" : @"图片");
+
+        UIImage *thumb = [_thumbs objectForKey:name];
+        if (!thumb) {
+            thumb = isVideo ? CCGVideoThumbForPath(full) : CCGThumbForPath(full);
+            if (thumb) [_thumbs setObject:thumb forKey:name];
+        }
+        UIImageView *iv = [[UIImageView alloc] initWithFrame:CCGRect(0, 0, cardW, imgH)];
+        [iv setImage:thumb];
+        [iv setContentMode:UIViewContentModeScaleAspectFill];
+        [iv setBackgroundColor:[UIColor colorWithWhite:0.9 alpha:1.0]];
+        [iv.layer setCornerRadius:14.0];
+        [iv.layer setMasksToBounds:YES];
+        [card addSubview:iv];
+
+        // 左上角类型角标
+        UILabel *badge = [[UILabel alloc] initWithFrame:CCGRect(6, 6, 34, 16)];
+        [badge setText:typeTag];
+        [badge setFont:[UIFont systemFontOfSize:9.0]];
+        [badge setTextAlignment:NSTextAlignmentCenter];
+        [badge setBackgroundColor:[UIColor colorWithWhite:0.0 alpha:0.55]];
+        [badge setTextColor:[UIColor whiteColor]];
+        [badge.layer setCornerRadius:8.0];
+        [badge.layer setMasksToBounds:YES];
+        [card addSubview:badge];
+
+        // 视频左下角播放标志
+        if (isVideo) {
+            UIView *vb = [[UIView alloc] initWithFrame:CCGRect(6, imgH - 30, 24, 24)];
+            [vb setBackgroundColor:[UIColor colorWithWhite:0.0 alpha:0.45]];
+            [vb.layer setCornerRadius:12.0];
+            [vb.layer setMasksToBounds:YES];
+            UILabel *pl = [[UILabel alloc] initWithFrame:CCGRect(0, -1, 24, 24)];
+            [pl setText:@"▶"];
+            [pl setFont:[UIFont systemFontOfSize:11.0]];
+            [pl setTextAlignment:NSTextAlignmentCenter];
+            [pl setTextColor:[UIColor whiteColor]];
+            [vb addSubview:pl];
+            [card addSubview:vb];
+        }
+
+        // 编辑态删除钮
+        if (_editMode) {
+            UIButton *delv = [[UIButton alloc] initWithFrame:CCGRect(cardW - 14, -12, 26, 26)];
+            [delv setBackgroundColor:[UIColor redColor]];
+            [delv.layer setCornerRadius:13.0];
+            [delv.layer setMasksToBounds:YES];
+            [delv setTitle:@"-" forState:UIControlStateNormal];
+            [delv setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            [delv.titleLabel setFont:[UIFont boldSystemFontOfSize:19.0]];
+            [delv addTarget:self action:@selector(delBtnTapped:) forControlEvents:UIControlEventTouchUpInside];
+            [card addSubview:delv];
+            objc_setAssociatedObject(delv, &kCCGDelKey, name, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        [[cell contentView] addSubview:card];
+    }
+
+    if (_editMode) [self jiggleCard:card];
+
+    // 名字胶囊(点按 -> 行内改名)
+    UIView *pill = [[UIView alloc] initWithFrame:CCGRect(10, imgH + 7, cardW - 8, 22)];
+    [pill setBackgroundColor:[UIColor colorWithWhite:0.62 alpha:0.85]];
+    [pill.layer setCornerRadius:11.0];
+    [pill.layer setMasksToBounds:YES];
+    UILabel *plb = [[UILabel alloc] initWithFrame:CCGRect(0, 0, cardW - 8, 22)];
+    [plb setText:name];
+    [plb setFont:[UIFont systemFontOfSize:11.0]];
+    [plb setTextAlignment:NSTextAlignmentCenter];
+    [plb setTextColor:[UIColor whiteColor]];
+    [plb setTag:922];
+    [pill addSubview:plb];
+    [[cell contentView] addSubview:pill];
+    UITapGestureRecognizer *ng = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(nameTapped:)];
+    [pill addGestureRecognizer:ng];
+    objc_setAssociatedObject(ng, &kCCGNameKey, name, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    // 选中圆点(目录/编辑态不显示)
+    if (!_editMode && !isDir) {
+        BOOL on = NO;
+        if (_selName) {
+            on = [_selName isEqualToString:name] || [_selName isEqualToString:full]
+              || [_selName isEqualToString:[name stringByDeletingPathExtension]];
+        }
+        UIView *dot = [[UIView alloc] initWithFrame:CCGRect(6 + cardW / 2 - 9, imgH + 33, 18, 18)];
+        [dot.layer setCornerRadius:9.0];
+        [dot.layer setMasksToBounds:YES];
+        [dot setBackgroundColor:on ? [UIColor systemBlueColor] : [UIColor colorWithWhite:0.80 alpha:1.0]];
+        [[cell contentView] addSubview:dot];
+    }
+    return cell;
+}
+
+- (void)collectionView:(UICollectionView *)cv didSelectItemAtIndexPath:(NSIndexPath *)ip {
+    if (_editMode) return;
+    NSInteger row = [ip item];
+    if (row >= (NSInteger)[_files count]) return;
+    NSString *name = [_files objectAtIndex:row];
+    NSString *full = [_dir stringByAppendingPathComponent:name];
+    BOOL isDir = NO;
+    [[NSFileManager defaultManager] fileExistsAtPath:full isDirectory:&isDir];
+    if (isDir) {
+        // 子目录: 推入新浏览器(同一 delegate)
+        CCGBrowserViewController *sub = [[CCGBrowserViewController alloc] initWithCell:_cell directory:full isRoot:NO];
+        [[self navigationController] pushViewController:sub animated:YES];
+        return;
+    }
+    // 选择素材 -> 原细胞处理存储/通知/关闭
+    id d = _cell;
+    if (d && [d respondsToSelector:@selector(fileBrowser:didSelectFilePath:fileName:)]) {
+        ((void(*)(id, SEL, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:didSelectFilePath:fileName:"), self, full, name);
+    } else {
+        [self closeTapped];
+    }
+}
+
+// ---------- 删除 ----------
+- (void)confirmDelete:(NSString *)name {
+    NSString *full = [_dir stringByAppendingPathComponent:name];
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:@"删除素材"
+                                                                message:[NSString stringWithFormat:@"确定删除「%@」? 不可恢复", name]
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertAction *yes = [UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        [[NSFileManager defaultManager] removeItemAtPath:full error:nil];
+        [_thumbs removeObjectForKey:name];
+        // 原细胞: 若当前素材指向被删文件则清空存储并刷新行/发通知
+        id d = _cell;
+        if (d && [d respondsToSelector:@selector(fileBrowser:deleteFileName:filePath:)]) {
+            ((void(*)(id, SEL, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:deleteFileName:filePath:"), self, name, full);
+        }
+        [self reloadFiles];
+    }];
+    UIAlertAction *cc = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
+    [al addAction:yes];
+    [al addAction:cc];
+    [self presentViewController:al animated:YES completion:nil];
+}
+
+// ---------- 行内改名 ----------
+- (void)beginRename:(NSString *)name inCell:(id)cell atPill:(id)pill {
+    if (_activeField) [_activeField resignFirstResponder];
+    UILabel *lab = (UILabel *)[pill viewWithTag:922];
+    CGRect lf = [pill frame];
+    if (lab) [lab setHidden:YES];
+    _activeIp = [_cv indexPathForCell:(UICollectionViewCell *)cell];
+    _preKbdOY = _cv.contentOffset.y;
+    UITextField *tf = [[UITextField alloc] initWithFrame:lf];
+    [tf setText:name];
+    [tf setFont:[UIFont systemFontOfSize:11.0]];
+    [tf setTextAlignment:NSTextAlignmentCenter];
+    [tf setBorderStyle:UITextBorderStyleRoundedRect];
+    [tf setReturnKeyType:UIReturnKeyDone];
+    [tf setClearButtonMode:UITextFieldViewModeWhileEditing];
+    [tf setAutocapitalizationType:UITextAutocapitalizationTypeNone];
+    [tf setAutocorrectionType:UITextAutocorrectionTypeNo];
+    [tf setDelegate:self];
+    [tf setTag:955];
+    [[cell contentView] addSubview:tf];
+    _activeField = tf;
+    _activeName = name;
+    _activeCell = cell;
+    _activeLabel = lab;
+    [tf becomeFirstResponder];
+}
+
+- (double)kbdTargetOffsetForCell:(UIView *)cell kbH:(double)kbH {
+    CGRect fr = [cell frame];
+    CGRect cvb = [_cv bounds];
+    UIEdgeInsets ins = [_cv contentInset];
+    double want = fr.origin.y + fr.size.height + 46.0 - (cvb.size.height - kbH);
+    double st = [_cv safeAreaInsets].top;
+    if (want < -st) want = -st;
+    double maxOff = [_cv contentSize].height + ins.bottom - cvb.size.height;
+    if (maxOff < 0) maxOff = 0;
+    if (want > maxOff) want = maxOff;
+    return want;
+}
+
+- (void)kbdApplyInset:(double)kbH {
+    UIEdgeInsets ins = [_cv contentInset];
+    ins.bottom = kbH + 8.0;
+    [_cv setContentInset:ins];
+}
+
+- (double)clampOffsetY:(double)y {
+    double minOff = -[_cv safeAreaInsets].top;
+    double maxOff = [_cv contentSize].height - [_cv bounds].size.height;
+    if (maxOff < minOff) maxOff = minOff;
+    if (y < minOff) y = minOff;
+    if (y > maxOff) y = maxOff;
+    return y;
+}
+
+- (double)kbdHeightFromNote:(NSNotification *)n {
+    double kbH = 0;
+    NSDictionary *ui = [n userInfo];
+    if (ui) {
+        NSValue *kbv = [ui objectForKey:UIKeyboardFrameEndUserInfoKey];
+        if (kbv) kbH = [kbv CGRectValue].size.height;
+    }
+    return kbH;
+}
+
+- (void)kbdScrollToActive:(double)kbH {
+    if (kbH <= 0 || !_activeCell) return;
+    [self kbdApplyInset:kbH];
+    double offY = [self kbdTargetOffsetForCell:_activeCell kbH:kbH];
+    CGPoint pt = [_cv contentOffset];
+    pt.y = offY;
+    [_cv setContentOffset:pt animated:YES];
+}
+
+- (void)kbdWillShow:(NSNotification *)n {
+    if (!_activeIp) return;
+    @try { [self kbdScrollToActive:[self kbdHeightFromNote:n]]; } @catch (id e) {}
+}
+
+- (void)kbdDidShow:(NSNotification *)n {
+    if (!_activeIp) return;
+    @try { [self kbdScrollToActive:[self kbdHeightFromNote:n]]; } @catch (id e) {}
+}
+
+- (void)kbdWillHide:(NSNotification *)n {
+    @try {
+        UIEdgeInsets ins = [_cv contentInset];
+        ins.bottom = 0;
+        [_cv setContentInset:ins];
+        CGPoint rp = [_cv contentOffset];
+        rp.y = [self clampOffsetY:_preKbdOY];
+        [_cv setContentOffset:rp animated:NO];
+    } @catch (id e) {}
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField *)tf {
+    [tf resignFirstResponder];
+    return YES;
+}
+
+- (void)doRename:(NSString *)old to:(NSString *)newName {
+    if (!newName || [newName length] == 0) return;
+    newName = [[newName componentsSeparatedByString:@"/"] componentsJoinedByString:@"-"];
+    newName = [newName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (![newName length] || [newName isEqualToString:old]) return;
+    // 未带扩展名时补上原扩展名, 防止素材丢失类型
+    NSString *oldExt = [[old pathExtension] lowercaseString];
+    if ([newName pathExtension].length == 0 && [oldExt length] > 0) {
+        newName = [newName stringByAppendingPathExtension:oldExt];
+    }
+    NSString *src = [_dir stringByAppendingPathComponent:old];
+    NSString *dst = [_dir stringByAppendingPathComponent:newName];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:dst]) { [self showTip:@"已存在同名素材"]; return; }
+    NSError *err = nil;
+    if ([fm moveItemAtPath:src toPath:dst error:&err]) {
+        [_thumbs removeObjectForKey:old];
+        id d = _cell;
+        if (d && [d respondsToSelector:@selector(fileBrowser:renameNewFileName:oldFileName:filePath:)]) {
+            ((void(*)(id, SEL, id, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:renameNewFileName:oldFileName:filePath:"),
+                                                             self, newName, old, src);
+        }
+        [self reloadFiles];
+    } else {
+        [self showTip:err.localizedDescription ?: @"改名失败"];
+    }
+}
+
+- (void)textFieldDidEndEditing:(UITextField *)tf {
+    if (tf != _activeField) return;
+    NSString *old = _activeName;
+    NSString *nn = [tf text];
+    [tf removeFromSuperview];
+    @try {
+        CGPoint rp = [_cv contentOffset];
+        rp.y = [self clampOffsetY:_preKbdOY];
+        [_cv setContentOffset:rp animated:YES];
+    } @catch (id e) {}
+    _activeField = nil;
+    _activeName = nil;
+    _activeCell = nil;
+    _activeIp = nil;
+    if (_activeLabel) { [_activeLabel setHidden:NO]; _activeLabel = nil; }
+    if (old && nn && [nn length] > 0) [self doRename:old to:nn];
+}
+
+// ---------- 提示 ----------
+- (void)showTip:(NSString *)msg {
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:@"提示" message:msg preferredStyle:UIAlertControllerStyleAlert];
+    [al addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:al animated:YES completion:nil];
+}
+
+// ---------- 关闭 ----------
+- (void)closeTapped {
+    id d = _cell;
+    if (_isRoot) {
+        // 与旧 dismissBrowser 相同: 通知 delegate 取消, 由细胞关掉整个弹出层
+        if (d && [d respondsToSelector:@selector(fileBrowserDidCancel:)]) {
+            ((void(*)(id, SEL, id))objc_msgSend)(d, CCG_SEL("fileBrowserDidCancel:"), self);
+        }
+        if ([self presentingViewController]) [self dismissViewControllerAnimated:YES completion:nil];
+    } else {
+        [self.navigationController popViewControllerAnimated:YES];
+    }
+}
+
+// ---------- 导入 ----------
+- (void)importTapped {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"导入素材" message:@"选择来源" preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"从相册" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [self openPhotos]; }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"从文件" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [self openFiles]; }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)openPhotos {
+    UIImagePickerController *pc = [[UIImagePickerController alloc] init];
+    [pc setSourceType:UIImagePickerControllerSourceTypePhotoLibrary];
+    [pc setMediaTypes:@[@"public.image", @"public.movie"]];
+    [pc setDelegate:self];
+    [pc setAllowsEditing:NO];
+    [self presentViewController:pc animated:YES completion:nil];
+}
+
+- (void)openFiles {
+    Class utCls = objc_getClass("UTType");
+    NSArray *types;
+    if (utCls) {
+        id utImage = ((id(*)(id, SEL))objc_msgSend)(utCls, CCG_SEL("image"));
+        id utMovie = ((id(*)(id, SEL))objc_msgSend)(utCls, CCG_SEL("movie"));
+        types = [NSArray arrayWithObjects:utImage, utMovie, nil];
+        UIDocumentPickerViewController *dp = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types];
+        [dp setDelegate:self];
+        [self presentViewController:dp animated:YES completion:nil];
+        return;
+    }
+    // 兜底: 旧 API (iOS 13)
+    UIDocumentPickerViewController *dp = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.image", @"public.movie"] inMode:UIDocumentPickerModeImport];
+    [dp setDelegate:self];
+    [self presentViewController:dp animated:YES completion:nil];
+}
+
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
+    NSString *mt = [info objectForKey:UIImagePickerControllerMediaType];
+    _pendURL = [info objectForKey:UIImagePickerControllerMediaURL];
+    if (!_pendURL) _pendURL = [info objectForKey:@"UIImagePickerControllerImageURL"];
+    _pendImg = [info objectForKey:UIImagePickerControllerOriginalImage];
+    _pendVideo = mt && [mt isEqualToString:@"public.movie"];
+    [self dismissViewControllerAnimated:YES completion:nil];
+    [self performSelector:@selector(showNaming) withObject:nil afterDelay:0.5];
+}
+
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    _pendImg = nil;
+    _pendURL = [urls firstObject];
+    NSString *ext = [[_pendURL pathExtension] lowercaseString];
+    _pendVideo = [CCGVideoExts() containsObject:ext];
+    [self dismissViewControllerAnimated:YES completion:nil];
+    [self performSelector:@selector(showNaming) withObject:nil afterDelay:0.5];
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)showNaming {
+    [self askNameAndSave:_pendImg url:_pendURL isVideo:_pendVideo];
+    _pendImg = nil;
+    _pendURL = nil;
+}
+
+- (void)askNameAndSave:(UIImage *)img url:(NSURL *)srcURL isVideo:(BOOL)isVideo {
+    if (!img && !srcURL) return;
+    NSString *defaultName = @"新素材";
+    if (srcURL) {
+        defaultName = [[srcURL lastPathComponent] stringByDeletingPathExtension];
+        defaultName = [[defaultName componentsSeparatedByString:@"/"] componentsJoinedByString:@"-"];
+        if (![defaultName length]) defaultName = @"新素材";
+    }
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:@"命名素材" message:@"给这个素材起个名字" preferredStyle:UIAlertControllerStyleAlert];
+    [al addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        [tf setPlaceholder:@"素材名称"];
+        [tf setText:defaultName];
+    }];
+    UIAlertAction *ok = [UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        UITextField *tf = [[al textFields] firstObject];
+        NSString *nm = [tf text];
+        if (!nm || [nm length] == 0) nm = @"新素材";
+        [self saveMaterial:nm image:img url:srcURL isVideo:isVideo];
+    }];
+    [al addAction:ok];
+    [al addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:al animated:YES completion:nil];
+}
+
+- (void)saveMaterial:(NSString *)nm image:(UIImage *)img url:(NSURL *)srcURL isVideo:(BOOL)isVideo {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *safe = [[nm componentsSeparatedByString:@"/"] componentsJoinedByString:@"-"];
+    safe = [safe stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (!safe || [safe length] == 0) safe = @"新素材";
+
+    NSString *ext = nil;
+    if (isVideo) {
+        NSString *se = srcURL ? [[srcURL pathExtension] lowercaseString] : @"";
+        ext = [CCGVideoExts() containsObject:se] ? se : @"mov";
+    } else if (img && !srcURL) {
+        ext = @"jpg";
+    } else {
+        NSString *se = srcURL ? [[srcURL pathExtension] lowercaseString] : @"";
+        if ([CCGImageExts() containsObject:se]) ext = se;
+        else if ([CCGVideoExts() containsObject:se]) ext = se; // 混合类型兜底
+        else ext = @"jpg";
+    }
+    NSString *dst = [_dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%@", safe, ext]];
+
+    // 同名去重
+    NSString *base = dst;
+    int idx = 2;
+    while ([fm fileExistsAtPath:dst]) {
+        dst = [NSString stringWithFormat:@"%@ %d.%@", [[base stringByDeletingLastPathComponent] stringByAppendingPathComponent:[base.lastPathComponent stringByDeletingPathExtension]], idx, [base pathExtension]];
+        idx++;
+        if (idx > 99) break;
+    }
+
+    BOOL ok = NO;
+    BOOL scoped = NO;
+    if (srcURL) {
+        scoped = [srcURL startAccessingSecurityScopedResource];
+        // 优先走原细胞 copyFileFromURL:toPath: (带 NSData 兜底, 与原导入路径一致)
+        id d = _cell;
+        if (d && [d respondsToSelector:@selector(copyFileFromURL:toPath:)]) {
+            ((void(*)(id, SEL, id, id))objc_msgSend)(d, CCG_SEL("copyFileFromURL:toPath:"), srcURL, dst);
+            ok = [fm fileExistsAtPath:dst];
+        }
+        if (!ok) ok = [fm copyItemAtURL:srcURL toURL:[NSURL fileURLWithPath:dst] error:nil];
+        if (scoped) [srcURL stopAccessingSecurityScopedResource];
+    } else if (img) {
+        NSData *data = UIImageJPEGRepresentation(img, 0.9);
+        ok = [data writeToFile:dst atomically:YES];
+    }
+    (void)ok;
+    [self reloadFiles];
+}
+
+@end
+
+// ============ swizzle ============
+static void (*gOrigSelectExistingAsset)(id, SEL) = NULL;
+
+static void CCGSelectExistingAsset(id self, SEL _cmd) {
+    @try {
+        UIViewController *host = nil;
+        if ([self respondsToSelector:@selector(_viewControllerForAncestor)]) {
+            host = ((UIViewController *(*)(id, SEL))objc_msgSend)(self, CCG_SEL("_viewControllerForAncestor"));
+        }
+        if (!host) {
+            // 兜底: key window root
+            for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                if ([scene isKindOfClass:[UIWindowScene class]]) {
+                    UIWindow *w = ((UIWindowScene *)scene).keyWindow;
+                    if (w) { host = w.rootViewController; break; }
+                }
+            }
+            if (!host) host = [UIApplication sharedApplication].keyWindow.rootViewController;
+        }
+        if (!host) return;
+        NSString *root = nil;
+        if ([self respondsToSelector:@selector(rootAssetPath)]) {
+            root = ((NSString *(*)(id, SEL))objc_msgSend)(self, CCG_SEL("rootAssetPath"));
+        }
+        if (!root) root = NSHomeDirectory();
+        CCGBrowserViewController *vc = [[CCGBrowserViewController alloc] initWithCell:self directory:root isRoot:YES];
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+        [nav setModalPresentationStyle:UIModalPresentationPageSheet];
+        [host presentViewController:nav animated:YES completion:nil];
+    } @catch (id e) {
+        // 失败兜底走原实现
+        if (gOrigSelectExistingAsset) gOrigSelectExistingAsset(self, _cmd);
+    }
+}
+
+static void CCGSwizzleAfterCoreLoad(void) {
+    Class cell = objc_getClass("CCAssetCell");
+    if (!cell) return;
+    SEL sel = CCG_SEL("selectExistingAsset");
+    Method m = class_getInstanceMethod(cell, sel);
+    if (!m) return;
+    gOrigSelectExistingAsset = (void (*)(id, SEL))method_getImplementation(m);
+    method_setImplementation(m, (IMP)CCGSelectExistingAsset);
+}
+
+@interface CCGBootstrap : NSObject
+@end
+@implementation CCGBootstrap
++ (void)load {
+    @autoreleasepool {
+        Dl_info info;
+        if (dladdr((void *)&CCGSwizzleAfterCoreLoad, &info) && info.dli_fname) {
+            NSString *mine = [NSString stringWithUTF8String:info.dli_fname];
+            NSString *core = [[mine stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"CCAudioPlayPresCore"];
+            dlopen([core fileSystemRepresentation], RTLD_NOW);
+        }
+        CCGSwizzleAfterCoreLoad();
+    }
+}
+@end

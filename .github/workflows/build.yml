@@ -1,0 +1,56 @@
+name: build-ccgrid
+
+on:
+  push:
+    paths:
+      - 'main/**'
+      - 'Makefile'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-ccgrid
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot rsync curl perl zip git libxml2 libtinfo6 unzip
+          sudo update-alternatives --set fakeroot /usr/bin/fakeroot-sysv || true
+
+      - name: Set up Theos
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          curl -L "https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolChain-x86_64.tar.xz" -o /tmp/toolchain.tar.xz
+          mkdir -p "$THEOS/toolchain"
+          tar -xJf /tmp/toolchain.tar.xz -C "$THEOS/toolchain"
+          "$THEOS/bin/install-sdk" latest
+
+      - name: Install ldid
+        run: |
+          curl -L "https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64" -o /tmp/ldid
+          chmod +x /tmp/ldid
+          sudo install -m 755 /tmp/ldid /usr/local/bin/ldid
+          ldid -V || true
+
+      - name: Build
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          make clean || true
+          make FINALPACKAGE=1
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccgrid-dylib
+          path: .theos/obj/CCAudioPlayPres.dylib
