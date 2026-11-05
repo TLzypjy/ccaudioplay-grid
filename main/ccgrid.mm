@@ -219,6 +219,15 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 }
 
 - (void)reloadFiles:(BOOL)keepThumbs {
+    // 刷新当前选中素材名(删除/改名后细胞侧可能已更新存储)
+    @try {
+        id c = _cell;
+        if (c && [c respondsToSelector:@selector(Key)] && [c respondsToSelector:@selector(assetNameWithKey:)]) {
+            id key = CCG_MSG0(c, CCG_SEL("Key"));
+            NSString *cur = CCG_MSG1(c, CCG_SEL("assetNameWithKey:"), key);
+            if (cur) _selName = cur;
+        }
+    } @catch (id e) {}
     NSMutableArray *arr = [NSMutableArray array];
     NSFileManager *fm = [NSFileManager defaultManager];
     NSArray *all = [fm contentsOfDirectoryAtPath:_dir error:nil];
@@ -683,7 +692,10 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 
 // ---------- 导入 ----------
 - (void)importTapped {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"导入素材" message:@"选择来源" preferredStyle:UIAlertControllerStyleActionSheet];
+    // iPad 上 actionSheet 需要锚点, 退回 alert 样式
+    UIAlertControllerStyle style = ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad)
+        ? UIAlertControllerStyleAlert : UIAlertControllerStyleActionSheet;
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"导入素材" message:@"选择来源" preferredStyle:style];
     [sheet addAction:[UIAlertAction actionWithTitle:@"从相册" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [self openPhotos]; }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"从文件" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [self openFiles]; }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
