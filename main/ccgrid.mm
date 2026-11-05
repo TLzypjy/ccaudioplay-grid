@@ -719,10 +719,14 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
     NSString *mt = [info objectForKey:UIImagePickerControllerMediaType];
-    _pendURL = [info objectForKey:UIImagePickerControllerMediaURL];
-    if (!_pendURL) _pendURL = [info objectForKey:@"UIImagePickerControllerImageURL"];
-    _pendImg = [info objectForKey:UIImagePickerControllerOriginalImage];
     _pendVideo = mt && [mt isEqualToString:@"public.movie"];
+    if (_pendVideo) {
+        _pendURL = [info objectForKey:UIImagePickerControllerMediaURL];
+    } else {
+        // 图片优先取原始文件 URL (保住 GIF 动图)
+        _pendURL = [info objectForKey:UIImagePickerControllerImageURL] ?: [info objectForKey:UIImagePickerControllerMediaURL];
+    }
+    _pendImg = _pendURL ? nil : [info objectForKey:UIImagePickerControllerOriginalImage];
     [self dismissViewControllerAnimated:YES completion:nil];
     [self performSelector:@selector(showNaming) withObject:nil afterDelay:0.5];
 }
@@ -776,6 +780,9 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 
 - (void)saveMaterial:(NSString *)nm image:(UIImage *)img url:(NSURL *)srcURL isVideo:(BOOL)isVideo {
     NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:_dir]) {
+        [fm createDirectoryAtPath:_dir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
     NSString *safe = [[nm componentsSeparatedByString:@"/"] componentsJoinedByString:@"-"];
     safe = [safe stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
     if (!safe || [safe length] == 0) safe = @"新素材";
