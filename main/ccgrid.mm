@@ -29,6 +29,9 @@
 
 #define CCG_SEL(s) sel_registerName(s)
 #define CCG_CLS(s) ((id)objc_getClass(s))
+
+@class CCGBrowserViewController;
+
 static inline id CCG_MSG1(id o, SEL s, id a) { return ((id(*)(id, SEL, id))objc_msgSend)(o, s, a); }
 static inline id CCG_MSG0(id o, SEL s) { return ((id(*)(id, SEL))objc_msgSend)(o, s); }
 static inline BOOL CCG_RESP(id o, SEL s) { return ((BOOL(*)(id, SEL, SEL))objc_msgSend)(o, sel_registerName("respondsToSelector:"), s); }
@@ -196,7 +199,7 @@ static void CCGQLThumbAsync(NSString *path, NSString *name, NSIndexPath *ip, __w
                     img = CCG_MSG0(thumb, CCG_SEL("uiKitImage"));
                 }
                 if (!img && thumb && [thumb respondsToSelector:CCG_SEL("CGImage")]) {
-                    CGImageRef cg = (CGImageRef)CCG_MSG0(thumb, CCG_SEL("CGImage"));
+                    CGImageRef cg = (__bridge CGImageRef)CCG_MSG0(thumb, CCG_SEL("CGImage"));
                     if (cg) img = [UIImage imageWithCGImage:cg];
                 }
                 if (!img) { CCGDbg(@"QL: completion no image"); return; }
@@ -215,7 +218,7 @@ static void CCGQLThumbAsync(NSString *path, NSString *name, NSIndexPath *ip, __w
                 });
             } @catch (id e) { CCGDbg(@"QL: completion exception"); }
         };
-        ((void(*)(id, SEL, id, void (^)()))objc_msgSend)(gen, CCG_SEL("generateBestRepresentationForFile:completionHandler:"), url, blk);
+        ((void(*)(id, SEL, id, void (^)(id, id)))objc_msgSend)(gen, CCG_SEL("generateBestRepresentationForFile:completionHandler:"), url, blk);
     } @catch (id e) { CCGDbg(@"QL: exception"); }
 }
 
