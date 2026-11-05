@@ -30,7 +30,7 @@
 static inline id CCG_MSG1(id o, SEL s, id a) { return ((id(*)(id, SEL, id))objc_msgSend)(o, s, a); }
 static inline id CCG_MSG0(id o, SEL s) { return ((id(*)(id, SEL))objc_msgSend)(o, s); }
 static inline BOOL CCG_RESP(id o, SEL s) { return ((BOOL(*)(id, SEL, SEL))objc_msgSend)(o, sel_registerName("respondsToSelector:"), s); }
-static inline CGRect CCGRect(double x, double y, double w, double h) { CGRect r = {x, y, w, h}; return r; }
+static inline CGRect CCGRect(double x, double y, double w, double h) { CGRect r = {{x, y}, {w, h}}; return r; }
 
 // 媒体扩展名分类
 static NSSet *CCGImageExts(void) {
@@ -68,7 +68,6 @@ static void CCGEnsureLibs(void) {
 static UIImage *CCGThumbForPath(NSString *path) {
     CCGEnsureLibs();
     if (!path || !fnCGSrcCreate || !fnCGSrcImg) return nil;
-    NSString *ext = [[path pathExtension] lowercaseString];
     NSData *data = [NSData dataWithContentsOfFile:path];
     if (!data) return nil;
     CGImageSourceRef src = ((CGImageSourceRef(*)(CFDataRef, CFDictionaryRef))fnCGSrcCreate)((__bridge CFDataRef)data, NULL);
@@ -166,7 +165,8 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     @try {
         id c = _cell;
         if (c && [c respondsToSelector:@selector(Key)] && [c respondsToSelector:@selector(assetNameWithKey:)]) {
-            _selName = [c assetNameWithKey:[c Key]];
+            id key = CCG_MSG0(c, CCG_SEL("Key"));
+            _selName = CCG_MSG1(c, CCG_SEL("assetNameWithKey:"), key);
         }
     } @catch (id e) { _selName = nil; }
 
