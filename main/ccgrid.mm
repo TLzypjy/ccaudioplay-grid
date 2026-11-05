@@ -85,8 +85,8 @@ static void CCGCacheRealAVFClasses(void) {
             const char *base = strstr(nm, "CCAudioPlayPresCore");
             if (!base || strcmp(base, "CCAudioPlayPresCore") != 0) continue;
             uintptr_t slide = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
-            Class a = *(Class *)(slide + 0xc6520);
-            Class g = *(Class *)(slide + 0xc6528);
+            Class a = *(__unsafe_unretained Class *)(uintptr_t)(slide + 0xc6520);
+            Class g = *(__unsafe_unretained Class *)(uintptr_t)(slide + 0xc6528);
             if (a && [(id)a respondsToSelector:CCG_SEL("URLAssetWithURL:options:")]) gRealAVURLAsset = a;
             if (g && [(id)g respondsToSelector:CCG_SEL("assetImageGeneratorWithAsset:")]) gRealAVAssetImageGenerator = g;
             break;
