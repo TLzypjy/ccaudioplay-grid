@@ -115,31 +115,108 @@ static UIImage *CCGThumbForPath(NSString *path) {
     }
 }
 
+// 调试日志(缩略图失败时能定位到哪一步), 写 /var/mobile/Documents/ccgrid_debug.log
+static void CCGDbg(NSString *line) {
+    @try {
+        NSString *p = @"/var/mobile/Documents/ccgrid_debug.log";
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSDictionary *attr = [fm attributesOfItemAtPath:p error:nil];
+        NSMutableString *existing = nil;
+        if ([attr fileSize] > 0 && [attr fileSize] < 60000) {
+            existing = [NSMutableString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+        }
+        NSString *ts = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], line];
+        NSMutableString *next = existing ?: [NSMutableString string];
+        [next appendString:ts];
+        [next writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (id e) {}
+}
+
 static UIImage *CCGVideoThumbForPath(NSString *path) {
     @try {
         CCGCacheRealAVFClasses();
         Class assetCls = gRealAVURLAsset;
         Class genCls = gRealAVAssetImageGenerator;
-        if (!assetCls || !genCls) return nil;
+        if (!assetCls) { CCGDbg(@"AVF: real AVURLAsset unavailable"); return nil; }
+        if (!genCls) { CCGDbg(@"AVF: real AVAssetImageGenerator unavailable"); return nil; }
         NSURL *url = [NSURL fileURLWithPath:path];
         id asset = ((id(*)(id, SEL, id, id))objc_msgSend)(assetCls, CCG_SEL("URLAssetWithURL:options:"), url, nil);
-        if (!asset) return nil;
+        if (!asset) { CCGDbg(@"AVF: asset nil"); return nil; }
         id gen = ((id(*)(id, SEL, id))objc_msgSend)(genCls, CCG_SEL("assetImageGeneratorWithAsset:"), asset);
-        if (!gen) return nil;
+        if (!gen) { CCGDbg(@"AVF: gen nil"); return nil; }
         // 防御: 任何一步不响应都直接放弃, 绝不让异常冒出去
-        if (![gen respondsToSelector:CCG_SEL("copyCGImageAtTime:actualTime:")]) return nil;
+        if (![gen respondsToSelector:CCG_SEL("copyCGImageAtTime:actualTime:")]) {
+            CCGDbg(@"AVF: gen no copyCGImage");
+            return nil;
+        }
         ((void(*)(id, SEL, id))objc_msgSend)(gen, CCG_SEL("setAppliesPreferredTrackTransform:"), (id)kCFBooleanTrue);
         // 手工构造 CMTime{value=0, timescale=1, flags=Valid, epoch=0}, 不引入 CoreMedia 链接依赖
         typedef struct { long long value; int timescale; unsigned flags; long long epoch; } CCGTime;
         CCGTime t; t.value = 0; t.timescale = 1; t.flags = 1; t.epoch = 0;
         CGImageRef cg = ((CGImageRef(*)(id, SEL, CCGTime, void *))objc_msgSend)(gen, CCG_SEL("copyCGImageAtTime:actualTime:"), t, NULL);
-        if (!cg) return nil;
+        if (!cg) { CCGDbg(@"AVF: cg nil"); return nil; }
         UIImage *img = [UIImage imageWithCGImage:cg];
         CGImageRelease(cg);
+        if (img) CCGDbg(@"AVF: ok");
         return img;
     } @catch (id e) {
+        CCGDbg(@"AVF: exception");
         return nil;
     }
+}
+
+// ---------- QuickLook 缩略图兜底(独立框架 dlopen, 不依赖进程里已加载什么) ----------
+// 异步生成完成后回主线程就地刷新对应 cell 的 imageView (tag 930)
+static void CCGQLThumbAsync(NSString *path, NSString *name, NSIndexPath *ip, __weak CCGBrowserViewController *wself) {
+    @try {
+        static void *qlLib = NULL;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            qlLib = dlopen("/System/Library/Frameworks/QuickLookThumbnailing.framework/QuickLookThumbnailing", RTLD_LAZY);
+        });
+        Class qlCls = objc_getClass("QLThumbnailGenerator");
+        if (!qlLib || !qlCls) { CCGDbg(@"QL: framework/class unavailable"); return; }
+        if (![qlCls respondsToSelector:CCG_SEL("generatorWithMaximumSize:scale:requestOptions:")]) {
+            CCGDbg(@"QL: no class factory");
+            return;
+        }
+        double scale = [UIScreen mainScreen].scale;
+        id gen = ((id(*)(id, SEL, CGSize, double, long long))objc_msgSend)(
+            qlCls, CCG_SEL("generatorWithMaximumSize:scale:requestOptions:"), CGSizeMake(600, 600), scale, 0);
+        if (!gen) { CCGDbg(@"QL: generator nil"); return; }
+        if (![gen respondsToSelector:CCG_SEL("generateBestRepresentationForFile:completionHandler:")]) {
+            CCGDbg(@"QL: no generate method");
+            return;
+        }
+        NSURL *url = [NSURL fileURLWithPath:path];
+        void (^blk)(id, id) = ^(id thumb, id err) {
+            @try {
+                UIImage *img = nil;
+                if (thumb && [thumb respondsToSelector:CCG_SEL("uiKitImage")]) {
+                    img = CCG_MSG0(thumb, CCG_SEL("uiKitImage"));
+                }
+                if (!img && thumb && [thumb respondsToSelector:CCG_SEL("CGImage")]) {
+                    CGImageRef cg = (CGImageRef)CCG_MSG0(thumb, CCG_SEL("CGImage"));
+                    if (cg) img = [UIImage imageWithCGImage:cg];
+                }
+                if (!img) { CCGDbg(@"QL: completion no image"); return; }
+                CCGDbg(@"QL: ok");
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    @try {
+                        CCGBrowserViewController *s = wself;
+                        if (!s || !s->_cv || s->_thumbs == nil) return;
+                        [s->_thumbs setObject:img forKey:name];
+                        if ([s->_cv cellForItemAtIndexPath:ip]) {
+                            UICollectionViewCell *cell = [s->_cv cellForItemAtIndexPath:ip];
+                            UIImageView *iv = (UIImageView *)[cell viewWithTag:930];
+                            [iv setImage:img];
+                        }
+                    } @catch (id e) {}
+                });
+            } @catch (id e) { CCGDbg(@"QL: completion exception"); }
+        };
+        ((void(*)(id, SEL, id, void (^)()))objc_msgSend)(gen, CCG_SEL("generateBestRepresentationForFile:completionHandler:"), url, blk);
+    } @catch (id e) { CCGDbg(@"QL: exception"); }
 }
 
 // ---------- 编辑态 associated key ----------
@@ -173,6 +250,7 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     BOOL _isRoot;                    // 是否根目录(决定"关闭"行为)
     CGPoint _lastTapPt;              // 普通模式下点名字直接改名的位置检测
     double _lastTapAt;
+    NSMutableSet *_qlPending;        // QuickLook 异步生成中的素材名(防重复请求)
 }
 - (instancetype)initWithCell:(id)cell directory:(NSString *)dir isRoot:(BOOL)root;
 - (void)closeTapped;
@@ -189,6 +267,8 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
         _isRoot = root;
         _files = [NSMutableArray array];
         _thumbs = [NSMutableDictionary dictionary];
+        _qlPending = [NSMutableSet set];
+        _lastTapPt = CGPointMake(-9999, -9999);
     }
     return self;
 }
@@ -448,9 +528,21 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
         UIImage *thumb = [_thumbs objectForKey:name];
         if (!thumb) {
             thumb = isVideo ? CCGVideoThumbForPath(full) : CCGThumbForPath(full);
-            if (thumb) [_thumbs setObject:thumb forKey:name];
+            if (thumb) {
+                [_thumbs setObject:thumb forKey:name];
+            } else if (isVideo && ![_qlPending containsObject:name]) {
+                // AVF 不通 -> QuickLook 异步兜底, 完成后就地刷新
+                [_qlPending addObject:name];
+                NSIndexPath *ipCopy = [ip copy];
+                NSString *nameCopy = [name copy];
+                NSString *fullCopy = [full copy];
+                dispatch_async(dispatch_get_global_queue(0, 0), ^{
+                    CCGQLThumbAsync(fullCopy, nameCopy, ipCopy, self);
+                });
+            }
         }
         UIImageView *iv = [[UIImageView alloc] initWithFrame:CCGRect(0, 0, cardW, imgH)];
+        [iv setTag:930];
         [iv setImage:thumb];
         [iv setContentMode:UIViewContentModeScaleAspectFill];
         [iv setBackgroundColor:[UIColor colorWithWhite:0.9 alpha:1.0]];
