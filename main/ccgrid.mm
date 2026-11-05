@@ -70,6 +70,19 @@ static void CCGEnsureLibs(void) {
     });
 }
 
+// 统一缩到方形小图(卡片显示尺寸的 retina 倍), 控制内存: 1080p 帧解出来是 8MB, 不缩会爆
+static UIImage *CCGSquareThumb(UIImage *img, double side) {
+    if (!img) return nil;
+    double sc = side / MAX(img.size.width, img.size.height);
+    if (sc > 1.0) sc = 1.0;
+    CGSize nsz = CGSizeMake(img.size.width * sc, img.size.height * sc);
+    UIGraphicsBeginImageContextWithOptions(CGSizeMake(side, side), NO, 0.0);
+    [img drawInRect:CCGRect((side - nsz.width) / 2.0, (side - nsz.height) / 2.0, nsz.width, nsz.height)];
+    UIImage *outImg = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return outImg ?: img;
+}
+
 // 设置进程里 objc_getClass("AVURLAsset") 可能拿到不响应消息的假类(实测会转发崩溃),
 // 原二进制用的是编译期类引用 -> 直接从 CCAudioPlayPresCore 的 __objc_classrefs 槽位读真类指针。
 // 槽位 VA 由逆向原二进制得出 (bundle 固定文件, 不会变):
@@ -112,7 +125,7 @@ static UIImage *CCGThumbForPath(NSString *path) {
         if (!cg) return nil;
         UIImage *img = [UIImage imageWithCGImage:cg];
         CGImageRelease(cg);
-        return img;
+        return CCGSquareThumb(img, 400.0);
     } @catch (id e) {
         return nil;
     }
@@ -163,11 +176,10 @@ static UIImage *CCGVideoThumbForPath(NSString *path) {
         }
         UIImage *img = [UIImage imageWithCGImage:cg];
         CGImageRelease(cg);
-        if (img) {
-            CCGDbg(@"AVF: ok");
-            return img;
-        }
-        return nil;
+        if (!img) return nil;
+        UIImage *small = CCGSquareThumb(img, 400.0);
+        CCGDbg(@"AVF: ok");
+        return small;
     } @catch (id e) {
         // 转发异常也在这里接住
         CCGDbg(@"AVF: exception (copyCGImage)");
@@ -225,60 +237,87 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 static const char kCCGDlKey = 0;    // 下载按钮 -> 文件名
 
 // ---------- 保存到相册 ----------
-// 注意: 不要走 PHPhotoLibrary 类查找 —— 本进程 objc_getClass 会被污染返回假类(AVF 已踩坑)。
-// 用 UIKit C 函数 UISaveVideoAtPathToSavedPhotosAlbum / UIImageWriteToSavedPhotosAlbum:
-// - 完成回调必须用苹果契约选择器 video:/image:didFinishSavingWithError:contextInfo:
-//   (v8 用自造名字 saveFinished:... 在 PLAssetsSaver 回调块里抛异常崩溃)
-// - photolibraryd 可能读不到插件目录里的原文件 -> 先拷到本进程临时目录再存
+// 真 PHPhotoLibrary 类指针(从原二进制 classref 槽位读, 同 AVF 方案; objc_getClass 在本进程被污染)
+static Class gRealPHPhotoLibrary = Nil;
+
+static void CCGCacheRealPHClass(void) {
+    if (gRealPHPhotoLibrary) return;
+    @try {
+        uint32_t n = _dyld_image_count();
+        for (uint32_t i = 0; i < n; i++) {
+            const char *nm = _dyld_get_image_name(i);
+            if (!nm) continue;
+            const char *base = strstr(nm, "CCAudioPlayPresCore");
+            if (!base || strcmp(base, "CCAudioPlayPresCore") != 0) continue;
+            uintptr_t slide = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+            void *slotA = (void *)(slide + 0xc64b0);   // _OBJC_CLASS_$_PHPhotoLibrary
+            Class a = *(__unsafe_unretained Class *)slotA;
+            if (a && [(id)a respondsToSelector:CCG_SEL("performChanges:completionHandler:")]) {
+                gRealPHPhotoLibrary = a;
+            }
+            break;
+        }
+    } @catch (id e) {}
+}
+
+// ---------- 保存到相册(现代 Photos API + 真类; 旧 legacySave 在本环境回调块里抛异常=闪退, 禁用) ----------
 static void CCGSaveToAlbum(NSString *path, id target) {
     @try {
+        // 先拷到本进程临时目录, 避开 photolibraryd 读不到插件目录文件的问题
         NSString *ext = [[path pathExtension] lowercaseString];
-        SEL done = CCG_SEL("video:didFinishSavingWithError:contextInfo:");
-        SEL doneImg = CCG_SEL("image:didFinishSavingWithError:contextInfo:");
-
-        // 兼容性/可达性: 拷贝到本进程临时目录(系统守护进程一定能读), 用完即删
         NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
             [NSString stringWithFormat:@"ccgrid_export_%@.%@", [NSUUID UUID].UUIDString, ext]];
         NSFileManager *fm = [NSFileManager defaultManager];
         if (![fm copyItemAtPath:path toPath:tmp error:nil]) {
-            NSError *err = [NSError errorWithDomain:@"CCGrid" code:-3
-                                            userInfo:@{NSLocalizedDescriptionKey : @"素材拷贝失败，无法导出"}];
-            ((void(*)(id, SEL, id, id, void *))objc_msgSend)(target, done, path, err, NULL);
+            ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"),
+                NO, @"素材拷贝失败，无法导出");
             return;
         }
 
-        if ([CCGVideoExts() containsObject:ext]) {
-            // 视频: 检查兼容性再存(不兼容系统会直接抛异常, 先拦下来给提示)
-            BOOL compat = UIVideoAtPathIsCompatibleWithSavedPhotosAlbum(tmp);
-            if (!compat) {
-                [fm removeItemAtPath:tmp error:nil];
-                NSError *err = [NSError errorWithDomain:@"CCGrid" code:-4
-                                                userInfo:@{NSLocalizedDescriptionKey : @"该视频格式无法存入相册"}];
-                ((void(*)(id, SEL, id, id, void *))objc_msgSend)(target, done, tmp, err, NULL);
-                return;
-            }
-            UISaveVideoAtPathToSavedPhotosAlbum(tmp, target, done, NULL);
-        } else {
-            UIImage *img = [UIImage imageWithContentsOfFile:tmp];
-            if (!img) {
-                [fm removeItemAtPath:tmp error:nil];
-                NSError *err = [NSError errorWithDomain:@"CCGrid" code:-1
-                                                userInfo:@{NSLocalizedDescriptionKey : @"图片读取失败"}];
-                ((void(*)(id, SEL, id, id, void *))objc_msgSend)(target, doneImg, path, err, NULL);
-                return;
-            }
-            UIImageWriteToSavedPhotosAlbum(img, target, doneImg, NULL);
+        CCGCacheRealPHClass();
+        Class phLib = gRealPHPhotoLibrary;
+        Class reqCls = objc_getClass("PHAssetCreationRequest");
+        BOOL modern = phLib && reqCls
+            && [reqCls respondsToSelector:CCG_SEL("creationRequestForAsset")]
+            && [(id)reqCls instancesRespondToSelector:CCG_SEL("addResourceWithType:fileURL:options:")];
+
+        if (!modern) {
+            [fm removeItemAtPath:tmp error:nil];
+            ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"),
+                NO, @"当前环境不支持保存到相册");
+            return;
         }
 
-        // 视频保存是异步引用文件, 延迟清理临时文件; 图片是同步的, 立即删也行
+        NSString *ext2 = [[path pathExtension] lowercaseString];
+        long long rtype = [CCGVideoExts() containsObject:ext2] ? 2 : 1;   // video=2 photo=1
+        NSURL *u = [NSURL fileURLWithPath:tmp];
+
+        ((void(*)(id, SEL, void (^)(void), void (^)(BOOL, id)))objc_msgSend)(
+            phLib, CCG_SEL("performChanges:completionHandler:"),
+            ^{
+                @try {
+                    id req = ((id(*)(id, SEL))objc_msgSend)(reqCls, CCG_SEL("creationRequestForAsset"));
+                    if (req) {
+                        ((void(*)(id, SEL, long long, id, id))objc_msgSend)(
+                            req, CCG_SEL("addResourceWithType:fileURL:options:"), rtype, u, (id)nil);
+                    }
+                } @catch (id e) {}
+            },
+            ^(BOOL ok, id err) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    NSString *msg = ok ? @"已保存到相册" :
+                        ([err localizedDescription] ?: @"保存失败(权限或格式)");
+                    ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"), ok, msg);
+                });
+            });
+
+        // 保存为异步引用文件, 延迟清理临时副本
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(0, 0), ^{
             [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
         });
     } @catch (id e) {
-        NSError *err = [NSError errorWithDomain:@"CCGrid" code:-2
-                                        userInfo:@{NSLocalizedDescriptionKey : @"保存异常"}];
-        ((void(*)(id, SEL, id, id, void *))objc_msgSend)(target, CCG_SEL("video:didFinishSavingWithError:contextInfo:"), path, err, NULL);
+        ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"), NO, @"保存异常");
     }
 }
 
@@ -319,8 +358,7 @@ static void CCGSaveToAlbum(NSString *path, id target) {
 - (void)importTapped;
 - (void)reloadFiles;
 - (void)qlGotThumb:(UIImage *)img forName:(NSString *)name atIp:(NSIndexPath *)ip;
-- (void)video:(NSString *)videoPath didFinishSavingWithError:(NSError *)error contextInfo:(void *)ctx;
-- (void)image:(UIImage *)image didFinishSavingWithError:(NSError *)error contextInfo:(void *)ctx;
+- (void)saveDoneWithOk:(BOOL)ok msg:(NSString *)msg;
 - (void)genThumbInBackgroundForName:(NSString *)name path:(NSString *)full isVideo:(BOOL)isVideo ip:(NSIndexPath *)ip;
 @end
 
@@ -518,15 +556,61 @@ static void CCGSaveToAlbum(NSString *path, id target) {
     } @catch (id e) {}
 }
 
-// 缩略图后台生成(AVF 解码视频帧较重, 主线程同步做会卡滑动), 完成后主线程就地刷新
+// 缩略图磁盘缓存: 首帧只取一次, 落盘后永久复用(文件改动会因 mtime 变化自动重取)
+// 缓存目录 = 素材目录下的 .ccthumbs (点前缀不会出现在列表里)
+- (NSString *)thumbCachePathForFull:(NSString *)full {
+    @try {
+        NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:full error:nil];
+        long long mt = (long long)([attr fileModificationDate].timeIntervalSince1970);
+        NSString *base = [full stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+        return [[[self class] ccgThumbDir:_dir] stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"%@.%lld.jpg", base, mt]];
+    } @catch (id e) {
+        return nil;
+    }
+}
+
++ (NSString *)ccgThumbDir:(NSString *)dir {
+    return [dir stringByAppendingPathComponent:@".ccthumbs"];
+}
+
+// 缩略图后台生成: ① 磁盘缓存命中直接用 ② 未命中才解码首帧并落盘 ③ AVF 失败落 QL 兜底
+// 完成后主线程就地刷新对应 cell
 - (void)genThumbInBackgroundForName:(NSString *)name path:(NSString *)full isVideo:(BOOL)isVideo ip:(NSIndexPath *)ip {
     if ([_qlPending containsObject:name]) return;
     [_qlPending addObject:name];
     NSIndexPath *ipCopy = [ip copy];
     NSString *nameCopy = [name copy];
     NSString *fullCopy = [full copy];
+    NSString *dirCopy = [_dir copy];
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        UIImage *img = isVideo ? CCGVideoThumbForPath(fullCopy) : CCGThumbForPath(fullCopy);
+        UIImage *img = nil;
+        NSString *cachePath = nil;
+        @try {
+            // ① 磁盘缓存(键含 mtime, 素材改动自动失效)
+            NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:fullCopy error:nil];
+            long long mt = (long long)([attr fileModificationDate].timeIntervalSince1970);
+            NSString *base = [fullCopy stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+            cachePath = [[[CCGBrowserViewController ccgThumbDir:dirCopy]
+                stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%lld.jpg", base, mt]] copy];
+
+            if (cachePath && [[NSFileManager defaultManager] fileExistsAtPath:cachePath]) {
+                img = [UIImage imageWithContentsOfFile:cachePath];   // 秒出, 不解码视频
+            }
+
+            // ② 未命中: 解码首帧并落盘
+            if (!img) {
+                img = isVideo ? CCGVideoThumbForPath(fullCopy) : CCGThumbForPath(fullCopy);
+                if (img && cachePath) {
+                    [[NSFileManager defaultManager] createDirectoryAtPath:
+                        [cachePath stringByDeletingLastPathComponent]
+                        withIntermediateDirectories:YES attributes:nil error:nil];
+                    NSData *jd = UIImageJPEGRepresentation(img, 0.82);
+                    if (jd) [jd writeToFile:cachePath atomically:YES];
+                }
+            }
+        } @catch (id e) {}
+
         dispatch_async(dispatch_get_main_queue(), ^{
             @try {
                 if (!_cv) return;
@@ -534,6 +618,7 @@ static void CCGSaveToAlbum(NSString *path, id target) {
                     [_thumbs setObject:img forKey:nameCopy];
                 } else if (isVideo) {
                     // AVF 取帧失败 -> QuickLook 异步兜底
+                    [_qlPending removeObject:nameCopy];
                     dispatch_async(dispatch_get_global_queue(0, 0), ^{
                         CCGQLThumbAsync(fullCopy, nameCopy, ipCopy, self);
                     });
@@ -550,21 +635,9 @@ static void CCGSaveToAlbum(NSString *path, id target) {
     });
 }
 
-// 保存到相册完成回调(苹果契约选择器, 系统函数经 target/selector 调回)
-- (void)video:(NSString *)videoPath didFinishSavingWithError:(NSError *)error contextInfo:(void *)ctx {
-    NSString *msg = @"已保存到相册";
-    if (error && error.code != 0) {
-        msg = [error localizedDescription] ?: @"保存失败";
-    }
-    [self showTip:msg];
-}
-
-- (void)image:(UIImage *)image didFinishSavingWithError:(NSError *)error contextInfo:(void *)ctx {
-    NSString *msg = @"已保存到相册";
-    if (error && error.code != 0) {
-        msg = [error localizedDescription] ?: @"保存失败";
-    }
-    [self showTip:msg];
+// 保存到相册完成回调(现代 API 经 performChanges completionHandler 调回, 已在主线程)
+- (void)saveDoneWithOk:(BOOL)ok msg:(NSString *)msg {
+    [self showTip:msg ?: (ok ? @"已保存到相册" : @"保存失败")];
 }
 
 - (void)longPressTapped:(UILongPressGestureRecognizer *)lp {
@@ -591,9 +664,7 @@ static void CCGSaveToAlbum(NSString *path, id target) {
         [self showTip:@"文件不存在"];
         return;
     }
-    CCGSaveToAlbum(full, ^(BOOL ok, NSString *msg) {
-        [self showTip:msg ?: (ok ? @"已保存到相册" : @"保存失败")];
-    });
+    CCGSaveToAlbum(full, self);
 }
 
 - (void)nameTapped:(UITapGestureRecognizer *)g {
@@ -681,21 +752,6 @@ static void CCGSaveToAlbum(NSString *path, id target) {
         [badge.layer setCornerRadius:8.0];
         [badge.layer setMasksToBounds:YES];
         [card addSubview:badge];
-
-        // 视频: 没取到缩略图时给居中大播放钮占位, 不显得像坏了
-        if (isVideo && !thumb) {
-            UIView *pc = [[UIView alloc] initWithFrame:CCGRect((cardW - 44) / 2.0, (imgH - 44) / 2.0, 44, 44)];
-            [pc setBackgroundColor:[UIColor colorWithWhite:0.0 alpha:0.35]];
-            [pc.layer setCornerRadius:22.0];
-            [pc.layer setMasksToBounds:YES];
-            UILabel *plc = [[UILabel alloc] initWithFrame:pc.bounds];
-            [plc setText:@"▶"];
-            [plc setFont:[UIFont systemFontOfSize:17.0]];
-            [plc setTextAlignment:NSTextAlignmentCenter];
-            [plc setTextColor:[UIColor whiteColor]];
-            [pc addSubview:plc];
-            [card addSubview:pc];
-        }
 
         // 视频左下角播放标志
         if (isVideo) {
@@ -834,9 +890,12 @@ static void CCGSaveToAlbum(NSString *path, id target) {
                                                                 message:[NSString stringWithFormat:@"确定删除「%@」? 不可恢复", name]
                                                          preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction *yes = [UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        // 先算缩略图缓存路径(依赖被删文件的 mtime)
+        NSString *thumbCache = [self thumbCachePathForFull:full];
         [[NSFileManager defaultManager] removeItemAtPath:full error:nil];
         [_thumbs removeObjectForKey:name];
         if (_pickedName && [_pickedName isEqualToString:name]) _pickedName = nil;
+        if (thumbCache) [[NSFileManager defaultManager] removeItemAtPath:thumbCache error:nil];
         [self reloadFiles];   // 立即刷新列表
         id d = _cell;
         if (d && [d respondsToSelector:@selector(fileBrowser:deleteFileName:filePath:)]) {
@@ -973,6 +1032,16 @@ static void CCGSaveToAlbum(NSString *path, id target) {
     if ([fm moveItemAtPath:src toPath:dst error:&err]) {
         [_thumbs removeObjectForKey:old];
         if (_pickedName && [_pickedName isEqualToString:old]) _pickedName = newName;
+        // 同步移动缩略图缓存(同文件 mtime 不变, 仅路径键变化)
+        NSString *oldCache = [self thumbCachePathForFull:src];
+        NSString *newCache = [self thumbCachePathForFull:dst];
+        if (oldCache && [[NSFileManager defaultManager] fileExistsAtPath:oldCache]) {
+            [[NSFileManager defaultManager] createDirectoryAtPath:
+                [newCache stringByDeletingLastPathComponent]
+                withIntermediateDirectories:YES attributes:nil error:nil];
+            [[NSFileManager defaultManager] removeItemAtPath:newCache error:nil];
+            [[NSFileManager defaultManager] moveItemAtPath:oldCache toPath:newCache error:nil];
+        }
         id d = _cell;
         if (d && [d respondsToSelector:@selector(fileBrowser:renameNewFileName:oldFileName:filePath:)]) {
             ((void(*)(id, SEL, id, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:renameNewFileName:oldFileName:filePath:"),
@@ -1173,6 +1242,12 @@ static void CCGSaveToAlbum(NSString *path, id target) {
     }
     (void)ok;
     [self reloadFiles];
+    // 导入成功: 后台取一次首帧并落盘缩略图缓存, 之后打开素材库秒出图、永不重复解码
+    NSString *dstName = [dst lastPathComponent];
+    BOOL dstIsVideo = [CCGVideoExts() containsObject:[[dstName pathExtension] lowercaseString]];
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        [self genThumbInBackgroundForName:dstName path:dst isVideo:dstIsVideo ip:nil];
+    });
 }
 
 @end
