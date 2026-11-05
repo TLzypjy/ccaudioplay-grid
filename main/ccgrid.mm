@@ -149,8 +149,13 @@ static UIImage *CCGVideoThumbForPath(NSString *path) {
         if (!gen) { CCGDbg(@"AVF: gen nil"); return nil; }
         // 防御: 任何一步不响应都直接放弃, 绝不让异常冒出去
         if (![gen respondsToSelector:CCG_SEL("copyCGImageAtTime:actualTime:")]) {
-            CCGDbg(@"AVF: gen no copyCGImage");
-            return nil;
+            // 该方法在 AVFoundation 伞层; 设置进程可能只加载了底层 AVFCore,
+            // 补加载伞层后分类方法即挂到类上 (日志证实 gen 存在但缺此方法)
+            dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_NOW);
+            if (![gen respondsToSelector:CCG_SEL("copyCGImageAtTime:actualTime:")]) {
+                CCGDbg(@"AVF: gen no copyCGImage (after umbrella)");
+                return nil;
+            }
         }
         ((void(*)(id, SEL, id))objc_msgSend)(gen, CCG_SEL("setAppliesPreferredTrackTransform:"), (id)kCFBooleanTrue);
         // 手工构造 CMTime{value=0, timescale=1, flags=Valid, epoch=0}, 不引入 CoreMedia 链接依赖
@@ -175,6 +180,8 @@ static void CCGQLThumbAsync(NSString *path, NSString *name, NSIndexPath *ip, __w
         static void *qlLib = NULL;
         static dispatch_once_t once;
         dispatch_once(&once, ^{
+            // 同 AVF: 先补伞层再补子框架, 防止类/方法只注册了一半
+            dlopen("/System/Library/Frameworks/QuickLook.framework/QuickLook", RTLD_LAZY);
             qlLib = dlopen("/System/Library/Frameworks/QuickLookThumbnailing.framework/QuickLookThumbnailing", RTLD_LAZY);
         });
         Class qlCls = objc_getClass("QLThumbnailGenerator");
@@ -314,11 +321,6 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     _editLP = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(longPressTapped:)];
     [_editLP setMinimumPressDuration:0.4];
     [_cv addGestureRecognizer:_editLP];
-    // 点击位置观察器: 不拦截触摸(cancelsTouchesInView=NO), 只记录位置,
-    // 供 didSelect 判断"点的是名字胶囊" -> 普通模式直接改名, 不用进编辑态
-    UITapGestureRecognizer *tapProbe = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(recordTap:)];
-    [tapProbe setCancelsTouchesInView:NO];
-    [_cv addGestureRecognizer:tapProbe];
     [[self view] addSubview:_cv];
 
     [self reloadFiles];
@@ -441,11 +443,6 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     [self navigationItem].rightBarButtonItem = imp;
     [self setTitle:[NSString stringWithFormat:@"素材库 (%lu)", (unsigned long)[_files count]]];
     [_cv reloadData];
-}
-
-- (void)recordTap:(UITapGestureRecognizer *)g {
-    _lastTapPt = [g locationInView:_cv];
-    _lastTapAt = CFAbsoluteTimeGetCurrent();
 }
 
 // QuickLook 异步回调: 缓存缩略图并就地刷新可见 cell
@@ -622,10 +619,11 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 
     if (_editMode) [self jiggleCard:card];
 
-    // 名字胶囊(点按 -> 行内改名)
+    // 名字胶囊(仅编辑态可点 -> 行内改名; 普通态穿透给 cell = 选中素材)
     UIView *pill = [[UIView alloc] initWithFrame:CCGRect(10, imgH + 8, cardW - 8, 22)];
     [pill setTag:921];
     [pill setBackgroundColor:[UIColor colorWithWhite:0.62 alpha:0.85]];
+    [pill setUserInteractionEnabled:_editMode];
     [pill.layer setCornerRadius:11.0];
     [pill.layer setMasksToBounds:YES];
     UILabel *plb = [[UILabel alloc] initWithFrame:CCGRect(0, 0, cardW - 8, 22)];
@@ -665,41 +663,35 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     BOOL isDir = NO;
     [[NSFileManager defaultManager] fileExistsAtPath:full isDirectory:&isDir];
 
-    // 普通模式: 点在名字胶囊上 -> 直接行内改名(不用进编辑态)
-    if (!isDir) {
-        BOOL tappedPill = NO;
-        if (_activeField != nil) {
-            // 名字胶囊自己的手势已经先触发行内改名, 本次选择作废
-            tappedPill = YES;
-        } else {
-            double age = CFAbsoluteTimeGetCurrent() - _lastTapAt;
-            if (age >= 0 && age < 0.6) {
-                UICollectionViewCell *cell = [_cv cellForItemAtIndexPath:ip];
-                if (cell) {
-                    UIView *pill = [cell viewWithTag:921];
-                    if (pill) {
-                        CGRect pillFrame = [pill convertRect:pill.bounds toView:_cv];
-                        if (CGRectContainsPoint(pillFrame, _lastTapPt)) {
-                            [self beginRename:name inCell:cell atPill:pill];
-                            tappedPill = YES;
-                        }
-                    }
-                }
-            }
-        }
-        if (tappedPill) return;
-    }
-
     if (isDir) {
         // 子目录: 推入新浏览器(同一 delegate)
         CCGBrowserViewController *sub = [[CCGBrowserViewController alloc] initWithCell:_cell directory:full isRoot:NO];
         [[self navigationController] pushViewController:sub animated:YES];
         return;
     }
-    // 选择素材 -> 原细胞处理存储/通知/关闭
+    // 选择素材: 原细胞会写配置/发通知, 然后 dismiss 整个弹出层。
+    // 先递一个透明"替身"VC 接住那次 dismiss, 网格就能留在原地, 只刷新圆点。
     id d = _cell;
     if (d && [d respondsToSelector:@selector(fileBrowser:didSelectFilePath:fileName:)]) {
-        ((void(*)(id, SEL, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:didSelectFilePath:fileName:"), self, full, name);
+        _selName = name;
+        UIViewController *sacrifice = [[UIViewController alloc] init];
+        [sacrifice setModalPresentationStyle:UIModalPresentationOverFullScreen];
+        [sacrifice setView:[[UIView alloc] initWithFrame:CGRectZero]];
+        [self presentViewController:sacrifice animated:NO completion:^{
+            ((void(*)(id, SEL, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:didSelectFilePath:fileName:"), self, full, name);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                @try {
+                    // 重新读取真实选中名(细胞侧已写好), 刷新圆点
+                    id c = _cell;
+                    if (c && [c respondsToSelector:@selector(Key)] && [c respondsToSelector:@selector(assetNameWithKey:)]) {
+                        id key = CCG_MSG0(c, CCG_SEL("Key"));
+                        NSString *cur = CCG_MSG1(c, CCG_SEL("assetNameWithKey:"), key);
+                        if (cur) _selName = cur;
+                    }
+                    [(UICollectionView *)_cv reloadData];
+                } @catch (id e) {}
+            });
+        }];
     } else {
         [self closeTapped];
     }
