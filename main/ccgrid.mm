@@ -224,59 +224,31 @@ static const char kCCGDelKey = 0;   // 删除按钮 -> 文件名
 static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 static const char kCCGDlKey = 0;    // 下载按钮 -> 文件名
 
-// ---------- 保存到相册(完全动态调用, 不链接 Photos) ----------
-// PHAuthorizationStatus: 0 未决定 / 1 受限 / 2 拒绝 / 3 允许 / 4 部分允许; PHAccessLevel 只写=2
-static void CCGSaveToAlbum(NSString *path, void (^done)(BOOL ok, NSString *msg)) {
+// ---------- 保存到相册 ----------
+// 注意: 不要走 PHPhotoLibrary 类查找 —— 本进程 objc_getClass 会被污染返回假类(AVF 已踩坑)。
+// 直接用 UIKit 的 C 函数(内部自行处理权限/保存), 对本进程稳定:
+//   UISaveVideoAtPathToSavedPhotosAlbum / UIImageWriteToSavedPhotosAlbum
+// 完成回调走 target/selector: -saveFinished:didFinishSavingWithError:contextInfo:
+static void CCGSaveToAlbum(NSString *path, id target) {
     @try {
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{
-            dlopen("/System/Library/Frameworks/Photos.framework/Photos", RTLD_LAZY);
-        });
-        Class phLib = objc_getClass("PHPhotoLibrary");
-        Class createReq = objc_getClass("PHAssetCreationRequest");
-        if (!phLib || !createReq) {
-            if (done) done(NO, @"当前环境不支持相册写入");
-            return;
-        }
-        NSURL *url = [NSURL fileURLWithPath:path];
         NSString *ext = [[path pathExtension] lowercaseString];
-        long long rtype = [CCGVideoExts() containsObject:ext] ? 2 : 1;   // video=2 photo=1
-
-        void (^writeIt)(void) = ^{
-            // 关键: PHAssetCreationRequest 必须在 performChanges 块内创建
-            ((void(*)(id, SEL, void (^)(void), void (^)(BOOL, id)))objc_msgSend)(
-                phLib, CCG_SEL("performChanges:completionHandler:"),
-                ^{
-                    @try {
-                        id req = ((id(*)(id, SEL))objc_msgSend)(createReq, CCG_SEL("creationRequestForAsset"));
-                        if (req) {
-                            ((void(*)(id, SEL, long long, id, id))objc_msgSend)(
-                                req, CCG_SEL("addResourceWithType:fileURL:options:"), rtype, url, (id)nil);
-                        }
-                    } @catch (id e) {}
-                },
-                ^(BOOL ok, id err) {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        if (done) done(ok, ok ? @"已保存到相册" : @"保存失败(权限或格式)");
-                    });
-                });
-        };
-
-        long long status = ((long long(*)(id, SEL, long long))objc_msgSend)(
-            phLib, CCG_SEL("authorizationStatusForAccessLevel:"), 2);
-        if (status == 3 || status == 4) {
-            writeIt();
-        } else if (status == 1 || status == 2) {
-            if (done) done(NO, @"没有相册权限，请到 设置>隐私与安全性>照片 允许");
+        SEL done = CCG_SEL("saveFinished:didFinishSavingWithError:contextInfo:");
+        if ([CCGVideoExts() containsObject:ext]) {
+            UISaveVideoAtPathToSavedPhotosAlbum(path, target, done, NULL);
         } else {
-            ((void(*)(id, SEL, long long, void (^)(long long)))objc_msgSend)(
-                phLib, CCG_SEL("requestAuthorizationForAccessLevel:handler:"), 2, ^(long long st) {
-                    if (st == 3 || st == 4) writeIt();
-                    else dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(NO, @"相册权限被拒绝"); });
-                });
+            UIImage *img = [UIImage imageWithContentsOfFile:path];
+            if (!img) {
+                NSError *err = [NSError errorWithDomain:@"CCGrid" code:-1
+                                                userInfo:@{NSLocalizedDescriptionKey : @"图片读取失败"}];
+                ((void(*)(id, SEL, id, id, void *))objc_msgSend)(target, done, path, err, NULL);
+                return;
+            }
+            UIImageWriteToSavedPhotosAlbum(img, target, done, NULL);
         }
     } @catch (id e) {
-        if (done) done(NO, @"保存异常");
+        NSError *err = [NSError errorWithDomain:@"CCGrid" code:-2
+                                        userInfo:@{NSLocalizedDescriptionKey : @"保存异常"}];
+        ((void(*)(id, SEL, id, id, void *))objc_msgSend)(target, CCG_SEL("saveFinished:didFinishSavingWithError:contextInfo:"), path, err, NULL);
     }
 }
 
@@ -315,6 +287,7 @@ static void CCGSaveToAlbum(NSString *path, void (^done)(BOOL ok, NSString *msg))
 - (void)importTapped;
 - (void)reloadFiles;
 - (void)qlGotThumb:(UIImage *)img forName:(NSString *)name atIp:(NSIndexPath *)ip;
+- (void)saveFinished:(NSString *)path didFinishSavingWithError:(NSError *)error contextInfo:(void *)ctx;
 @end
 
 @implementation CCGBrowserViewController
@@ -509,6 +482,15 @@ static void CCGSaveToAlbum(NSString *path, void (^done)(BOOL ok, NSString *msg))
             [iv setImage:img];
         }
     } @catch (id e) {}
+}
+
+// 保存到相册完成回调(系统函数经 target/selector 调回)
+- (void)saveFinished:(NSString *)path didFinishSavingWithError:(NSError *)error contextInfo:(void *)ctx {
+    NSString *msg = @"已保存到相册";
+    if (error && error.code != 0) {
+        msg = [error localizedDescription] ?: @"保存失败";
+    }
+    [self showTip:msg];
 }
 
 - (void)longPressTapped:(UILongPressGestureRecognizer *)lp {
@@ -752,21 +734,18 @@ static void CCGSaveToAlbum(NSString *path, void (^done)(BOOL ok, NSString *msg))
         return;
     }
     // 选择素材: 原细胞会写配置/发通知, 然后 dismiss 整个弹出层。
-    // 先递一个透明"替身"VC 接住那次 dismiss, 网格就能留在原地, 只刷新圆点。
+    // 先递一个透明"替身"VC 接住那次 dismiss, 网格就能留在原地。
+    // 蓝点立即重绘(不等原细胞回调), 避免约 1 秒的切换延迟。
     id d = _cell;
     if (d && [d respondsToSelector:@selector(fileBrowser:didSelectFilePath:fileName:)]) {
         _pickedName = name;   // 蓝点以此为准(细胞回读值格式不可控, 不覆盖它)
         _selName = name;
+        [_cv reloadData];     // 立即刷新圆点
         UIViewController *sacrifice = [[UIViewController alloc] init];
         [sacrifice setModalPresentationStyle:UIModalPresentationOverFullScreen];
         [sacrifice setView:[[UIView alloc] initWithFrame:CGRectZero]];
         [self presentViewController:sacrifice animated:NO completion:^{
             ((void(*)(id, SEL, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:didSelectFilePath:fileName:"), self, full, name);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                @try {
-                    [(UICollectionView *)_cv reloadData];
-                } @catch (id e) {}
-            });
         }];
     } else {
         [self closeTapped];
@@ -783,20 +762,16 @@ static void CCGSaveToAlbum(NSString *path, void (^done)(BOOL ok, NSString *msg))
         [[NSFileManager defaultManager] removeItemAtPath:full error:nil];
         [_thumbs removeObjectForKey:name];
         if (_pickedName && [_pickedName isEqualToString:name]) _pickedName = nil;
+        [self reloadFiles];   // 立即刷新列表
         id d = _cell;
         if (d && [d respondsToSelector:@selector(fileBrowser:deleteFileName:filePath:)]) {
-            // 原实现删除后也会 dismiss 整个素材库; 同样用替身 VC 接住, 删除后留在网格里
+            // 原实现删除后也会 dismiss 整个素材库; 用替身 VC 接住, 删除后留在网格里
             UIViewController *sacrifice = [[UIViewController alloc] init];
             [sacrifice setModalPresentationStyle:UIModalPresentationOverFullScreen];
             [sacrifice setView:[[UIView alloc] initWithFrame:CGRectZero]];
             [self presentViewController:sacrifice animated:NO completion:^{
                 ((void(*)(id, SEL, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:deleteFileName:filePath:"), self, name, full);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    @try { [self reloadFiles]; } @catch (id e) {}
-                });
             }];
-        } else {
-            [self reloadFiles];
         }
     }];
     UIAlertAction *cc = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
