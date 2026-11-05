@@ -153,7 +153,10 @@ static UIImage *CCGVideoThumbForPath(NSString *path) {
         // 手工构造 CMTime{value=0, timescale=1, flags=Valid, epoch=0}, 不引入 CoreMedia 链接依赖
         typedef struct { long long value; int timescale; unsigned flags; long long epoch; } CCGTime;
         CCGTime t; t.value = 0; t.timescale = 1; t.flags = 1; t.epoch = 0;
-        CGImageRef cg = ((CGImageRef(*)(id, SEL, CCGTime, void *))objc_msgSend)(gen, CCG_SEL("copyCGImageAtTime:actualTime:"), t, NULL);
+        // 注意: 新 iOS 上是三段选择器 copyCGImageAtTime:actualTime:error:
+        // (逆向原插件得其真实调用; 两段的旧方法已不存在, 之前一直因此失败)
+        CGImageRef cg = ((CGImageRef(*)(id, SEL, CCGTime *, void *, void *))objc_msgSend)(
+            gen, CCG_SEL("copyCGImageAtTime:actualTime:error:"), &t, NULL, NULL);
         if (!cg) {
             CCGDbg([NSString stringWithFormat:@"AVF: cg nil (gen=%@)", [gen class]]);
             return nil;
@@ -680,6 +683,7 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
                         id key = CCG_MSG0(c, CCG_SEL("Key"));
                         NSString *cur = CCG_MSG1(c, CCG_SEL("assetNameWithKey:"), key);
                         if (cur) _selName = cur;
+                        CCGDbg([NSString stringWithFormat:@"SEL key=%@ stored=%@ picked=%@", key, cur, name]);
                     }
                     [(UICollectionView *)_cv reloadData];
                 } @catch (id e) {}
