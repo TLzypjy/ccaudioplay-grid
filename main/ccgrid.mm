@@ -220,8 +220,65 @@ static void CCGQLThumbAsync(NSString *path, NSString *name, NSIndexPath *ip, __w
 }
 
 // ---------- 编辑态 associated key ----------
-static const char kCCGDelKey = 0;   // 删除按钮手势 -> 文件名
+static const char kCCGDelKey = 0;   // 删除按钮 -> 文件名
 static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
+static const char kCCGDlKey = 0;    // 下载按钮 -> 文件名
+
+// ---------- 保存到相册(完全动态调用, 不链接 Photos) ----------
+// PHAuthorizationStatus: 0 未决定 / 1 受限 / 2 拒绝 / 3 允许 / 4 部分允许; PHAccessLevel 只写=2
+static void CCGSaveToAlbum(NSString *path, void (^done)(BOOL ok, NSString *msg)) {
+    @try {
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            dlopen("/System/Library/Frameworks/Photos.framework/Photos", RTLD_LAZY);
+        });
+        Class phLib = objc_getClass("PHPhotoLibrary");
+        Class createReq = objc_getClass("PHAssetCreationRequest");
+        if (!phLib || !createReq) {
+            if (done) done(NO, @"当前环境不支持相册写入");
+            return;
+        }
+        NSURL *url = [NSURL fileURLWithPath:path];
+        NSString *ext = [[path pathExtension] lowercaseString];
+        long long rtype = [CCGVideoExts() containsObject:ext] ? 2 : 1;   // video=2 photo=1
+
+        void (^writeIt)(void) = ^{
+            // 关键: PHAssetCreationRequest 必须在 performChanges 块内创建
+            ((void(*)(id, SEL, void (^)(void), void (^)(BOOL, id)))objc_msgSend)(
+                phLib, CCG_SEL("performChanges:completionHandler:"),
+                ^{
+                    @try {
+                        id req = ((id(*)(id, SEL))objc_msgSend)(createReq, CCG_SEL("creationRequestForAsset"));
+                        if (req) {
+                            ((void(*)(id, SEL, long long, id, id))objc_msgSend)(
+                                req, CCG_SEL("addResourceWithType:fileURL:options:"), rtype, url, (id)nil);
+                        }
+                    } @catch (id e) {}
+                },
+                ^(BOOL ok, id err) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        if (done) done(ok, ok ? @"已保存到相册" : @"保存失败(权限或格式)");
+                    });
+                });
+        };
+
+        long long status = ((long long(*)(id, SEL, long long))objc_msgSend)(
+            phLib, CCG_SEL("authorizationStatusForAccessLevel:"), 2);
+        if (status == 3 || status == 4) {
+            writeIt();
+        } else if (status == 1 || status == 2) {
+            if (done) done(NO, @"没有相册权限，请到 设置>隐私与安全性>照片 允许");
+        } else {
+            ((void(*)(id, SEL, long long, void (^)(long long)))objc_msgSend)(
+                phLib, CCG_SEL("requestAuthorizationForAccessLevel:handler:"), 2, ^(long long st) {
+                    if (st == 3 || st == 4) writeIt();
+                    else dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(NO, @"相册权限被拒绝"); });
+                });
+        }
+    } @catch (id e) {
+        if (done) done(NO, @"保存异常");
+    }
+}
 
 // ============ 网格素材库 ============
 @interface CCGBrowserViewController : UIViewController <UICollectionViewDataSource, UICollectionViewDelegate,
@@ -232,7 +289,8 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     NSString *_dir;                  // 当前目录
     NSMutableArray *_files;          // 文件/目录名(仅末级)
     NSMutableDictionary *_thumbs;    // 名字 -> UIImage
-    NSString *_selName;              // 当前选中素材名
+    NSString *_selName;              // 从细胞读到的选中名(格式未知, 仅参考)
+    NSString *_pickedName;           // 本界面实际点选的素材名(绝对准确, 蓝点以它为准)
     UICollectionView *_cv;
     // 导入暂存
     id _pendImg;
@@ -391,8 +449,7 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     return (NSInteger)[_files count];
 }
 
-- (void)jiggleCard:(UIView *)card {
-    CABasicAnimation *anim = [CABasicAnimation animationWithKeyPath:@"transform.rotation"];
+- (void)jiggleCard:(UIView *)card {    CABasicAnimation *anim = [CABasicAnimation animationWithKeyPath:@"transform.rotation"];
     [anim setFromValue:@(-0.03)];
     [anim setToValue:@(0.03)];
     [anim setDuration:0.12];
@@ -467,6 +524,20 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 - (void)delBtnTapped:(UITapGestureRecognizer *)g {
     NSString *name = objc_getAssociatedObject(g, &kCCGDelKey);
     if (name) [self confirmDelete:name];
+}
+
+// 编辑态下载: 把素材存进系统相册
+- (void)dlBtnTapped:(UIButton *)b {
+    NSString *name = objc_getAssociatedObject(b, &kCCGDlKey);
+    if (!name) return;
+    NSString *full = [_dir stringByAppendingPathComponent:name];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:full]) {
+        [self showTip:@"文件不存在"];
+        return;
+    }
+    CCGSaveToAlbum(full, ^(BOOL ok, NSString *msg) {
+        [self showTip:msg ?: (ok ? @"已保存到相册" : @"保存失败")];
+    });
 }
 
 - (void)nameTapped:(UITapGestureRecognizer *)g {
@@ -608,6 +679,18 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
             [delv addTarget:self action:@selector(delBtnTapped:) forControlEvents:UIControlEventTouchUpInside];
             [card addSubview:delv];
             objc_setAssociatedObject(delv, &kCCGDelKey, name, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+            // 编辑态下载钮(右下角, 保存该素材到相册)
+            UIButton *dlv = [[UIButton alloc] initWithFrame:CCGRect(cardW - 30, imgH - 30, 24, 24)];
+            [dlv setBackgroundColor:[UIColor colorWithWhite:0.0 alpha:0.55]];
+            [dlv.layer setCornerRadius:12.0];
+            [dlv.layer setMasksToBounds:YES];
+            [dlv setTitle:@"↓" forState:UIControlStateNormal];
+            [dlv setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            [dlv.titleLabel setFont:[UIFont boldSystemFontOfSize:15.0]];
+            [dlv addTarget:self action:@selector(dlBtnTapped:) forControlEvents:UIControlEventTouchUpInside];
+            [card addSubview:dlv];
+            objc_setAssociatedObject(dlv, &kCCGDlKey, name, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         [[cell contentView] addSubview:card];
     }
@@ -633,13 +716,16 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     [pill addGestureRecognizer:ng];
     objc_setAssociatedObject(ng, &kCCGNameKey, name, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    // 选中圆点(目录/编辑态不显示); 匹配对路径/扩展名不敏感(存储格式未知)
+    // 选中圆点(目录/编辑态不显示)
+    // 蓝点以用户在本界面实际点选的素材为准(原始细胞存储名格式不可控);
+    // 首次进入时用细胞里读到的名字兜底匹配
     if (!_editMode && !isDir) {
+        NSString *base = [name stringByDeletingPathExtension];
         BOOL on = NO;
-        if (_selName.length) {
-            NSString *a = [[_selName lastPathComponent] stringByDeletingPathExtension];
-            NSString *b = [name stringByDeletingPathExtension];
-            on = [a isEqualToString:b];
+        if (_pickedName.length) {
+            on = [[[_pickedName lastPathComponent] stringByDeletingPathExtension] isEqualToString:base];
+        } else if (_selName.length) {
+            on = [[[_selName lastPathComponent] stringByDeletingPathExtension] isEqualToString:base];
         }
         UIView *dot = [[UIView alloc] initWithFrame:CCGRect(6 + cardW / 2 - 8, imgH + 36, 16, 16)];
         [dot.layer setCornerRadius:9.0];
@@ -669,6 +755,7 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     // 先递一个透明"替身"VC 接住那次 dismiss, 网格就能留在原地, 只刷新圆点。
     id d = _cell;
     if (d && [d respondsToSelector:@selector(fileBrowser:didSelectFilePath:fileName:)]) {
+        _pickedName = name;   // 蓝点以此为准(细胞回读值格式不可控, 不覆盖它)
         _selName = name;
         UIViewController *sacrifice = [[UIViewController alloc] init];
         [sacrifice setModalPresentationStyle:UIModalPresentationOverFullScreen];
@@ -677,14 +764,6 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
             ((void(*)(id, SEL, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:didSelectFilePath:fileName:"), self, full, name);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 @try {
-                    // 重新读取真实选中名(细胞侧已写好), 刷新圆点
-                    id c = _cell;
-                    if (c && [c respondsToSelector:@selector(Key)] && [c respondsToSelector:@selector(assetNameWithKey:)]) {
-                        id key = CCG_MSG0(c, CCG_SEL("Key"));
-                        NSString *cur = CCG_MSG1(c, CCG_SEL("assetNameWithKey:"), key);
-                        if (cur) _selName = cur;
-                        CCGDbg([NSString stringWithFormat:@"SEL key=%@ stored=%@ picked=%@", key, cur, name]);
-                    }
                     [(UICollectionView *)_cv reloadData];
                 } @catch (id e) {}
             });
@@ -703,12 +782,22 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     UIAlertAction *yes = [UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
         [[NSFileManager defaultManager] removeItemAtPath:full error:nil];
         [_thumbs removeObjectForKey:name];
-        // 原细胞: 若当前素材指向被删文件则清空存储并刷新行/发通知
+        if (_pickedName && [_pickedName isEqualToString:name]) _pickedName = nil;
         id d = _cell;
         if (d && [d respondsToSelector:@selector(fileBrowser:deleteFileName:filePath:)]) {
-            ((void(*)(id, SEL, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:deleteFileName:filePath:"), self, name, full);
+            // 原实现删除后也会 dismiss 整个素材库; 同样用替身 VC 接住, 删除后留在网格里
+            UIViewController *sacrifice = [[UIViewController alloc] init];
+            [sacrifice setModalPresentationStyle:UIModalPresentationOverFullScreen];
+            [sacrifice setView:[[UIView alloc] initWithFrame:CGRectZero]];
+            [self presentViewController:sacrifice animated:NO completion:^{
+                ((void(*)(id, SEL, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:deleteFileName:filePath:"), self, name, full);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    @try { [self reloadFiles]; } @catch (id e) {}
+                });
+            }];
+        } else {
+            [self reloadFiles];
         }
-        [self reloadFiles];
     }];
     UIAlertAction *cc = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     [al addAction:yes];
@@ -833,6 +922,7 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     NSError *err = nil;
     if ([fm moveItemAtPath:src toPath:dst error:&err]) {
         [_thumbs removeObjectForKey:old];
+        if (_pickedName && [_pickedName isEqualToString:old]) _pickedName = newName;
         id d = _cell;
         if (d && [d respondsToSelector:@selector(fileBrowser:renameNewFileName:oldFileName:filePath:)]) {
             ((void(*)(id, SEL, id, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:renameNewFileName:oldFileName:filePath:"),
