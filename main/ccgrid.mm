@@ -206,9 +206,9 @@ static void CCGQLThumbAsync(NSString *path, NSString *name, NSIndexPath *ip, __w
                 CCGDbg(@"QL: ok");
                 dispatch_async(dispatch_get_main_queue(), ^{
                     @try {
-                        CCGBrowserViewController *s = wself;
+                        id s = wself;
                         if (!s) return;
-                        [s qlGotThumb:img forName:name atIp:ip];
+                        ((void(*)(id, SEL, id, id, id))objc_msgSend)(s, CCG_SEL("qlGotThumb:forName:atIp:"), img, name, ip);
                     } @catch (id e) {}
                 });
             } @catch (id e) { CCGDbg(@"QL: completion exception"); }
