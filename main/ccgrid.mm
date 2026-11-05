@@ -21,6 +21,8 @@
 #import <UIKit/UIKit.h>
 #import <ImageIO/ImageIO.h>
 #import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <string.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <pthread.h>
@@ -65,6 +67,33 @@ static void CCGEnsureLibs(void) {
     });
 }
 
+// 设置进程里 objc_getClass("AVURLAsset") 可能拿到不响应消息的假类(实测会转发崩溃),
+// 原二进制用的是编译期类引用 -> 直接从 CCAudioPlayPresCore 的 __objc_classrefs 槽位读真类指针。
+// 槽位 VA 由逆向原二进制得出 (bundle 固定文件, 不会变):
+//   0xc6520 -> _OBJC_CLASS_$_AVURLAsset
+//   0xc6528 -> _OBJC_CLASS_$_AVAssetImageGenerator
+static Class gRealAVURLAsset = Nil;
+static Class gRealAVAssetImageGenerator = Nil;
+
+static void CCGCacheRealAVFClasses(void) {
+    if (gRealAVURLAsset || gRealAVAssetImageGenerator) return;
+    @try {
+        uint32_t n = _dyld_image_count();
+        for (uint32_t i = 0; i < n; i++) {
+            const char *nm = _dyld_get_image_name(i);
+            if (!nm) continue;
+            const char *base = strstr(nm, "CCAudioPlayPresCore");
+            if (!base || strcmp(base, "CCAudioPlayPresCore") != 0) continue;
+            uintptr_t slide = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+            Class a = *(Class *)(slide + 0xc6520);
+            Class g = *(Class *)(slide + 0xc6528);
+            if (a && [(id)a respondsToSelector:CCG_SEL("URLAssetWithURL:options:")]) gRealAVURLAsset = a;
+            if (g && [(id)g respondsToSelector:CCG_SEL("assetImageGeneratorWithAsset:")]) gRealAVAssetImageGenerator = g;
+            break;
+        }
+    } @catch (id e) {}
+}
+
 static UIImage *CCGThumbForPath(NSString *path) {
     @try {
         CCGEnsureLibs();
@@ -86,15 +115,16 @@ static UIImage *CCGThumbForPath(NSString *path) {
 
 static UIImage *CCGVideoThumbForPath(NSString *path) {
     @try {
-        Class assetCls = objc_getClass("AVURLAsset");
-        Class genCls = objc_getClass("AVAssetImageGenerator");
+        CCGCacheRealAVFClasses();
+        Class assetCls = gRealAVURLAsset;
+        Class genCls = gRealAVAssetImageGenerator;
         if (!assetCls || !genCls) return nil;
         NSURL *url = [NSURL fileURLWithPath:path];
         id asset = ((id(*)(id, SEL, id, id))objc_msgSend)(assetCls, CCG_SEL("URLAssetWithURL:options:"), url, nil);
         if (!asset) return nil;
         id gen = ((id(*)(id, SEL, id))objc_msgSend)(genCls, CCG_SEL("assetImageGeneratorWithAsset:"), asset);
         if (!gen) return nil;
-        // 防御: 设置进程环境特殊, 任何一步不响应都直接放弃缩略图, 绝不让异常冒出去
+        // 防御: 任何一步不响应都直接放弃, 绝不让异常冒出去
         if (![gen respondsToSelector:CCG_SEL("copyCGImageAtTime:actualTime:")]) return nil;
         ((void(*)(id, SEL, id))objc_msgSend)(gen, CCG_SEL("setAppliesPreferredTrackTransform:"), (id)kCFBooleanTrue);
         // 手工构造 CMTime{value=0, timescale=1, flags=Valid, epoch=0}, 不引入 CoreMedia 链接依赖
@@ -139,6 +169,8 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     id _activeIp;
     double _preKbdOY;
     BOOL _isRoot;                    // 是否根目录(决定"关闭"行为)
+    CGPoint _lastTapPt;              // 普通模式下点名字直接改名的位置检测
+    double _lastTapAt;
 }
 - (instancetype)initWithCell:(id)cell directory:(NSString *)dir isRoot:(BOOL)root;
 - (void)closeTapped;
@@ -182,11 +214,13 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 
     UICollectionViewFlowLayout *flow = [[UICollectionViewFlowLayout alloc] init];
     [flow setMinimumInteritemSpacing:0];
-    [flow setMinimumLineSpacing:0];
+    [flow setMinimumLineSpacing:14];
     [flow setSectionInset:UIEdgeInsetsMake(14, 16, 70, 16)];
+    // item 宽 = (容器宽-32)/3, 卡片宽 = item宽-12 (左右各缩6), 卡片为正方形;
+    // 下方 58pt: 胶囊(8+22) + 圆点(36+16) + 4pt 余量, 任何机型都不会互相遮挡
     CGRect sb = [UIScreen mainScreen].bounds;
     double iw = (sb.size.width - 32.0) / 3.0;
-    double ih = (iw - 12.0) + 56.0;
+    double ih = (iw - 12.0) + 58.0;
     [flow setItemSize:CGSizeMake(iw, ih)];
 
     _cv = [[UICollectionView alloc] initWithFrame:[self view].bounds collectionViewLayout:flow];
@@ -199,6 +233,11 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     _editLP = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(longPressTapped:)];
     [_editLP setMinimumPressDuration:0.4];
     [_cv addGestureRecognizer:_editLP];
+    // 点击位置观察器: 不拦截触摸(cancelsTouchesInView=NO), 只记录位置,
+    // 供 didSelect 判断"点的是名字胶囊" -> 普通模式直接改名, 不用进编辑态
+    UITapGestureRecognizer *tapProbe = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(recordTap:)];
+    [tapProbe setCancelsTouchesInView:NO];
+    [_cv addGestureRecognizer:tapProbe];
     [[self view] addSubview:_cv];
 
     [self reloadFiles];
@@ -211,13 +250,13 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     if (!_cv) return;
-    // 兜底: 任何宽度下保证一行恰好 3 个
+    // 兜底: 任何宽度下保证一行恰好 3 个且不遮挡
     UICollectionViewFlowLayout *fl = (UICollectionViewFlowLayout *)_cv.collectionViewLayout;
     double want = (_cv.bounds.size.width - 32.0) / 3.0;
     if (want > 1.0 && fabs(fl.itemSize.width - want) > 1.0) {
-        [fl setItemSize:CGSizeMake(want, (want - 12.0) + 56.0)];
+        [fl setItemSize:CGSizeMake(want, (want - 12.0) + 58.0)];
         [fl setMinimumInteritemSpacing:0];
-        [fl setMinimumLineSpacing:0];
+        [fl setMinimumLineSpacing:14];
         [fl setSectionInset:UIEdgeInsetsMake(14, 16, 70, 16)];
         [fl invalidateLayout];
     }
@@ -323,6 +362,11 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     [_cv reloadData];
 }
 
+- (void)recordTap:(UITapGestureRecognizer *)g {
+    _lastTapPt = [g locationInView:_cv];
+    _lastTapAt = CFAbsoluteTimeGetCurrent();
+}
+
 - (void)longPressTapped:(UILongPressGestureRecognizer *)lp {
     if ([lp state] != UIGestureRecognizerStateBegan) return;
     CGPoint p = [lp locationInView:_cv];
@@ -361,9 +405,10 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     BOOL isDir = NO;
     [[NSFileManager defaultManager] fileExistsAtPath:full isDirectory:&isDir];
 
-    double w = [UIScreen mainScreen].bounds.size.width;
-    if (self.view.window) w = [self view].bounds.size.width;
-    double cardW = w / 3.0 - 12.0;
+    // 与布局公式完全一致: item 宽 = (容器宽-32)/3, 卡片 = item宽-12
+    double cvW = [self view].bounds.size.width;
+    if (cvW < 2.0) cvW = [UIScreen mainScreen].bounds.size.width;
+    double cardW = (cvW - 32.0) / 3.0 - 12.0;
     double imgH = cardW;
 
     // 白色圆角卡片(不裁切, 让删除钮伸出右上角)
@@ -422,6 +467,21 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
         [badge.layer setMasksToBounds:YES];
         [card addSubview:badge];
 
+        // 视频: 没取到缩略图时给居中大播放钮占位, 不显得像坏了
+        if (isVideo && !thumb) {
+            UIView *pc = [[UIView alloc] initWithFrame:CCGRect((cardW - 44) / 2.0, (imgH - 44) / 2.0, 44, 44)];
+            [pc setBackgroundColor:[UIColor colorWithWhite:0.0 alpha:0.35]];
+            [pc.layer setCornerRadius:22.0];
+            [pc.layer setMasksToBounds:YES];
+            UILabel *plc = [[UILabel alloc] initWithFrame:pc.bounds];
+            [plc setText:@"▶"];
+            [plc setFont:[UIFont systemFontOfSize:17.0]];
+            [plc setTextAlignment:NSTextAlignmentCenter];
+            [plc setTextColor:[UIColor whiteColor]];
+            [pc addSubview:plc];
+            [card addSubview:pc];
+        }
+
         // 视频左下角播放标志
         if (isVideo) {
             UIView *vb = [[UIView alloc] initWithFrame:CCGRect(6, imgH - 30, 24, 24)];
@@ -456,7 +516,8 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     if (_editMode) [self jiggleCard:card];
 
     // 名字胶囊(点按 -> 行内改名)
-    UIView *pill = [[UIView alloc] initWithFrame:CCGRect(10, imgH + 7, cardW - 8, 22)];
+    UIView *pill = [[UIView alloc] initWithFrame:CCGRect(10, imgH + 8, cardW - 8, 22)];
+    [pill setTag:921];
     [pill setBackgroundColor:[UIColor colorWithWhite:0.62 alpha:0.85]];
     [pill.layer setCornerRadius:11.0];
     [pill.layer setMasksToBounds:YES];
@@ -479,7 +540,7 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
             on = [_selName isEqualToString:name] || [_selName isEqualToString:full]
               || [_selName isEqualToString:[name stringByDeletingPathExtension]];
         }
-        UIView *dot = [[UIView alloc] initWithFrame:CCGRect(6 + cardW / 2 - 9, imgH + 33, 18, 18)];
+        UIView *dot = [[UIView alloc] initWithFrame:CCGRect(6 + cardW / 2 - 8, imgH + 36, 16, 16)];
         [dot.layer setCornerRadius:9.0];
         [dot.layer setMasksToBounds:YES];
         [dot setBackgroundColor:on ? [UIColor systemBlueColor] : [UIColor colorWithWhite:0.80 alpha:1.0]];
@@ -496,6 +557,32 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     NSString *full = [_dir stringByAppendingPathComponent:name];
     BOOL isDir = NO;
     [[NSFileManager defaultManager] fileExistsAtPath:full isDirectory:&isDir];
+
+    // 普通模式: 点在名字胶囊上 -> 直接行内改名(不用进编辑态)
+    if (!isDir) {
+        BOOL tappedPill = NO;
+        if (_activeField != nil) {
+            // 名字胶囊自己的手势已经先触发行内改名, 本次选择作废
+            tappedPill = YES;
+        } else {
+            double age = CFAbsoluteTimeGetCurrent() - _lastTapAt;
+            if (age >= 0 && age < 0.6) {
+                UICollectionViewCell *cell = [_cv cellForItemAtIndexPath:ip];
+                if (cell) {
+                    UIView *pill = [cell viewWithTag:921];
+                    if (pill) {
+                        CGRect pillFrame = [pill convertRect:pill.bounds toView:_cv];
+                        if (CGRectContainsPoint(pillFrame, _lastTapPt)) {
+                            [self beginRename:name inCell:cell atPill:pill];
+                            tappedPill = YES;
+                        }
+                    }
+                }
+            }
+        }
+        if (tappedPill) return;
+    }
+
     if (isDir) {
         // 子目录: 推入新浏览器(同一 delegate)
         CCGBrowserViewController *sub = [[CCGBrowserViewController alloc] initWithCell:_cell directory:full isRoot:NO];
