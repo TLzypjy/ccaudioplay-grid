@@ -66,38 +66,48 @@ static void CCGEnsureLibs(void) {
 }
 
 static UIImage *CCGThumbForPath(NSString *path) {
-    CCGEnsureLibs();
-    if (!path || !fnCGSrcCreate || !fnCGSrcImg) return nil;
-    NSData *data = [NSData dataWithContentsOfFile:path];
-    if (!data) return nil;
-    CGImageSourceRef src = ((CGImageSourceRef(*)(CFDataRef, CFDictionaryRef))fnCGSrcCreate)((__bridge CFDataRef)data, NULL);
-    if (!src) return nil;
-    CGImageRef cg = ((CGImageRef(*)(CGImageSourceRef, size_t, CFDictionaryRef))fnCGSrcImg)(src, 0, NULL);
-    CFRelease(src);
-    if (!cg) return nil;
-    UIImage *img = [UIImage imageWithCGImage:cg];
-    CGImageRelease(cg);
-    return img;
+    @try {
+        CCGEnsureLibs();
+        if (!path || !fnCGSrcCreate || !fnCGSrcImg) return nil;
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data) return nil;
+        CGImageSourceRef src = ((CGImageSourceRef(*)(CFDataRef, CFDictionaryRef))fnCGSrcCreate)((__bridge CFDataRef)data, NULL);
+        if (!src) return nil;
+        CGImageRef cg = ((CGImageRef(*)(CGImageSourceRef, size_t, CFDictionaryRef))fnCGSrcImg)(src, 0, NULL);
+        CFRelease(src);
+        if (!cg) return nil;
+        UIImage *img = [UIImage imageWithCGImage:cg];
+        CGImageRelease(cg);
+        return img;
+    } @catch (id e) {
+        return nil;
+    }
 }
 
 static UIImage *CCGVideoThumbForPath(NSString *path) {
-    Class assetCls = objc_getClass("AVURLAsset");
-    Class genCls = objc_getClass("AVAssetImageGenerator");
-    if (!assetCls || !genCls) return nil;
-    NSURL *url = [NSURL fileURLWithPath:path];
-    id asset = ((id(*)(id, SEL, id, id))objc_msgSend)(assetCls, CCG_SEL("URLAssetWithURL:options:"), url, nil);
-    if (!asset) return nil;
-    id gen = ((id(*)(id, SEL, id))objc_msgSend)(genCls, CCG_SEL("assetImageGeneratorWithAsset:"), asset);
-    if (!gen) return nil;
-    ((void(*)(id, SEL, id))objc_msgSend)(gen, CCG_SEL("setAppliesPreferredTrackTransform:"), (id)kCFBooleanTrue);
-    // 手工构造 CMTime{value=0, timescale=1, flags=Valid, epoch=0}, 不引入 CoreMedia 链接依赖
-    typedef struct { long long value; int timescale; unsigned flags; long long epoch; } CCGTime;
-    CCGTime t; t.value = 0; t.timescale = 1; t.flags = 1; t.epoch = 0;
-    CGImageRef cg = ((CGImageRef(*)(id, SEL, CCGTime, void *))objc_msgSend)(gen, CCG_SEL("copyCGImageAtTime:actualTime:"), t, NULL);
-    if (!cg) return nil;
-    UIImage *img = [UIImage imageWithCGImage:cg];
-    CGImageRelease(cg);
-    return img;
+    @try {
+        Class assetCls = objc_getClass("AVURLAsset");
+        Class genCls = objc_getClass("AVAssetImageGenerator");
+        if (!assetCls || !genCls) return nil;
+        NSURL *url = [NSURL fileURLWithPath:path];
+        id asset = ((id(*)(id, SEL, id, id))objc_msgSend)(assetCls, CCG_SEL("URLAssetWithURL:options:"), url, nil);
+        if (!asset) return nil;
+        id gen = ((id(*)(id, SEL, id))objc_msgSend)(genCls, CCG_SEL("assetImageGeneratorWithAsset:"), asset);
+        if (!gen) return nil;
+        // 防御: 设置进程环境特殊, 任何一步不响应都直接放弃缩略图, 绝不让异常冒出去
+        if (![gen respondsToSelector:CCG_SEL("copyCGImageAtTime:actualTime:")]) return nil;
+        ((void(*)(id, SEL, id))objc_msgSend)(gen, CCG_SEL("setAppliesPreferredTrackTransform:"), (id)kCFBooleanTrue);
+        // 手工构造 CMTime{value=0, timescale=1, flags=Valid, epoch=0}, 不引入 CoreMedia 链接依赖
+        typedef struct { long long value; int timescale; unsigned flags; long long epoch; } CCGTime;
+        CCGTime t; t.value = 0; t.timescale = 1; t.flags = 1; t.epoch = 0;
+        CGImageRef cg = ((CGImageRef(*)(id, SEL, CCGTime, void *))objc_msgSend)(gen, CCG_SEL("copyCGImageAtTime:actualTime:"), t, NULL);
+        if (!cg) return nil;
+        UIImage *img = [UIImage imageWithCGImage:cg];
+        CGImageRelease(cg);
+        return img;
+    } @catch (id e) {
+        return nil;
+    }
 }
 
 // ---------- 编辑态 associated key ----------
