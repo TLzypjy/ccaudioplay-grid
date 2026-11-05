@@ -143,32 +143,31 @@ static UIImage *CCGVideoThumbForPath(NSString *path) {
         if (!assetCls) { CCGDbg(@"AVF: real AVURLAsset unavailable"); return nil; }
         if (!genCls) { CCGDbg(@"AVF: real AVAssetImageGenerator unavailable"); return nil; }
         NSURL *url = [NSURL fileURLWithPath:path];
+        // 不用 respondsToSelector 当门槛(此进程里结果不可信, 原插件也是直接调用),
+        // 全部真调用 + @try 接异常, 失败一路降级
         id asset = ((id(*)(id, SEL, id, id))objc_msgSend)(assetCls, CCG_SEL("URLAssetWithURL:options:"), url, nil);
         if (!asset) { CCGDbg(@"AVF: asset nil"); return nil; }
         id gen = ((id(*)(id, SEL, id))objc_msgSend)(genCls, CCG_SEL("assetImageGeneratorWithAsset:"), asset);
         if (!gen) { CCGDbg(@"AVF: gen nil"); return nil; }
-        // 防御: 任何一步不响应都直接放弃, 绝不让异常冒出去
-        if (![gen respondsToSelector:CCG_SEL("copyCGImageAtTime:actualTime:")]) {
-            // 该方法在 AVFoundation 伞层; 设置进程可能只加载了底层 AVFCore,
-            // 补加载伞层后分类方法即挂到类上 (日志证实 gen 存在但缺此方法)
-            dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_NOW);
-            if (![gen respondsToSelector:CCG_SEL("copyCGImageAtTime:actualTime:")]) {
-                CCGDbg(@"AVF: gen no copyCGImage (after umbrella)");
-                return nil;
-            }
-        }
         ((void(*)(id, SEL, id))objc_msgSend)(gen, CCG_SEL("setAppliesPreferredTrackTransform:"), (id)kCFBooleanTrue);
         // 手工构造 CMTime{value=0, timescale=1, flags=Valid, epoch=0}, 不引入 CoreMedia 链接依赖
         typedef struct { long long value; int timescale; unsigned flags; long long epoch; } CCGTime;
         CCGTime t; t.value = 0; t.timescale = 1; t.flags = 1; t.epoch = 0;
         CGImageRef cg = ((CGImageRef(*)(id, SEL, CCGTime, void *))objc_msgSend)(gen, CCG_SEL("copyCGImageAtTime:actualTime:"), t, NULL);
-        if (!cg) { CCGDbg(@"AVF: cg nil"); return nil; }
+        if (!cg) {
+            CCGDbg([NSString stringWithFormat:@"AVF: cg nil (gen=%@)", [gen class]]);
+            return nil;
+        }
         UIImage *img = [UIImage imageWithCGImage:cg];
         CGImageRelease(cg);
-        if (img) CCGDbg(@"AVF: ok");
-        return img;
+        if (img) {
+            CCGDbg(@"AVF: ok");
+            return img;
+        }
+        return nil;
     } @catch (id e) {
-        CCGDbg(@"AVF: exception");
+        // 转发异常也在这里接住
+        CCGDbg(@"AVF: exception (copyCGImage)");
         return nil;
     }
 }
@@ -186,18 +185,11 @@ static void CCGQLThumbAsync(NSString *path, NSString *name, NSIndexPath *ip, __w
         });
         Class qlCls = objc_getClass("QLThumbnailGenerator");
         if (!qlLib || !qlCls) { CCGDbg(@"QL: framework/class unavailable"); return; }
-        if (![qlCls respondsToSelector:CCG_SEL("generatorWithMaximumSize:scale:requestOptions:")]) {
-            CCGDbg(@"QL: no class factory");
-            return;
-        }
+        // 不用 respondsToSelector 当门槛, 直接调, 异常 @try 接
         double scale = [UIScreen mainScreen].scale;
         id gen = ((id(*)(id, SEL, CGSize, double, long long))objc_msgSend)(
             qlCls, CCG_SEL("generatorWithMaximumSize:scale:requestOptions:"), CGSizeMake(600, 600), scale, 0);
         if (!gen) { CCGDbg(@"QL: generator nil"); return; }
-        if (![gen respondsToSelector:CCG_SEL("generateBestRepresentationForFile:completionHandler:")]) {
-            CCGDbg(@"QL: no generate method");
-            return;
-        }
         NSURL *url = [NSURL fileURLWithPath:path];
         void (^blk)(id, id) = ^(id thumb, id err) {
             @try {
@@ -638,12 +630,13 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
     [pill addGestureRecognizer:ng];
     objc_setAssociatedObject(ng, &kCCGNameKey, name, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    // 选中圆点(目录/编辑态不显示)
+    // 选中圆点(目录/编辑态不显示); 匹配对路径/扩展名不敏感(存储格式未知)
     if (!_editMode && !isDir) {
         BOOL on = NO;
-        if (_selName) {
-            on = [_selName isEqualToString:name] || [_selName isEqualToString:full]
-              || [_selName isEqualToString:[name stringByDeletingPathExtension]];
+        if (_selName.length) {
+            NSString *a = [[_selName lastPathComponent] stringByDeletingPathExtension];
+            NSString *b = [name stringByDeletingPathExtension];
+            on = [a isEqualToString:b];
         }
         UIView *dot = [[UIView alloc] initWithFrame:CCGRect(6 + cardW / 2 - 8, imgH + 36, 16, 16)];
         [dot.layer setCornerRadius:9.0];
