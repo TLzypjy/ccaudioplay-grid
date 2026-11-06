@@ -70,14 +70,29 @@ static void CCGEnsureLibs(void) {
     });
 }
 
-// 统一缩到方形小图(卡片显示尺寸的 retina 倍), 控制内存: 1080p 帧解出来是 8MB, 不缩会爆
+// 统一缩到方形小图(卡片显示尺寸的 retina 倍), 控制内存: 1080p 帧解出来是 8MB, 不缩会爆。
+// 注意用"居中裁切填满"(AspectFill)而不是 letterbox: 否则黑边会被烘进图里,
+// 卡片再做 AspectFill 就只能整体缩小, 看起来两边留黑不填满。
 static UIImage *CCGSquareThumb(UIImage *img, double side) {
     if (!img) return nil;
-    double sc = side / MAX(img.size.width, img.size.height);
-    if (sc > 1.0) sc = 1.0;
-    CGSize nsz = CGSizeMake(img.size.width * sc, img.size.height * sc);
-    UIGraphicsBeginImageContextWithOptions(CGSizeMake(side, side), NO, 0.0);
-    [img drawInRect:CCGRect((side - nsz.width) / 2.0, (side - nsz.height) / 2.0, nsz.width, nsz.height)];
+    double w = img.size.width, h = img.size.height;
+    if (w <= 1 || h <= 1) return img;
+    // 取短边做正方形裁切区域
+    double cropSide = MIN(w, h);
+    CGRect crop = CGRectMake((w - cropSide) / 2.0, (h - cropSide) / 2.0, cropSide, cropSide);
+    CGImageRef cg = img.CGImage;
+    if (cg) {
+        double sx = CGImageGetWidth(cg) / w, sy = CGImageGetHeight(cg) / h;
+        CGRect pxCrop = CGRectMake(crop.origin.x * sx, crop.origin.y * sy,
+                                   crop.size.width * sx, crop.size.height * sy);
+        CGImageRef cropped = CGImageCreateWithImageInRect(cg, pxCrop);
+        if (cropped) {
+            img = [UIImage imageWithCGImage:cropped];
+            CGImageRelease(cropped);
+        }
+    }
+    UIGraphicsBeginImageContextWithOptions(CGSizeMake(side, side), NO, 1.0);
+    [img drawInRect:CCGRect(0, 0, side, side)];
     UIImage *outImg = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
     return outImg ?: img;
@@ -237,27 +252,71 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 static const char kCCGDlKey = 0;    // 下载按钮 -> 文件名
 
 // ---------- 保存到相册 ----------
-// 真 PHPhotoLibrary 类指针(从原二进制 classref 槽位读, 同 AVF 方案; objc_getClass 在本进程被污染)
+// 真 PHPhotoLibrary 类指针(从原二进制 classrefs 段里按"类名字符串"核对, 同 AVF 方案;
+// objc_getClass 在本进程被污染返回假类)。
+// 原二进制 classrefs 段: VA 0xc63e0 起, 每项 8 字节; 其中 0xc64b0 引用 _OBJC_CLASS_$_PHPhotoLibrary。
 static Class gRealPHPhotoLibrary = Nil;
+
+static const char *CCGClassGetName(Class cls) {
+    if (!cls) return NULL;
+    @try {
+        // class name 位于 ro+24
+        void *p = (__bridge void *)cls;
+        uintptr_t bits = *(uintptr_t *)((uintptr_t)p + 32);
+        uintptr_t ro = bits & ~(uintptr_t)7;
+        if (!ro) return NULL;
+        const char *np = *(const char **)(ro + 24);
+        return np;
+    } @catch (id e) { return NULL; }
+}
 
 static void CCGCacheRealPHClass(void) {
     if (gRealPHPhotoLibrary) return;
     @try {
+        // 1) 先试常规查找(若环境干净, 这一步就够)
+        Class c = objc_getClass("PHPhotoLibrary");
+        const char *nm = CCGClassGetName(c);
+        if (c && nm && strcmp(nm, "PHPhotoLibrary") == 0
+            && [c respondsToSelector:CCG_SEL("performChanges:completionHandler:")]) {
+            gRealPHPhotoLibrary = c;
+            CCGDbg(@"PH: from objc_getClass");
+            return;
+        }
+        // 2) 从 Core 二进制 classrefs 段按类名核对
         uint32_t n = _dyld_image_count();
         for (uint32_t i = 0; i < n; i++) {
-            const char *nm = _dyld_get_image_name(i);
-            if (!nm) continue;
-            const char *base = strstr(nm, "CCAudioPlayPresCore");
-            if (!base || strcmp(base, "CCAudioPlayPresCore") != 0) continue;
+            const char *inm = _dyld_get_image_name(i);
+            if (!inm) continue;
+            const char *base = strstr(inm, "CCAudioPlayPresCore");
+            if (!base) continue;
             uintptr_t slide = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
-            void *slotA = (void *)(slide + 0xc64b0);   // _OBJC_CLASS_$_PHPhotoLibrary
-            Class a = *(__unsafe_unretained Class *)slotA;
-            if (a && [(id)a respondsToSelector:CCG_SEL("performChanges:completionHandler:")]) {
-                gRealPHPhotoLibrary = a;
+            // 扫描整个 classrefs 段(0xc63e0 起 0x160 字节), 用类名精确核对
+            for (uintptr_t va = 0xc63e0; va < 0xc6540; va += 8) {
+                Class cand = *(__unsafe_unretained Class *)(void *)(slide + va);
+                const char *cn = CCGClassGetName(cand);
+                if (cn && (strcmp(cn, "PHPhotoLibrary") == 0)) {
+                    if ([cand respondsToSelector:CCG_SEL("performChanges:completionHandler:")]) {
+                        gRealPHPhotoLibrary = cand;
+                        CCGDbg([NSString stringWithFormat:@"PH: from Core classref %#lx", (unsigned long)va]);
+                        return;
+                    }
+                }
+            }
+            // 3) 兜底: Core 里没有 -> 用 dlopen 后重新查
+            dlopen("/System/Library/Frameworks/Photos.framework/Photos", RTLD_NOW);
+            Class c2 = objc_getClass("PHPhotoLibrary");
+            const char *c2n = CCGClassGetName(c2);
+            if (c2 && c2n && strcmp(c2n, "PHPhotoLibrary") == 0
+                && [c2 respondsToSelector:CCG_SEL("performChanges:completionHandler:")]) {
+                gRealPHPhotoLibrary = c2;
+                CCGDbg(@"PH: from dlopen+getClass");
             }
             break;
         }
-    } @catch (id e) {}
+        if (!gRealPHPhotoLibrary) CCGDbg(@"PH: NOT FOUND");
+    } @catch (id e) {
+        CCGDbg(@"PH: cache exception");
+    }
 }
 
 // ---------- 保存到相册(现代 Photos API + 真类; 旧 legacySave 在本环境回调块里抛异常=闪退, 禁用) ----------
@@ -319,6 +378,24 @@ static void CCGSaveToAlbum(NSString *path, id target) {
     } @catch (id e) {
         ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"), NO, @"保存异常");
     }
+}
+
+// 记住用户点选的素材名(跨会话, 重进素材库蓝点不丢)
+static NSString *CCGPickStoreKey(NSString *dir) {
+    return [NSString stringWithFormat:@"CCGridPicked::%@", dir ?: @""];
+}
+static NSString *CCGLoadPicked(NSString *dir) {
+    @try {
+        return [[NSUserDefaults standardUserDefaults] stringForKey:CCGPickStoreKey(dir)];
+    } @catch (id e) { return nil; }
+}
+static void CCGSavePicked(NSString *dir, NSString *name) {
+    @try {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        if (name.length) [ud setObject:name forKey:CCGPickStoreKey(dir)];
+        else [ud removeObjectForKey:CCGPickStoreKey(dir)];
+        [ud synchronize];
+    } @catch (id e) {}
 }
 
 // ============ 网格素材库 ============
@@ -389,7 +466,7 @@ static void CCGSaveToAlbum(NSString *path, id target) {
                                                            target:self action:@selector(importTapped)];
     [self navigationItem].rightBarButtonItem = imp;
 
-    // 当前选中素材名
+    // 当前选中素材名: 优先用本界面保存过的点选记录(跨会话稳定), 细胞存储仅作参考
     @try {
         id c = _cell;
         if (c && [c respondsToSelector:@selector(Key)] && [c respondsToSelector:@selector(assetNameWithKey:)]) {
@@ -397,6 +474,7 @@ static void CCGSaveToAlbum(NSString *path, id target) {
             _selName = CCG_MSG1(c, CCG_SEL("assetNameWithKey:"), key);
         }
     } @catch (id e) { _selName = nil; }
+    _pickedName = CCGLoadPicked(_dir);
 
     UICollectionViewFlowLayout *flow = [[UICollectionViewFlowLayout alloc] init];
     [flow setMinimumInteritemSpacing:0];
@@ -860,6 +938,7 @@ static void CCGSaveToAlbum(NSString *path, id target) {
     if (d && [d respondsToSelector:@selector(fileBrowser:didSelectFilePath:fileName:)]) {
         _pickedName = name;
         _selName = name;
+        CCGSavePicked(_dir, name);   // 持久化, 重进素材库蓝点仍在
         [_cv reloadData];   // 圆点立即切换
 
         _pendSelPath = [full copy];
@@ -894,7 +973,7 @@ static void CCGSaveToAlbum(NSString *path, id target) {
         NSString *thumbCache = [self thumbCachePathForFull:full];
         [[NSFileManager defaultManager] removeItemAtPath:full error:nil];
         [_thumbs removeObjectForKey:name];
-        if (_pickedName && [_pickedName isEqualToString:name]) _pickedName = nil;
+        if (_pickedName && [_pickedName isEqualToString:name]) { _pickedName = nil; CCGSavePicked(_dir, nil); }
         if (thumbCache) [[NSFileManager defaultManager] removeItemAtPath:thumbCache error:nil];
         [self reloadFiles];   // 立即刷新列表
         id d = _cell;
@@ -1031,7 +1110,7 @@ static void CCGSaveToAlbum(NSString *path, id target) {
     NSError *err = nil;
     if ([fm moveItemAtPath:src toPath:dst error:&err]) {
         [_thumbs removeObjectForKey:old];
-        if (_pickedName && [_pickedName isEqualToString:old]) _pickedName = newName;
+        if (_pickedName && [_pickedName isEqualToString:old]) { _pickedName = newName; CCGSavePicked(_dir, newName); }
         // 同步移动缩略图缓存(同文件 mtime 不变, 仅路径键变化)
         NSString *oldCache = [self thumbCachePathForFull:src];
         NSString *newCache = [self thumbCachePathForFull:dst];
