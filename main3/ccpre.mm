@@ -123,7 +123,7 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
         if (!first) { first = f; firstIsVideo = isV; }
         if ([selName length]) {
             if ([f isEqualToString:selName] ||
-                [[[f stringByDeletingPathExtension] isEqualToString:selName]] ||
+                [[f stringByDeletingPathExtension] isEqualToString:selName] ||
                 [f hasPrefix:selName]) {
                 if (isVideo) *isVideo = isV;
                 return [dir stringByAppendingPathComponent:f];
@@ -261,16 +261,19 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
         [_mod addSubview:_progFill];
 
         NSArray *syms = @[@"backward.fill", @"pause.fill", @"forward.fill"];
-        NSArray *holders = @[[NSNull null], [NSNull null], [NSNull null]];
-        (void)holders;
-        UIImageView **btns[3] = {&_btnL, &_btnC, &_btnR};
+        UIImageView *b1 = [[UIImageView alloc] initWithFrame:CGRectZero];
+        UIImageView *b2 = [[UIImageView alloc] initWithFrame:CGRectZero];
+        UIImageView *b3 = [[UIImageView alloc] initWithFrame:CGRectZero];
+        UIImageView *btns[3] = {b1, b2, b3};
         for (int i = 0; i < 3; i++) {
+            UIImageView *iv = btns[i];
             UIImage *img = [UIImage systemImageNamed:syms[i]];
-            UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectZero];
             [iv setImage:img];
             [iv setContentMode:UIViewContentModeScaleAspectFit];
             [iv setTintColor:[UIColor whiteColor]];
-            *btns[i] = iv;
+            if (i == 0) _btnL = iv;
+            else if (i == 1) _btnC = iv;
+            else _btnR = iv;
             [_mod addSubview:iv];
         }
     }
@@ -327,7 +330,6 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
             ((void(*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setVideoGravity:"),
                                                  @"AVLayerVideoGravityResizeAspectFill");
             [((CALayer *)layer) setFrame:_bgHolder.bounds];
-            [((CALayer *)layer) setAutoresizingMask:kCALayerWidthSizable | kCALayerHeightSizable];
             [_bgHolder.layer addSublayer:(CALayer *)layer];
             _player = player;
             _looper = looper;
@@ -381,6 +383,9 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
     [_mod setFrame:CGRectMake(([self bounds].size.width - show.width) / 2.0,
                               ([self bounds].size.height - show.height) / 2.0,
                               show.width, show.height)];
+    if (_playerLayer) {
+        [(CALayer *)_playerLayer setFrame:_bgHolder.bounds];
+    }
 
     NSArray *order = @[@"iconFrame", @"titleFrame", @"subTitleFrame", @"elapsedTitleFrame",
                        @"durationTitleFrame", @"progressFrame", @"leftButtonFrame",
