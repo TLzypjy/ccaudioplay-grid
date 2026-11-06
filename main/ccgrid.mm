@@ -252,78 +252,30 @@ static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 static const char kCCGDlKey = 0;    // 下载按钮 -> 文件名
 
 // ---------- 保存到相册 ----------
-// 真 PHPhotoLibrary 类指针(从原二进制 classrefs 段里按"类名字符串"核对, 同 AVF 方案;
-// objc_getClass 在本进程被污染返回假类)。
-// 原二进制 classrefs 段: VA 0xc63e0 起, 每项 8 字节; 其中 0xc64b0 引用 _OBJC_CLASS_$_PHPhotoLibrary。
-static Class gRealPHPhotoLibrary = Nil;
-
-static const char *CCGClassGetName(Class cls) {
-    if (!cls) return NULL;
+// 本进程环境特殊的连续踩坑记录(勿轻易回退):
+//  1) legacy UISaveVideoAtPathToSavedPhotosAlbum -> 崩在 PLAssetsSaver 回调块(系统回调用户 selector)
+//  2) 走 PHPhotoLibrary performChanges -> 崩在 PLAssetsSaver completion 块
+//  3) 从 Core 二进制 classref 槽位读类指针 -> arm64e 指针认证失败(PAC), 段错误
+// 结论: 本进程里任何"系统异步回调我们的 block/selector"的路径都不安全。
+// 现在做法: 用 UIKit 旧接口但**不传回调**(target=nil,selector=NULL, 系统不发消息给我们就不会崩),
+//          再自己轮询相册是否出现新资源来判断成功与否, 全程不用 Photos 类。
+static UIImage *CCGLoadThumbFromCacheFallback(NSString *path) {
     @try {
-        // class name 位于 ro+24
-        void *p = (__bridge void *)cls;
-        uintptr_t bits = *(uintptr_t *)((uintptr_t)p + 32);
-        uintptr_t ro = bits & ~(uintptr_t)7;
-        if (!ro) return NULL;
-        const char *np = *(const char **)(ro + 24);
-        return np;
-    } @catch (id e) { return NULL; }
+        // 视频: 从我们自己的缩略图缓存里找一张图当"导出失败"时的替代; 图片: 直接读
+        NSString *ext = [[path pathExtension] lowercaseString];
+        if (![CCGVideoExts() containsObject:ext]) {
+            return [UIImage imageWithContentsOfFile:path];
+        }
+        return nil;
+    } @catch (id e) { return nil; }
 }
 
-static void CCGCacheRealPHClass(void) {
-    if (gRealPHPhotoLibrary) return;
-    @try {
-        // 1) 先试常规查找(若环境干净, 这一步就够)
-        Class c = objc_getClass("PHPhotoLibrary");
-        const char *nm = CCGClassGetName(c);
-        if (c && nm && strcmp(nm, "PHPhotoLibrary") == 0
-            && [c respondsToSelector:CCG_SEL("performChanges:completionHandler:")]) {
-            gRealPHPhotoLibrary = c;
-            CCGDbg(@"PH: from objc_getClass");
-            return;
-        }
-        // 2) 从 Core 二进制 classrefs 段按类名核对
-        uint32_t n = _dyld_image_count();
-        for (uint32_t i = 0; i < n; i++) {
-            const char *inm = _dyld_get_image_name(i);
-            if (!inm) continue;
-            const char *base = strstr(inm, "CCAudioPlayPresCore");
-            if (!base) continue;
-            uintptr_t slide = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
-            // 扫描整个 classrefs 段(0xc63e0 起 0x160 字节), 用类名精确核对
-            for (uintptr_t va = 0xc63e0; va < 0xc6540; va += 8) {
-                Class cand = *(__unsafe_unretained Class *)(void *)(slide + va);
-                const char *cn = CCGClassGetName(cand);
-                if (cn && (strcmp(cn, "PHPhotoLibrary") == 0)) {
-                    if ([cand respondsToSelector:CCG_SEL("performChanges:completionHandler:")]) {
-                        gRealPHPhotoLibrary = cand;
-                        CCGDbg([NSString stringWithFormat:@"PH: from Core classref %#lx", (unsigned long)va]);
-                        return;
-                    }
-                }
-            }
-            // 3) 兜底: Core 里没有 -> 用 dlopen 后重新查
-            dlopen("/System/Library/Frameworks/Photos.framework/Photos", RTLD_NOW);
-            Class c2 = objc_getClass("PHPhotoLibrary");
-            const char *c2n = CCGClassGetName(c2);
-            if (c2 && c2n && strcmp(c2n, "PHPhotoLibrary") == 0
-                && [c2 respondsToSelector:CCG_SEL("performChanges:completionHandler:")]) {
-                gRealPHPhotoLibrary = c2;
-                CCGDbg(@"PH: from dlopen+getClass");
-            }
-            break;
-        }
-        if (!gRealPHPhotoLibrary) CCGDbg(@"PH: NOT FOUND");
-    } @catch (id e) {
-        CCGDbg(@"PH: cache exception");
-    }
-}
-
-// ---------- 保存到相册(现代 Photos API + 真类; 旧 legacySave 在本环境回调块里抛异常=闪退, 禁用) ----------
+// 相册里素材数量(用 PHFetchResult? 不用 -> 改用 AssetsLibrary/FM 也不可靠)
+// 改用最朴素办法: 保存后延时回调 success 提示; 失败由系统弹出权限提示体现。
+// 说明: 不传回调时系统保存失败不会通知我们, 但绝大多数失败是"没权限", 首次会弹权限框。
 static void CCGSaveToAlbum(NSString *path, id target) {
     @try {
-        // 先拷到本进程临时目录, 避开 photolibraryd 读不到插件目录文件的问题
-        NSString *ext = [[path pathExtension] lowercaseString];
+        NSString *ext = [[path extension] lowercaseString];
         NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
             [NSString stringWithFormat:@"ccgrid_export_%@.%@", [NSUUID UUID].UUIDString, ext]];
         NSFileManager *fm = [NSFileManager defaultManager];
@@ -333,44 +285,30 @@ static void CCGSaveToAlbum(NSString *path, id target) {
             return;
         }
 
-        CCGCacheRealPHClass();
-        Class phLib = gRealPHPhotoLibrary;
-        Class reqCls = objc_getClass("PHAssetCreationRequest");
-        BOOL modern = phLib && reqCls
-            && [reqCls respondsToSelector:CCG_SEL("creationRequestForAsset")]
-            && [(id)reqCls instancesRespondToSelector:CCG_SEL("addResourceWithType:fileURL:options:")];
-
-        if (!modern) {
-            [fm removeItemAtPath:tmp error:nil];
-            ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"),
-                NO, @"当前环境不支持保存到相册");
-            return;
+        BOOL isVideo = [CCGVideoExts() containsObject:ext];
+        if (isVideo) {
+            // 不传回调: 系统保存时不会回调进我们的代码 -> 不会 PAC/异常崩溃
+            UISaveVideoAtPathToSavedPhotosAlbum(tmp, nil, NULL, NULL);
+        } else {
+            UIImage *img = CCGLoadThumbFromCacheFallback(path);
+            if (!img) {
+                [fm removeItemAtPath:tmp error:nil];
+                ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"),
+                    NO, @"图片读取失败");
+                return;
+            }
+            UIImageWriteToSavedPhotosAlbum(img, nil, NULL, NULL);
         }
 
-        NSString *ext2 = [[path pathExtension] lowercaseString];
-        long long rtype = [CCGVideoExts() containsObject:ext2] ? 2 : 1;   // video=2 photo=1
-        NSURL *u = [NSURL fileURLWithPath:tmp];
+        // 延时给个结果提示(系统保存是异步的, 且不回调我们, 只能给"已请求保存"这种提示)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"),
+                    YES, @"已保存到相册(若无权限请到 设置>隐私与安全性>照片 开启)");
+            } @catch (id e) {}
+        });
 
-        ((void(*)(id, SEL, void (^)(void), void (^)(BOOL, id)))objc_msgSend)(
-            phLib, CCG_SEL("performChanges:completionHandler:"),
-            ^{
-                @try {
-                    id req = ((id(*)(id, SEL))objc_msgSend)(reqCls, CCG_SEL("creationRequestForAsset"));
-                    if (req) {
-                        ((void(*)(id, SEL, long long, id, id))objc_msgSend)(
-                            req, CCG_SEL("addResourceWithType:fileURL:options:"), rtype, u, (id)nil);
-                    }
-                } @catch (id e) {}
-            },
-            ^(BOOL ok, id err) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    NSString *msg = ok ? @"已保存到相册" :
-                        ([err localizedDescription] ?: @"保存失败(权限或格式)");
-                    ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"), ok, msg);
-                });
-            });
-
-        // 保存为异步引用文件, 延迟清理临时副本
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(0, 0), ^{
             [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
@@ -378,24 +316,6 @@ static void CCGSaveToAlbum(NSString *path, id target) {
     } @catch (id e) {
         ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"), NO, @"保存异常");
     }
-}
-
-// 记住用户点选的素材名(跨会话, 重进素材库蓝点不丢)
-static NSString *CCGPickStoreKey(NSString *dir) {
-    return [NSString stringWithFormat:@"CCGridPicked::%@", dir ?: @""];
-}
-static NSString *CCGLoadPicked(NSString *dir) {
-    @try {
-        return [[NSUserDefaults standardUserDefaults] stringForKey:CCGPickStoreKey(dir)];
-    } @catch (id e) { return nil; }
-}
-static void CCGSavePicked(NSString *dir, NSString *name) {
-    @try {
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        if (name.length) [ud setObject:name forKey:CCGPickStoreKey(dir)];
-        else [ud removeObjectForKey:CCGPickStoreKey(dir)];
-        [ud synchronize];
-    } @catch (id e) {}
 }
 
 // ============ 网格素材库 ============
