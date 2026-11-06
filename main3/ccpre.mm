@@ -200,8 +200,9 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
     double _fontVals[4];
     NSTimer *_saveTimer;
     BOOL _frameDirty;
+    id _specifier;
 }
-@synthesize specifier;
+@synthesize specifier = _specifier;
 
 // Preferences 的 PSListController controllerForSpecifier: 用 initWithSpecifier: 实例化
 // detail 类; 不实现它会在转发后 doesNotRecognizeSelector 直接闪退 (v115 的崩因)。
