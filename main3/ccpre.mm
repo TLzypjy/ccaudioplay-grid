@@ -609,7 +609,7 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
         y += 38;
     }
 
-    y += 20;
+    y += 90;   // 底部大余量, 保证最后一行完整可见
     [scroll setContentSize:CGSizeMake(W, y + 40)];
 
     // 主题图 (Vinyl.png 若有)
@@ -803,10 +803,19 @@ static void CCPBuildOver(id self) {
         }
         if (!host) return;
         objc_setAssociatedObject(self, &_ccp_assoc_built, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        // v120: 整体接管 —— 不再往原表格上加子视图 (原表格自身滚动/布局会和覆盖层打架,
+        // 表现为预览被顶没/底部滚不到)。直接 setView 换成自己的容器: 固定 header + 独立滚动区。
+        UIView *container = [[UIView alloc] initWithFrame:host.bounds];
+        [container setAutoresizingMask:UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight];
+        [container setBackgroundColor:[UIColor colorWithWhite:0.94 alpha:1.0]];
+
         CCPPageHelper *helper = [[CCPPageHelper alloc] init];
         objc_setAssociatedObject(self, &_ccp_assoc_key, helper, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [helper buildOnHost:host];
-        CCPLog(@"page", @"overlay UI built (replica)");
+        [helper buildOnHost:container];
+
+        ((void(*)(id, SEL, id))objc_msgSend)(self, sel_registerName("setView:"), container);
+        CCPLog(@"page", @"view replaced with custom container (replica)");
     } @catch (id e) {
         CCPLog(@"page", [NSString stringWithFormat:@"build exception %@", e]);
     }
