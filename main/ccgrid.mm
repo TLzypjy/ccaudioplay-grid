@@ -4,8 +4,10 @@
  * 原理: 本二进制替换偏好设置 bundle 的主程序(CFBundleExecutable),
  *       +load 时 dlopen 同目录下的 CCAudioPlayPresCore(原二进制),
  *       原有全部设置逻辑(滑条/颜色/遮罩/3x2 自定义...)原样保留;
- *       仅 swizzle CCAssetCell 的 -selectExistingAsset,
- *       把图一那种列表式 SandboxFileBrowser 换成图二那种网格素材库:
+ *       仅 swizzle CCAssetCell 的两个素材入口:
+ *       -selectExistingAsset(从已有素材选择): 列表式 SandboxFileBrowser -> 网格素材库;
+ *       -selectImagePicker(从相册选择): 拉起 Filza 定位到该行素材的磁盘保存目录
+ *       (相册导入功能保留在网格库右上角"导入"入口)。
  *       三列网格 + GIF/视频 角标 + 名字胶囊 + 选中圆点,
  *       长按进入抖动编辑态(红-删除 + 点名字行内改名), 右上角导入(相册/文件)。
  *
@@ -1177,6 +1179,7 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
 
 // ============ swizzle ============
 static void (*gOrigSelectExistingAsset)(id, SEL) = NULL;
+static void (*gOrigSelectImagePicker)(id, SEL) = NULL;
 
 static void CCGSelectExistingAsset(id self, SEL _cmd) {
     @try {
@@ -1210,14 +1213,59 @@ static void CCGSelectExistingAsset(id self, SEL _cmd) {
     }
 }
 
+// 「从相册选择」按钮: 不再弹系统相册, 改为拉起 Filza 定位到该行素材的磁盘保存目录
+// (即 rootAssetPath, 与网格素材库打开的是同一个真实目录; 相册导入仍走网格库右上角"导入")。
+// 注意: 不用 canOpenURL (filza 未在宿主 Info.plist 的 LSApplicationQueriesSchemes 声明时必返回 NO),
+// 直接 openURL 异步拉起, completionHandler 传 nil -> 不回调进本进程, 无 PAC 风险;
+// 目录拿不到/构造失败时退回原相册实现。
+static void CCGSelectImagePicker(id self, SEL _cmd) {
+    @try {
+        NSString *root = nil;
+        if ([self respondsToSelector:@selector(rootAssetPath)]) {
+            root = ((NSString *(*)(id, SEL))objc_msgSend)(self, CCG_SEL("rootAssetPath"));
+        }
+        if (![root length]) {
+            if (gOrigSelectImagePicker) gOrigSelectImagePicker(self, _cmd);
+            return;
+        }
+        // 路径按查询参数值编码: 仅保留字母数字与 -._~/, 其余(含 ?&= 空格中文)全部转义
+        NSMutableCharacterSet *allowed = [[NSMutableCharacterSet alphanumericCharacterSet] mutableCopy];
+        [allowed addCharactersInString:@"-._~/"];
+        NSString *enc = [root stringByAddingPercentEncodingWithAllowedCharacters:allowed];
+        NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"filza://view?path=%@", enc]];
+        if (!url) {
+            if (gOrigSelectImagePicker) gOrigSelectImagePicker(self, _cmd);
+            return;
+        }
+        SEL openSel = CCG_SEL("openURL:options:completionHandler:");
+        UIApplication *app = [UIApplication sharedApplication];
+        if ([app respondsToSelector:openSel]) {
+            ((void(*)(id, SEL, id, id, id))objc_msgSend)(app, openSel, url, [NSDictionary dictionary], nil);
+        } else {
+            // 极老系统兜底
+            ((void(*)(id, SEL, id))objc_msgSend)(app, CCG_SEL("openURL:"), url);
+        }
+    } @catch (id e) {
+        if (gOrigSelectImagePicker) gOrigSelectImagePicker(self, _cmd);
+    }
+}
+
 static void CCGSwizzleAfterCoreLoad(void) {
     Class cell = objc_getClass("CCAssetCell");
     if (!cell) return;
     SEL sel = CCG_SEL("selectExistingAsset");
     Method m = class_getInstanceMethod(cell, sel);
-    if (!m) return;
-    gOrigSelectExistingAsset = (void (*)(id, SEL))method_getImplementation(m);
-    method_setImplementation(m, (IMP)CCGSelectExistingAsset);
+    if (m) {
+        gOrigSelectExistingAsset = (void (*)(id, SEL))method_getImplementation(m);
+        method_setImplementation(m, (IMP)CCGSelectExistingAsset);
+    }
+    // 「从相册选择」-> 拉起 Filza 定位素材目录
+    SEL selIP = CCG_SEL("selectImagePicker");
+    Method mIP = class_getInstanceMethod(cell, selIP);
+    if (mIP) {
+        gOrigSelectImagePicker = (void (*)(id, SEL))method_getImplementation(mIP);
+        method_setImplementation(mIP, (IMP)CCGSelectImagePicker);
+    }
 }
 
 @interface CCGBootstrap : NSObject
