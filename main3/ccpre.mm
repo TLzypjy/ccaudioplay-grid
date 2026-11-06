@@ -21,10 +21,6 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-// 与 bundle_struct 一致的最小声明 (Preferences 私有框架, 运行时动态解析)
-@interface PSListController : UIViewController
-@property (retain, nonatomic) id specifier;
-@end
 
 #define CCP_DOMAIN @"com.thefool.ccaudioplaypres"
 #define CCP_NOTE_FRAME @"com.thefool.ccaudioplaypres/updateCustomFrameNotificationt"
@@ -185,10 +181,13 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
 
 @end
 
-@interface CCALLCustomController : PSListController
+@interface CCALLCustomController : UIViewController
+@property (nonatomic, retain) id specifier;
 @end
 
-@implementation CCALLCustomController {
+@implementation CCALLCustomController
+@synthesize specifier;
+{
     UIScrollView *_scroll;
     CCALLPreviewView *_preview;
     UISegmentedControl *_seg;
