@@ -34,6 +34,14 @@ static char _ccp_assoc_font_idx;
 static char _ccp_assoc_info;
 static char _ccp_assoc_built;
 
+// ---------------- 容器 (强制布局, 免疫构建时机) ----------------
+@interface CCPContainerView : UIView
+@property (nonatomic, retain) UIView *header;
+@property (nonatomic, retain) UIScrollView *scroll;
+@property (nonatomic, assign) CGFloat headerH;
+- (void)ccpForceLayout;
+@end
+
 static void CCPLog(NSString *tag, NSString *line) {
     @try {
         NSString *p = @"/var/mobile/Documents/ccpre_debug.log";
@@ -481,7 +489,7 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
              @"durationTitleFont": [dom objectForKey:@"durationTitleFont"] ?: @10.0};
 }
 
-- (void)buildOnHost:(UIView *)host {
+- (void)buildOnHost:(CCPContainerView *)host {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     NSDictionary *dom = [ud persistentDomainForName:CCP_DOMAIN] ?: @{};
     NSArray *keys = @[@"iconFrame", @"titleFrame", @"subTitleFrame", @"elapsedTitleFrame",
@@ -509,6 +517,8 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
     [header setBackgroundColor:[UIColor colorWithWhite:0.94 alpha:1.0]];
     [header setAutoresizingMask:UIViewAutoresizingFlexibleWidth];
     [host addSubview:header];
+    [host setHeader:header];
+    [host setHeaderH:headerH];
 
     UILabel *pt = [[UILabel alloc] initWithFrame:CGRectMake(16, 14, inner, 18)];
     [pt setText:@"实时预览 (真实素材/主题/字体, 数值随滑条变化)"];
@@ -538,6 +548,7 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
     [scroll setAlwaysBounceVertical:YES];
     [scroll setBackgroundColor:[UIColor colorWithWhite:0.94 alpha:1.0]];
     [host addSubview:scroll];
+    [host setScroll:scroll];
 
     CGFloat y = 14;
     y = [self addSwitchRowIn:scroll y:y label:@"启用自定义" key:@"isEnableCustomFrame" def:NO width:W];
@@ -794,6 +805,19 @@ static void (*ccp_orig_vdl)(id, SEL) = NULL;
 static BOOL ccp_via_super = NO;
 static int ccp_tries = 0;
 
+// ---------------- 容器实现 ----------------
+@implementation CCPContainerView
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    [self ccpForceLayout];
+}
+- (void)ccpForceLayout {
+    CGRect b = self.bounds;
+    [_header setFrame:CGRectMake(0, 0, b.size.width, _headerH)];
+    [_scroll setFrame:CGRectMake(0, _headerH, b.size.width, MAX(b.size.height - _headerH, 100))];
+}
+@end
+
 static void CCPBuildOver(id self) {
     @try {
         if (objc_getAssociatedObject(self, &_ccp_assoc_built)) return;
@@ -801,13 +825,12 @@ static void CCPBuildOver(id self) {
         if ([self respondsToSelector:@selector(view)]) {
             host = ((UIView *(*)(id, SEL))objc_msgSend)(self, sel_registerName("view"));
         }
-        if (!host) return;
         objc_setAssociatedObject(self, &_ccp_assoc_built, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-        // v120: 整体接管 —— 不再往原表格上加子视图 (原表格自身滚动/布局会和覆盖层打架,
-        // 表现为预览被顶没/底部滚不到)。直接 setView 换成自己的容器: 固定 header + 独立滚动区。
-        UIView *container = [[UIView alloc] initWithFrame:host.bounds];
-        [container setAutoresizingMask:UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight];
+        // v121: 容器用自定义布局类, header/scroll 几何在每次 layoutSubviews 强制摆放;
+        // 内容尺寸取屏幕绝对值, 不依赖构建时 host 的状态。
+        CCPContainerView *container = [[CCPContainerView alloc] initWithFrame:
+            CGRectMake(0, 0, [UIScreen mainScreen].bounds.size.width, [UIScreen mainScreen].bounds.size.height)];
         [container setBackgroundColor:[UIColor colorWithWhite:0.94 alpha:1.0]];
 
         CCPPageHelper *helper = [[CCPPageHelper alloc] init];
@@ -815,7 +838,27 @@ static void CCPBuildOver(id self) {
         [helper buildOnHost:container];
 
         ((void(*)(id, SEL, id))objc_msgSend)(self, sel_registerName("setView:"), container);
-        CCPLog(@"page", @"view replaced with custom container (replica)");
+
+        CCPLog(@"page", [NSString stringWithFormat:@"view replaced; self.view=%@ frame=%@ header=%@ scroll=%@",
+               [[self view] class], NSStringFromCGRect([[self view] frame]),
+               NSStringFromCGRect([container.header frame]), NSStringFromCGRect([container.scroll frame])]);
+
+        // 0.6s 后复查: 视图层级真相 (self.view 是否还是我们的容器, 在不在窗口上)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                UIView *v = ((UIView *(*)(id, SEL))objc_msgSend)(self, sel_registerName("view"));
+                CCPLog(@"diag", [NSString stringWithFormat:@"t+0.6s self.view=%@ frame=%@ window=%@ "
+                                 @"container.window=%d container.super=%@ header.frame=%@ scroll.frame=%@ scroll.offset=%@ content=%@",
+                                 [v class], NSStringFromCGRect(v.frame), v.window,
+                                 container.window != nil,
+                                 [container superview] ? [[container superview] class] : @"nil",
+                                 NSStringFromCGRect([container.header frame]),
+                                 NSStringFromCGRect([container.scroll frame]),
+                                 NSStringFromCGPoint([container.scroll contentOffset]),
+                                 NSStringFromCGSize([container.scroll contentSize])]);
+            } @catch (id e) {}
+        });
     } @catch (id e) {
         CCPLog(@"page", [NSString stringWithFormat:@"build exception %@", e]);
     }
