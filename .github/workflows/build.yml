@@ -53,4 +53,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ccgrid-dylib
-          path: .theos/obj/CCAudioPlayPres.dylib
+          path: |
+            .theos/obj/CCAudioPlayPres.dylib
+            .theos/obj/CCAudioPlayAllLayout.dylib
