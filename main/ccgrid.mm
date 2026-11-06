@@ -275,7 +275,7 @@ static UIImage *CCGLoadThumbFromCacheFallback(NSString *path) {
 // 说明: 不传回调时系统保存失败不会通知我们, 但绝大多数失败是"没权限", 首次会弹权限框。
 static void CCGSaveToAlbum(NSString *path, id target) {
     @try {
-        NSString *ext = [[path extension] lowercaseString];
+        NSString *ext = [[path pathExtension] lowercaseString];
         NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
             [NSString stringWithFormat:@"ccgrid_export_%@.%@", [NSUUID UUID].UUIDString, ext]];
         NSFileManager *fm = [NSFileManager defaultManager];
@@ -316,6 +316,24 @@ static void CCGSaveToAlbum(NSString *path, id target) {
     } @catch (id e) {
         ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"), NO, @"保存异常");
     }
+}
+
+// 记住用户点选的素材名(跨会话, 重进素材库蓝点不丢)
+static NSString *CCGPickStoreKey(NSString *dir) {
+    return [NSString stringWithFormat:@"CCGridPicked::%@", dir ?: @""];
+}
+static NSString *CCGLoadPicked(NSString *dir) {
+    @try {
+        return [[NSUserDefaults standardUserDefaults] stringForKey:CCGPickStoreKey(dir)];
+    } @catch (id e) { return nil; }
+}
+static void CCGSavePicked(NSString *dir, NSString *name) {
+    @try {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        if (name.length) [ud setObject:name forKey:CCGPickStoreKey(dir)];
+        else [ud removeObjectForKey:CCGPickStoreKey(dir)];
+        [ud synchronize];
+    } @catch (id e) {}
 }
 
 // ============ 网格素材库 ============
