@@ -414,13 +414,12 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
             double artSide = discSide * 0.42;
             [_artView setFrame:CGRectMake(cx - artSide / 2, cy - artSide / 2, artSide, artSide)];
             // 环: path 用 _mod 坐标系, layer frame 对齐 _mod
+            // 注意: 不要 release layer.path 的旧值 (getter 返回非持有引用),
+            // v118 每秒刷新时对它 CGPathRelease 造成过度释放 -> setPath CFEqual 野指针崩溃
             CGMutablePathRef path = CGPathCreateMutable();
             double r = side / 2.0 - 1.5;
             CGPathAddEllipseInRect(path, NULL, CGRectMake(cx - r, cy - r, r * 2, r * 2));
-            CGPathRef old;
-            old = _ringTrack.path; if (old) CGPathRelease(old);
             [_ringTrack setPath:path];
-            old = _ringProg.path; if (old) CGPathRelease(old);
             [_ringProg setPath:path];
             CGPathRelease(path);
             [_ringTrack setFrame:CGRectMake(0, 0, _mod.bounds.size.width, _mod.bounds.size.height)];
@@ -631,11 +630,7 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
 
     [self refreshReplica];
     [self fetchNowPlaying];
-
-    // 1s 定时: 刷新播放进度/歌名
-    _nowTimer = [NSTimer timerWithTimeInterval:1.0 target:self selector:@selector(fetchNowPlaying)
-                                      userInfo:nil repeats:YES];
-    [[NSRunLoop mainRunLoop] addTimer:_nowTimer forMode:NSRunLoopCommonModes];
+    // 播放进度不刷新 (用户要求): 只在进入页面时取一次播放信息, 不再起定时器
 }
 
 - (void)fetchNowPlaying {
