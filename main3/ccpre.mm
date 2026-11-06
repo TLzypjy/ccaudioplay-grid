@@ -64,7 +64,7 @@ static NSRegularExpression *CCPNumRe(void) {
 
 static BOOL CCPExtract4(NSString *s, double out4[4]) {
     if (![s isKindOfClass:[NSString class]] || ![s length]) return NO;
-    NSArray *ms = [[CCPNumRe() matchesInString:s options:0 range:NSMakeRange(0, [s length])]];
+    NSArray *ms = [CCPNumRe() matchesInString:s options:0 range:NSMakeRange(0, [s length])];
     if ([ms count] < 4) return NO;
     for (int i = 0; i < 4; i++) {
         out4[i] = [[s substringWithRange:[ms[i] range]] doubleValue];
@@ -282,17 +282,17 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
             [sl setMinimumValue:0.0];
             [sl setMaximumValue:(d <= 1) ? 340.0 : 260.0];
             [sl setValue:(float)val];
+            UILabel *vl = [[UILabel alloc] initWithFrame:CGRectMake(16 + inner - 70, y + 5, 70, 20)];
+            [vl setText:[NSString stringWithFormat:@"%@ %.1f", dims[d], val]];
+            [vl setFont:[UIFont systemFontOfSize:12.0]];
+            [vl setTextAlignment:NSTextAlignmentRight];
+            [vl setTextColor:[UIColor darkGrayColor]];
             objc_setAssociatedObject(sl, &_ccp_assoc_info,
                                      @{@"key": k, @"idx": @(d), @"dim": dims[d], @"vlabel": vl},
                                      OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [sl addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
             [scroll addSubview:sl];
 
-            UILabel *vl = [[UILabel alloc] initWithFrame:CGRectMake(16 + inner - 70, y + 5, 70, 20)];
-            [vl setText:[NSString stringWithFormat:@"%@ %.1f", dims[d], val]];
-            [vl setFont:[UIFont systemFontOfSize:12.0]];
-            [vl setTextAlignment:NSTextAlignmentRight];
-            [vl setTextColor:[UIColor darkGrayColor]];
             [scroll addSubview:vl];
             y += 34;
         }
