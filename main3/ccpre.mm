@@ -848,11 +848,12 @@ static void CCPBuildOver(id self) {
                        dispatch_get_main_queue(), ^{
             @try {
                 UIView *v = ((UIView *(*)(id, SEL))objc_msgSend)(self, sel_registerName("view"));
+                UIView *sup = [container superview];
                 CCPLog(@"diag", [NSString stringWithFormat:@"t+0.6s self.view=%@ frame=%@ window=%@ "
-                                 @"container.window=%d container.super=%@ header.frame=%@ scroll.frame=%@ scroll.offset=%@ content=%@",
+                                 @"containerInWindow=%d container.super=%@ header.frame=%@ scroll.frame=%@ scroll.offset=%@ content=%@",
                                  [v class], NSStringFromCGRect(v.frame), v.window,
                                  container.window != nil,
-                                 [container superview] ? [[container superview] class] : @"nil",
+                                 sup ? NSStringFromClass([sup class]) : @"nil",
                                  NSStringFromCGRect([container.header frame]),
                                  NSStringFromCGRect([container.scroll frame]),
                                  NSStringFromCGPoint([container.scroll contentOffset]),
