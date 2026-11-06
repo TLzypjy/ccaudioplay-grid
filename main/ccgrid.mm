@@ -7,7 +7,7 @@
  *       swizzle CCAssetCell 的两个素材入口 + 细胞初始化:
  *       -selectExistingAsset(从已有素材选择): 列表式 SandboxFileBrowser -> 网格素材库;
  *       -selectImagePicker(从相册选择, 改名「素材目录」): 拉起 Filza 定位到该行素材的
- *       磁盘保存目录 (官方 URL 形式 filza://view/<路径>);
+ *       磁盘保存目录 (裸路径形式 filza:///<路径>, 直接跳进目录);
  *       -initWithStyle:reuseIdentifier:specifier: 后扫描按钮把「从相册选择」改为「素材目录」
  *       (相册导入功能保留在网格库右上角"导入"入口)。
  *       三列网格 + GIF/视频 角标 + 名字胶囊 + 选中圆点,
@@ -1245,11 +1245,12 @@ static void CCGSelectExistingAsset(id self, SEL _cmd) {
 // 「从相册选择」按钮: 不再弹系统相册, 改为拉起 Filza 定位到该行素材的磁盘保存目录
 // (即 rootAssetPath, 与网格素材库打开的是同一个真实目录; 相册导入仍走网格库右上角"导入")。
 // URL 形式踩坑记录:
-//   v109 filza://view?path=%2Fvar%2F...  -> Filza 打开但不跳转 (查询参数形式非官方格式, 且 Filza 不反转义)
-//   v110 filza://view?path=/var/...      -> URL 无路径成分, Filza 原样停在原处 (用户看=没反应)
-//   官方文档(tigisoftware)只有路径拼接形式: filza://view/路径/到/目标
-//   (scheme=filza, host=view, 目标路径就是 URL 的 path; 例: filza://view/Applications/Filza.app)
-//   -> v111 用 filza://view + 去尾斜杠的原始路径 (仅转义空格/引号/非ASCII等非法字符)。
+//   v109 filza://view?path=%2Fvar%2F...  -> Filza 打开但不跳转 (Filza 不反转义 query 值)
+//   v110 filza://view?path=/var/...      -> URL 无路径成分, Filza 原样停在原处
+//   v111 filza://view/var/mobile/...     -> 停在父目录高亮目标 (view=host 是"打开文件并高亮"动作)
+//   实测+社区标准写法(快捷指令/StackOverflow tweak): 裸路径形式直接跳进目录:
+//   filza://<路径>  例: filza:///var/mobile/Documents/  (无动作host, 保留尾部斜杠标记目录)
+//   -> v112 用 filza:// + rootAssetPath 原样 (仅转义空格/引号/非ASCII等非法字符)。
 // 注意: 不用 canOpenURL (filza 未在宿主 Info.plist 的 LSApplicationQueriesSchemes 声明时必返回 NO),
 // 直接 openURL 异步拉起, completionHandler 传 nil -> 不回调进本进程, 无 PAC 风险;
 // 目录拿不到/构造失败时退回原相册实现。
@@ -1263,16 +1264,12 @@ static void CCGSelectImagePicker(id self, SEL _cmd) {
             if (gOrigSelectImagePicker) gOrigSelectImagePicker(self, _cmd);
             return;
         }
-        // 去掉尾部斜杠(rootAssetPath 以 / 结尾), 拼成 filza://view/var/mobile/...
-        NSString *path = root;
-        while ([path length] > 1 && [path hasSuffix:@"/"]) {
-            path = [path substringToIndex:[path length] - 1];
-        }
+        // 裸路径形式: filza:///var/mobile/... (rootAssetPath 自带尾部斜杠, 原样保留标记目录)
         // 最小转义: 字母数字与 -._~/:!$'()*,;=@ 原样保留, 其余(空格 # % <> 引号 中文等)才转义
         NSMutableCharacterSet *allowed = [[NSMutableCharacterSet alphanumericCharacterSet] mutableCopy];
         [allowed addCharactersInString:@"-._~/:!$'()*,;=@"];
-        NSString *enc = [path stringByAddingPercentEncodingWithAllowedCharacters:allowed];
-        NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"filza://view%@", enc]];
+        NSString *enc = [root stringByAddingPercentEncodingWithAllowedCharacters:allowed];
+        NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"filza://%@", enc]];
         if (!url) {
             if (gOrigSelectImagePicker) gOrigSelectImagePicker(self, _cmd);
             return;
