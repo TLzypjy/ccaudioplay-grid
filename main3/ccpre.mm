@@ -181,6 +181,9 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
 
 @end
 
+// 与 Preferences 对接的最小声明
+@class PSSpecifier;
+
 @interface CCALLCustomController : UIViewController
 @property (nonatomic, retain) id specifier;
 @end
@@ -199,6 +202,25 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
     BOOL _frameDirty;
 }
 @synthesize specifier;
+
+// Preferences 的 PSListController controllerForSpecifier: 用 initWithSpecifier: 实例化
+// detail 类; 不实现它会在转发后 doesNotRecognizeSelector 直接闪退 (v115 的崩因)。
+- (instancetype)initWithSpecifier:(PSSpecifier *)spec {
+    if ((self = [super initWithNibName:nil bundle:nil])) {
+        _specifier = spec;
+    }
+    return self;
+}
+
+- (instancetype)initWithNibName:(NSString *)n bundle:(NSBundle *)b {
+    if ((self = [super initWithNibName:n bundle:b])) {
+    }
+    return self;
+}
+
+// 防御: Preferences 对 controller 的常见回发, 一律 no-op
+- (void)reloadSpecifiers {}
+- (void)reloadSpecifiersAndRelayout {}
 
 - (NSString *)cc_title {
     return @"自定义设置(全模块)";
