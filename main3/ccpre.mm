@@ -1,19 +1,20 @@
 /**
- * CCALLCustomController — 自定义设置页 (全模块): 预览 + 模块大小切换 + 滑条
+ * CCALLCustomPage — 自定义设置页 (全模块): 预览 + 模块大小切换 + 滑条
  *
- * 替换原 "3x2自定义" (CCAudio3x2ListController) 页面。repack 时把 Root.plist 的
- * detail 指到本类 (类在 CCAudioPlayPres loader 二进制里, 设置进程可直接用)。
+ * v115/v116 的教训: 让 Preferences 直接实例化我们自己的 detail 控制器类
+ * (PSLinkCell detail -> CCALLCustomController) 会在 PSListController
+ * controllerForSpecifier: 的实例化协议上崩 (两次 .ips 同一位置)。
  *
- * 功能:
- *  1. 顶部实时预览: 按所选模块大小 (2x2/2x3/3x2/4x2/4x3) 等比缩放的模块形状,
- *     9 个元素占位物按当前 frame 值摆放, 滑条一动立即重摆。
- *  2. 位置滑条: 9 元素 x (X/Y/高/宽), 与原 CCFrameCell 同键同格式 ——
- *     读取现有值后只替换其中的数字 (模板保持, 兼容任意显示格式);
- *     无既有值时用默认模板 "X:%.1f Y:%.1f 高度:%.1f 宽度:%.1f"。
- *  3. 字体滑条: 复用 titleFont/subtitleFont/elapsedTitleFont/durationTitleFont。
- *  4. 每次改动: 写 NSUserDefaults domain com.thefool.ccaudioplaypres + 同步 +
- *     发 Darwin 通知 com.thefool.ccaudioplaypres/updateCustomFrameNotificationt
- *     (字体走 updateCustomFontNotificationt), 真机 CC 模块实时刷新。
+ * v117 思路: Root.plist 保持原样 (detail = CCAudio3x2ListController, 原本就能正常
+ * 打开), 在 loader 里给 CCAudio3x2ListController 的 viewDidLoad 加覆盖
+ * (class_addMethod 优先, 失败说明它自己实现了则换 IMP), 原逻辑跑完后把
+ * 预览+分段+滑条界面盖在整个 view 上面 (不透明, 盖住原表格)。
+ * 安装结果写 /var/mobile/Documents/ccpre_debug.log 便于诊断。
+ *
+ * 写值: 与原 CCFrameCell 同键; 模板保持 —— 读现有值只替换其中数字,
+ * 无既有值时用默认模板 "X:%.1f Y:%.1f 高度:%.1f 宽度:%.1f"。
+ * 每次改动发 Darwin 通知 com.thefool.ccaudioplaypres/updateCustomFrameNotificationt
+ * (字体走 updateCustomFontNotificationt), 真机 CC 模块实时刷新。
  */
 
 #import <Foundation/Foundation.h>
@@ -21,69 +22,81 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-
 #define CCP_DOMAIN @"com.thefool.ccaudioplaypres"
 #define CCP_NOTE_FRAME @"com.thefool.ccaudioplaypres/updateCustomFrameNotificationt"
 #define CCP_NOTE_FONT  @"com.thefool.ccaudioplaypres/updateCustomFontNotificationt"
 
 static char _ccp_assoc_key;
 static char _ccp_assoc_font_idx;
+static char _ccp_assoc_info;
+static char _ccp_assoc_built;
 
+// ---------------- 日志 ----------------
+static void CCPLog(NSString *tag, NSString *line) {
+    @try {
+        NSString *p = @"/var/mobile/Documents/ccpre_debug.log";
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSDictionary *attr = [fm attributesOfItemAtPath:p error:nil];
+        NSMutableString *existing = nil;
+        unsigned long long sz = [attr fileSize];
+        if (sz > 0 && sz < 100000) {
+            existing = [NSMutableString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+        }
+        NSMutableString *next = existing ?: [NSMutableString string];
+        [next appendFormat:@"[%@] [%@] %@\n", [NSDate date], tag, line];
+        [next writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (id e) {}
+}
+
+// ---------------- 模板工具 ----------------
 static NSString *CCPDefaultTemplate(void) {
     return @"X:%.1f Y:%.1f 高度:%.1f 宽度:%.1f";
 }
 
-// 从模板串提取前 4 个数字 (按出现顺序); 返回 NO 表示没有模板
-static BOOL CCPExtract4(NSString *s, double out4[4]) {
-    if (![s isKindOfClass:[NSString class]] || ![s length]) return NO;
+static NSRegularExpression *CCPNumRe(void) {
     static NSRegularExpression *re = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         re = [[NSRegularExpression alloc] initWithPattern:@"-?[0-9]+(?:\\.[0-9]+)?" options:0 error:nil];
     });
-    NSArray *ms = [re matchesInString:s options:0 range:NSMakeRange(0, [s length])];
+    return re;
+}
+
+static BOOL CCPExtract4(NSString *s, double out4[4]) {
+    if (![s isKindOfClass:[NSString class]] || ![s length]) return NO;
+    NSArray *ms = [[CCPNumRe() matchesInString:s options:0 range:NSMakeRange(0, [s length])]];
     if ([ms count] < 4) return NO;
     for (int i = 0; i < 4; i++) {
-        NSTextCheckingResult *m = ms[i];
-        NSString *n = [s substringWithRange:[m range]];
-        out4[i] = [n doubleValue];
+        out4[i] = [[s substringWithRange:[ms[i] range]] doubleValue];
     }
     return YES;
 }
 
-// 用 4 个新数字替换模板串里的前 4 个数字 (没有 4 个数字则视为无模板, 返回用默认模板生成)
 static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, double w) {
-    static NSRegularExpression *re = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        re = [[NSRegularExpression alloc] initWithPattern:@"-?[0-9]+(?:\\.[0-9]+)?" options:0 error:nil];
-    });
     if (![tpl isKindOfClass:[NSString class]] || ![tpl length]) {
         return [NSString stringWithFormat:CCPDefaultTemplate(), x, y, h, w];
     }
-    NSArray *ms = [re matchesInString:tpl options:0 range:NSMakeRange(0, [tpl length])];
+    NSArray *ms = [CCPNumRe() matchesInString:tpl options:0 range:NSMakeRange(0, [tpl length])];
     if ([ms count] < 4) {
         return [NSString stringWithFormat:CCPDefaultTemplate(), x, y, h, w];
     }
     NSMutableString *s = [tpl mutableCopy];
-    // 从后往前替换, 避免 range 失效
     double vals[4] = {x, y, h, w};
     for (int i = 3; i >= 0; i--) {
-        NSTextCheckingResult *m = ms[i];
-        [s replaceCharactersInRange:[m range] withString:[NSString stringWithFormat:@"%.1f", vals[i]]];
+        [s replaceCharactersInRange:[ms[i] range]
+                         withString:[NSString stringWithFormat:@"%.1f", vals[i]]];
     }
     return s;
 }
 
-@interface CCALLPreviewView : UIView
-- (void)updateWithModule:(int)module frames:(NSDictionary<NSString *, NSValue *> *)frames;
+// ---------------- 预览视图 ----------------
+@interface CCPPreviewView : UIView
+- (void)updateWithModule:(int)module frames:(NSDictionary *)frames;
 @end
 
-@implementation CCALLPreviewView {
+@implementation CCPPreviewView {
     UIView *_mod;
-    NSMutableArray *_els;   // dicts: view, key
-    int _module;
-    double _sx, _sy, _ox, _oy;  // 缩放/偏移
+    NSMutableArray *_els;
 }
 
 - (id)initWithFrame:(CGRect)f {
@@ -142,19 +155,17 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
     return self;
 }
 
-// 模块像素尺寸估算: 单元 82 x 79.5, 命名 = 列x行 (3x2 = 246x159 与作者注释吻合)
 - (CGSize)moduleSize:(int)m {
     switch (m) {
-        case 0: return CGSizeMake(164.0, 159.0);   // 2x2
-        case 1: return CGSizeMake(164.0, 238.5);   // 2x3
-        case 2: return CGSizeMake(246.0, 159.0);   // 3x2
-        case 3: return CGSizeMake(328.0, 159.0);   // 4x2
-        default:return CGSizeMake(328.0, 238.5);   // 4x3
+        case 0: return CGSizeMake(164.0, 159.0);
+        case 1: return CGSizeMake(164.0, 238.5);
+        case 2: return CGSizeMake(246.0, 159.0);
+        case 3: return CGSizeMake(328.0, 159.0);
+        default:return CGSizeMake(328.0, 238.5);
     }
 }
 
-- (void)updateWithModule:(int)module frames:(NSDictionary<NSString *, NSValue *> *)frames {
-    _module = module;
+- (void)updateWithModule:(int)module frames:(NSDictionary *)frames {
     CGSize ms = [self moduleSize:module];
     double availW = [self bounds].size.width - 24.0;
     double availH = [self bounds].size.height - 24.0;
@@ -173,7 +184,7 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
         CGRect scaled = CGRectMake(fr.origin.x * sc, fr.origin.y * sc,
                                    fr.size.width * sc, fr.size.height * sc);
         if (scaled.size.height < 2.0 && [d[@"key"] isEqualToString:@"progressFrame"]) {
-            scaled.size.height = 2.5;   // 进度条最小可见厚度
+            scaled.size.height = 2.5;
         }
         [v setFrame:scaled];
     }
@@ -181,66 +192,28 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
 
 @end
 
-// 与 Preferences 对接的最小声明
-@class PSSpecifier;
-
-@interface CCALLCustomController : UIViewController
-@property (nonatomic, retain) id specifier;
+// ---------------- 页面状态与动作 ----------------
+@interface CCPPageHelper : NSObject
+@property (nonatomic, retain) CCPPreviewView *preview;
+@property (nonatomic, retain) UISegmentedControl *seg;
+@property (nonatomic, retain) NSMutableDictionary *frames;
+@property (nonatomic, retain) NSMutableDictionary *templates;
+@property (nonatomic, retain) NSMutableArray *sliderRows;
+@property (nonatomic, retain) NSTimer *saveTimer;
+@property (nonatomic, assign) BOOL frameDirty;
 @end
 
-@implementation CCALLCustomController
-{
-    UIScrollView *_scroll;
-    CCALLPreviewView *_preview;
-    UISegmentedControl *_seg;
-    NSMutableDictionary *_frames;          // key -> NSValue(CGRect)
-    NSMutableDictionary *_templates;       // key -> 原始模板串 (可能 nil)
-    NSMutableArray *_sliderRows;           // dicts: slider, label, key, idx(0-3)
-    UILabel *_fontVal[4];
-    double _fontVals[4];
-    NSTimer *_saveTimer;
-    BOOL _frameDirty;
-    id _specifier;
-}
-@synthesize specifier = _specifier;
+@implementation CCPPageHelper
 
-// Preferences 的 PSListController controllerForSpecifier: 用 initWithSpecifier: 实例化
-// detail 类; 不实现它会在转发后 doesNotRecognizeSelector 直接闪退 (v115 的崩因)。
-- (instancetype)initWithSpecifier:(PSSpecifier *)spec {
-    if ((self = [super initWithNibName:nil bundle:nil])) {
-        _specifier = spec;
-    }
-    return self;
-}
-
-- (instancetype)initWithNibName:(NSString *)n bundle:(NSBundle *)b {
-    if ((self = [super initWithNibName:n bundle:b])) {
-    }
-    return self;
-}
-
-// 防御: Preferences 对 controller 的常见回发, 一律 no-op
-- (void)reloadSpecifiers {}
-- (void)reloadSpecifiersAndRelayout {}
-
-- (NSString *)cc_title {
-    return @"自定义设置(全模块)";
-}
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    [self setTitle:[self cc_title]];
-    [[self view] setBackgroundColor:[UIColor colorWithWhite:0.94 alpha:1.0]];
-
-    _frames = [NSMutableDictionary dictionary];
-    _templates = [NSMutableDictionary dictionary];
-    _sliderRows = [NSMutableArray array];
-
+- (void)buildOnHost:(UIView *)host {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     NSDictionary *dom = [ud persistentDomainForName:CCP_DOMAIN] ?: @{};
     NSArray *keys = @[@"iconFrame", @"titleFrame", @"subTitleFrame", @"elapsedTitleFrame",
                       @"durationTitleFrame", @"progressFrame", @"leftButtonFrame",
                       @"centerButtonFrame", @"rightButtonFrame"];
+    _frames = [NSMutableDictionary dictionary];
+    _templates = [NSMutableDictionary dictionary];
+    _sliderRows = [NSMutableArray array];
     for (NSString *k in keys) {
         id v = [dom objectForKey:k];
         double a[4] = {0, 0, 0, 0};
@@ -251,49 +224,45 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
         [_frames setObject:[NSValue valueWithBytes:&a objCType:@encode(CGRect)] forKey:k];
     }
 
-    CGFloat W = [[self view] bounds].size.width;
-    if (W < 100) W = [UIScreen mainScreen].bounds.size.width - 32.0;
+    CGFloat W = [UIScreen mainScreen].bounds.size.width;
+    CGFloat inner = W - 32.0;
 
-    _scroll = [[UIScrollView alloc] initWithFrame:[[self view] bounds]];
-    [_scroll setAutoresizingMask:UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight];
-    [_scroll setAlwaysBounceVertical:YES];
-    [[self view] addSubview:_scroll];
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:host.bounds];
+    [scroll setAutoresizingMask:UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight];
+    [scroll setAlwaysBounceVertical:YES];
+    [scroll setBackgroundColor:[UIColor colorWithWhite:0.94 alpha:1.0]];
+    [host addSubview:scroll];
 
     CGFloat y = 16;
-    CGFloat inner = W - 32;
 
-    // ---- 预览 ----
     UILabel *pt = [[UILabel alloc] initWithFrame:CGRectMake(16, y, inner, 18)];
     [pt setText:@"实时预览 (占位示意, 数值随滑条变化)"];
     [pt setFont:[UIFont systemFontOfSize:12.0]];
     [pt setTextColor:[UIColor grayColor]];
-    [_scroll addSubview:pt];
+    [scroll addSubview:pt];
     y += 24;
 
-    _preview = [[CCALLPreviewView alloc] initWithFrame:CGRectMake(16, y, inner, 170.0)];
-    [_scroll addSubview:_preview];
+    _preview = [[CCPPreviewView alloc] initWithFrame:CGRectMake(16, y, inner, 170.0)];
+    [scroll addSubview:_preview];
     y += 182;
 
-    // ---- 模块大小切换 ----
     UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(16, y, inner, 18)];
     [st setText:@"预览模块大小"];
     [st setFont:[UIFont systemFontOfSize:12.0]];
     [st setTextColor:[UIColor grayColor]];
-    [_scroll addSubview:st];
+    [scroll addSubview:st];
     y += 22;
 
     _seg = [[UISegmentedControl alloc] initWithItems:@[@"2x2", @"2x3", @"3x2", @"4x2", @"4x3"]];
     [_seg setFrame:CGRectMake(16, y, inner, 32)];
     [_seg setSelectedSegmentIndex:2];
     [_seg addTarget:self action:@selector(segChanged:) forControlEvents:UIControlEventValueChanged];
-    [_scroll addSubview:_seg];
+    [scroll addSubview:_seg];
     y += 44;
 
-    // ---- 开关 ----
-    y = [self addSwitchRow:y label:@"启用自定义" key:@"isEnableCustomFrame" def:NO];
-    y = [self addSwitchRow:y label:@"启用颜色调试" key:@"isEnableColor" def:NO];
+    y = [self addSwitchRowIn:scroll y:y label:@"启用自定义" key:@"isEnableCustomFrame" def:NO width:W];
+    y = [self addSwitchRowIn:scroll y:y label:@"启用颜色调试" key:@"isEnableColor" def:NO width:W];
 
-    // ---- 位置滑条 ----
     NSArray *names = @[@"专辑", @"歌词", @"歌曲", @"当前时间", @"总时间",
                        @"进度条", @"左边按钮", @"中间按钮", @"右边按钮"];
     NSArray *dims = @[@"X", @"Y", @"高", @"宽"];
@@ -302,7 +271,7 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
         UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(16, y, inner, 20)];
         [h setText:[NSString stringWithFormat:@"%@  (%@)", names[e], k]];
         [h setFont:[UIFont boldSystemFontOfSize:13.0]];
-        [_scroll addSubview:h];
+        [scroll addSubview:h];
         y += 24;
         CGRect cur;
         [[_frames objectForKey:k] getValue:&cur];
@@ -312,31 +281,28 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
             UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(16, y, inner - 78, 30)];
             [sl setMinimumValue:0.0];
             [sl setMaximumValue:(d <= 1) ? 340.0 : 260.0];
-            [sl setContinuous:YES];
             [sl setValue:(float)val];
-            NSDictionary *info = @{@"key": k, @"idx": @(d)};
-            objc_setAssociatedObject(sl, &_ccp_assoc_key, info, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(sl, &_ccp_assoc_info,
+                                     @{@"key": k, @"idx": @(d), @"dim": dims[d], @"vlabel": vl},
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [sl addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
-            [_scroll addSubview:sl];
+            [scroll addSubview:sl];
 
             UILabel *vl = [[UILabel alloc] initWithFrame:CGRectMake(16 + inner - 70, y + 5, 70, 20)];
             [vl setText:[NSString stringWithFormat:@"%@ %.1f", dims[d], val]];
             [vl setFont:[UIFont systemFontOfSize:12.0]];
             [vl setTextAlignment:NSTextAlignmentRight];
             [vl setTextColor:[UIColor darkGrayColor]];
-            [_scroll addSubview:vl];
-
-            [_sliderRows addObject:@{@"slider": sl, @"label": vl, @"key": k, @"idx": @(d), @"dim": dims[d]}];
+            [scroll addSubview:vl];
             y += 34;
         }
         y += 6;
     }
 
-    // ---- 字体滑条 ----
     UILabel *fh = [[UILabel alloc] initWithFrame:CGRectMake(16, y, inner, 20)];
     [fh setText:@"字体自定义设置"];
     [fh setFont:[UIFont boldSystemFontOfSize:13.0]];
-    [_scroll addSubview:fh];
+    [scroll addSubview:fh];
     y += 24;
     NSArray *fkeys = @[@"titleFont", @"subtitleFont", @"elapsedTitleFont", @"durationTitleFont"];
     NSArray *fnames = @[@"歌词字体", @"歌曲字体", @"当前时长字体", @"总时长字体"];
@@ -344,52 +310,48 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
         UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 4, 110, 22)];
         [l setText:fnames[i]];
         [l setFont:[UIFont systemFontOfSize:13.0]];
-        [_scroll addSubview:l];
+        [scroll addSubview:l];
         double v = [[dom objectForKey:fkeys[i]] doubleValue];
         if (v < 4.0 || v > 30.0) v = 10.0;
-        _fontVals[i] = v;
         UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(130, y, inner - 210, 30)];
         [sl setMinimumValue:5.0];
         [sl setMaximumValue:17.0];
         [sl setValue:(float)v];
         objc_setAssociatedObject(sl, &_ccp_assoc_font_idx, @(i), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [sl addTarget:self action:@selector(fontChanged:) forControlEvents:UIControlEventValueChanged];
-        [_scroll addSubview:sl];
-        _fontVal[i] = [[UILabel alloc] initWithFrame:CGRectMake(16 + inner - 70, y + 4, 70, 22)];
-        [_fontVal[i] setText:[NSString stringWithFormat:@"%.2f", v]];
-        [_fontVal[i] setFont:[UIFont systemFontOfSize:12.0]];
-        [_fontVal[i] setTextAlignment:NSTextAlignmentRight];
-        [_fontVal[i] setTextColor:[UIColor darkGrayColor]];
-        [_scroll addSubview:_fontVal[i]];
+        [scroll addSubview:sl];
+        UILabel *vl = [[UILabel alloc] initWithFrame:CGRectMake(16 + inner - 70, y + 4, 70, 22)];
+        [vl setText:[NSString stringWithFormat:@"%.2f", v]];
+        [vl setFont:[UIFont systemFontOfSize:12.0]];
+        [vl setTextAlignment:NSTextAlignmentRight];
+        [vl setTextColor:[UIColor darkGrayColor]];
+        objc_setAssociatedObject(sl, &_ccp_assoc_key, vl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [scroll addSubview:vl];
         y += 38;
     }
 
     y += 20;
-    _scroll.contentSize = CGSizeMake(W, y + 40);
+    [scroll setContentSize:CGSizeMake(W, y + 40)];
     [self refreshPreview];
 }
 
-- (CGFloat)addSwitchRowY:(CGFloat)y label:(NSString *)label key:(NSString *)key def:(BOOL)def {
+- (CGFloat)addSwitchRowIn:(UIScrollView *)scroll y:(CGFloat)y label:(NSString *)label
+                      key:(NSString *)key def:(BOOL)def width:(CGFloat)W {
     UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 6, 180, 24)];
     [l setText:label];
     [l setFont:[UIFont systemFontOfSize:14.0]];
-    [_scroll addSubview:l];
+    [scroll addSubview:l];
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     NSDictionary *dom = [ud persistentDomainForName:CCP_DOMAIN] ?: @{};
     BOOL on = def;
     id v = [dom objectForKey:key];
     if (v) on = [v boolValue];
-    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake([[self view] bounds].size.width - 68, y + 3, 51, 31)];
+    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(W - 68, y + 3, 51, 31)];
     [sw setOn:on animated:NO];
     objc_setAssociatedObject(sw, &_ccp_assoc_key, key, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [sw addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
-    [_scroll addSubview:sw];
+    [scroll addSubview:sw];
     return y + 44;
-}
-
-// 上面声明写成 (CGFloat)y label:... 的形式不方便 objc method 查找, 统一用这个包装
-- (CGFloat)addSwitchRow:(CGFloat)y label:(NSString *)label key:(NSString *)key def:(BOOL)def {
-    return [self addSwitchRowY:y label:label key:key def:def];
 }
 
 - (void)switchChanged:(UISwitch *)sw {
@@ -403,20 +365,17 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
 }
 
 - (void)sliderChanged:(UISlider *)sl {
-    NSDictionary *info = objc_getAssociatedObject(sl, &_ccp_assoc_key);
+    NSDictionary *info = objc_getAssociatedObject(sl, &_ccp_assoc_info);
+    if (!info) return;
     NSString *key = info[@"key"];
     int idx = [info[@"idx"] intValue];
     double val = [sl value];
 
-    // 更新 label
-    for (NSDictionary *row in _sliderRows) {
-        if ([row[@"slider"] isEqual:sl]) {
-            [row[@"label"] setText:[NSString stringWithFormat:@"%@ %.1f", row[@"dim"], val]];
-            break;
-        }
+    UILabel *vl = info[@"vlabel"];
+    if ([vl isKindOfClass:[UILabel class]]) {
+        [vl setText:[NSString stringWithFormat:@"%@ %.1f", info[@"dim"], val]];
     }
 
-    // 更新 _frames
     CGRect cur;
     [[_frames objectForKey:key] getValue:&cur];
     if (idx == 0) cur.origin.x = val;
@@ -427,20 +386,6 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
 
     [self refreshPreview];
     _frameDirty = YES;
-    [self scheduleFrameSave];
-}
-
-- (void)fontChanged:(UISlider *)sl {
-    int i = [objc_getAssociatedObject(sl, &_ccp_assoc_font_idx) intValue];
-    double v = [sl value];
-    _fontVals[i] = v;
-    [_fontVal[i] setText:[NSString stringWithFormat:@"%.2f", v]];
-    NSArray *fkeys = @[@"titleFont", @"subtitleFont", @"elapsedTitleFont", @"durationTitleFont"];
-    [self cc_write:fkeys[i] value:@(v)];
-    [self cc_postNote:CCP_NOTE_FONT];
-}
-
-- (void)scheduleFrameSave {
     [_saveTimer invalidate];
     _saveTimer = [NSTimer timerWithTimeInterval:0.35 target:self selector:@selector(flushFrameSave)
                                        userInfo:nil repeats:NO];
@@ -457,8 +402,7 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
         CGRect cur;
         [[_frames objectForKey:k] getValue:&cur];
         NSString *tpl = [_templates objectForKey:k];
-        if (!tpl) {
-            // 沿用已知模板 (任一元素有值即用其模板), 否则默认模板
+        if (![tpl length]) {
             for (NSString *other in keys) {
                 NSString *t2 = [_templates objectForKey:other];
                 if ([t2 length]) { tpl = t2; break; }
@@ -470,8 +414,14 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
     [self cc_postNote:CCP_NOTE_FRAME];
 }
 
-- (void)refreshPreview {
-    [_preview updateWithModule:(int)[_seg selectedSegmentIndex] frames:_frames];
+- (void)fontChanged:(UISlider *)sl {
+    int i = [objc_getAssociatedObject(sl, &_ccp_assoc_font_idx) intValue];
+    double v = [sl value];
+    UILabel *vl = objc_getAssociatedObject(sl, &_ccp_assoc_key);
+    if ([vl isKindOfClass:[UILabel class]]) [vl setText:[NSString stringWithFormat:@"%.2f", v]];
+    NSArray *fkeys = @[@"titleFont", @"subtitleFont", @"elapsedTitleFont", @"durationTitleFont"];
+    [self cc_write:fkeys[i] value:@(v)];
+    [self cc_postNote:CCP_NOTE_FONT];
 }
 
 - (void)cc_write:(NSString *)key value:(id)val {
@@ -491,4 +441,94 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
     } @catch (id e) {}
 }
 
+- (void)refreshPreview {
+    [_preview updateWithModule:(int)[_seg selectedSegmentIndex] frames:_frames];
+}
+
+@end
+
+// ---------------- swizzle: CCAudio3x2ListController viewDidLoad ----------------
+static void (*ccp_orig_vdl)(id, SEL) = NULL;
+static BOOL ccp_via_super = NO;
+static int ccp_tries = 0;
+
+static void CCPBuildOver(id self) {
+    @try {
+        if (objc_getAssociatedObject(self, &_ccp_assoc_built)) return;
+        UIView *host = nil;
+        if ([self respondsToSelector:@selector(view)]) {
+            host = ((UIView *(*)(id, SEL))objc_msgSend)(self, sel_registerName("view"));
+        }
+        if (!host) return;
+        objc_setAssociatedObject(self, &_ccp_assoc_built, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        CCPPageHelper *helper = [[CCPPageHelper alloc] init];
+        objc_setAssociatedObject(self, &_ccp_assoc_key, helper, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [helper buildOnHost:host];
+        CCPLog(@"page", @"overlay UI built");
+    } @catch (id e) {
+        CCPLog(@"page", [NSString stringWithFormat:@"build exception %@", e]);
+    }
+}
+
+static void ccp_viewDidLoad(id self, SEL _cmd) {
+    @try {
+        if (ccp_via_super) {
+            struct objc_super sup = {self, class_getSuperclass(object_getClass(self))};
+            ((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, _cmd);
+        } else if (ccp_orig_vdl) {
+            ccp_orig_vdl(self, _cmd);
+        }
+    } @catch (id e) {}
+    CCPBuildOver(self);
+}
+
+static void CCPTryInstall(void) {
+    @try {
+        Class cls = objc_getClass("CCAudio3x2ListController");
+        if (!cls) {
+            if (ccp_tries == 0) CCPLog(@"install", @"CCAudio3x2ListController not found yet");
+            return;
+        }
+        SEL vs = sel_registerName("viewDidLoad");
+        Method m = class_getInstanceMethod(cls, vs);
+        if (!m) {
+            CCPLog(@"install", @"viewDidLoad method missing");
+            return;
+        }
+        if (class_addMethod(cls, vs, (IMP)ccp_viewDidLoad, "v@:")) {
+            ccp_via_super = YES;
+            ccp_orig_vdl = NULL;
+            CCPLog(@"install", @"hook installed via class_addMethod (super call)");
+        } else {
+            ccp_orig_vdl = (void (*)(id, SEL))method_getImplementation(m);
+            method_setImplementation(m, (IMP)ccp_viewDidLoad);
+            ccp_via_super = NO;
+            CCPLog(@"install", @"hook installed via exchange");
+        }
+    } @catch (id e) {
+        CCPLog(@"install", [NSString stringWithFormat:@"install exception %@", e]);
+    }
+}
+
+static void CCPRetry(void) {
+    CCPTryInstall();
+    // 装好了就不再重试
+    BOOL done = ccp_via_super || ccp_orig_vdl != NULL;
+    if (!done && ccp_tries < 120) {
+        ccp_tries++;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            CCPRetry();
+        });
+    }
+}
+
+@interface CCPBootstrap : NSObject
+@end
+@implementation CCPBootstrap
++ (void)load {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CCPRetry();
+    });
+}
 @end
