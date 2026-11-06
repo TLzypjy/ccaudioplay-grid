@@ -21,15 +21,60 @@
 static void (*ccal_orig_layoutSubviews)(id, SEL) = NULL;
 static int ccal_install_tries = 0;
 
+// ---------- 调试日志: /var/mobile/Documents/ccall_debug.log ----------
+static void CCALLLog(NSString *line) {
+    @try {
+        NSString *p = @"/var/mobile/Documents/ccall_debug.log";
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSDictionary *attr = [fm attributesOfItemAtPath:p error:nil];
+        NSMutableString *existing = nil;
+        unsigned long long sz = [attr fileSize];
+        if (sz > 0 && sz < 100000) {
+            existing = [NSMutableString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+        }
+        NSMutableString *next = existing ?: [NSMutableString string];
+        [next appendFormat:@"[%@] %@\n", [NSDate date], line];
+        [next writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (id e) {}
+}
+
+static BOOL cc_did_dump_prefs = NO;
+static int cc_last_type = -999;
+static BOOL cc_last_en = NO;
+static NSMutableSet *cc_logged_fails = nil;
+
+static void CCALLLogOnce(NSString *key, NSString *line) {
+    @try {
+        if (!cc_logged_fails) cc_logged_fails = [NSMutableSet set];
+        if ([cc_logged_fails containsObject:key]) return;
+        [cc_logged_fails addObject:key];
+        CCALLLog(line);
+    } @catch (id e) {}
+}
+
 static void CCALLApplyToFrame(UIView *npv, NSString *frameKey, NSString *viewKey, id self) {
     @try {
         NSValue *fv = [self valueForKey:frameKey];
-        if (!fv) return;
+        if (!fv) { CCALLLogOnce([@"nf" stringByAppendingString:frameKey], [NSString stringWithFormat:@"%@: frame ivar nil", frameKey]); return; }
         CGRect fr = [fv CGRectValue];
-        if (fr.origin.x == 0 && fr.origin.y == 0 && fr.size.width == 0 && fr.size.height == 0) return;
+        if (fr.origin.x == 0 && fr.origin.y == 0 && fr.size.width == 0 && fr.size.height == 0) {
+            CCALLLogOnce([@"z" stringByAppendingString:frameKey], [NSString stringWithFormat:@"%@: zero, skip", frameKey]);
+            return;
+        }
         UIView *v = [npv valueForKey:viewKey];
-        if ([v isKindOfClass:[UIView class]]) [v setFrame:fr];
-    } @catch (id e) {}
+        if ([v isKindOfClass:[UIView class]]) {
+            [v setFrame:fr];
+            CCALLLogOnce([@"ok" stringByAppendingString:frameKey],
+                [NSString stringWithFormat:@"%@ -> %@ ok fr=%@ old=%@", frameKey, viewKey,
+                 NSStringFromCGRect(fr), NSStringFromCGRect(v.frame)]);
+        } else {
+            CCALLLogOnce([@"miss" stringByAppendingString:frameKey],
+                [NSString stringWithFormat:@"%@: KVC %@ -> %@ (not UIView)", frameKey, viewKey, v]);
+        }
+    } @catch (id e) {
+        CCALLLogOnce([@"exc" stringByAppendingString:frameKey],
+            [NSString stringWithFormat:@"%@: KVC exception %@", frameKey, e]);
+    }
 }
 
 static void CCALLApplyFont(UILabel *lab, NSString *fontKey, id self) {
@@ -44,8 +89,38 @@ static void CCALLApply(id self) {
     @try {
         // 3x2 由原实现自己处理
         int type = [[self valueForKey:@"type"] intValue];
-        if (type == 2) return;
-        if (![[self valueForKey:@"IsEnableCustomFrame"] boolValue]) return;
+        BOOL en = [[self valueForKey:@"IsEnableCustomFrame"] boolValue];
+        if (type != cc_last_type || en != cc_last_en) {
+            cc_last_type = type;
+            cc_last_en = en;
+            CCALLLog([NSString stringWithFormat:@"layout pass: type=%d custom=%d", type, en]);
+            CCALLLog([NSString stringWithFormat:@"ivars icon=%@ title=%@ sub=%@ elapsed=%@ dur=%@ progress=%@ left=%@ center=%@ right=%@",
+                      [self valueForKey:@"iconFrame"], [self valueForKey:@"titleFrame"],
+                      [self valueForKey:@"subTitleFrame"], [self valueForKey:@"elapsedTitleFrame"],
+                      [self valueForKey:@"durationTitleFrame"], [self valueForKey:@"progressFrame"],
+                      [self valueForKey:@"leftButtonFrame"], [self valueForKey:@"centerButtonFrame"],
+                      [self valueForKey:@"rightButtonFrame"]]);
+            if (!cc_did_dump_prefs) {
+                cc_did_dump_prefs = YES;
+                NSDictionary *pd = [NSDictionary dictionaryWithContentsOfFile:
+                    @"/var/mobile/Library/Preferences/com.thefool.ccaudioplaypres.plist"];
+                if (pd) {
+                    CCALLLog([NSString stringWithFormat:@"prefs keys: %@", [pd allKeys]]);
+                    for (NSString *k in @[@"isEnableCustomFrame", @"iconFrame", @"titleFrame",
+                                          @"subTitleFrame", @"elapsedTitleFrame", @"durationTitleFrame",
+                                          @"progressFrame", @"leftButtonFrame", @"centerButtonFrame",
+                                          @"rightButtonFrame", @"titleFont", @"subtitleFont"]) {
+                        CCALLLog([NSString stringWithFormat:@"prefs[%@] = %@ (class %@)",
+                                  k, [pd objectForKey:k] ?: @"<nil>",
+                                  [[pd objectForKey:k] class]]);
+                    }
+                } else {
+                    CCALLLog(@"prefs file MISSING at /var/mobile/Library/Preferences/com.thefool.ccaudioplaypres.plist");
+                }
+            }
+        }
+        if (type == 2) return;   // 3x2 由原实现自己处理
+        if (!en) return;
 
         // ---- 直属元素 (CCCustomView 自己的属性) ----
         NSDictionary *direct = @{
@@ -55,14 +130,7 @@ static void CCALLApply(id self) {
             @"progressFrame"     : @"progressView",
         };
         for (NSString *fk in direct) {
-            @try {
-                NSValue *fv = [self valueForKey:fk];
-                if (!fv) continue;
-                CGRect fr = [fv CGRectValue];
-                if (fr.origin.x == 0 && fr.origin.y == 0 && fr.size.width == 0 && fr.size.height == 0) continue;
-                UIView *v = [self valueForKey:direct[fk]];
-                if ([v isKindOfClass:[UIView class]]) [v setFrame:fr];
-            } @catch (id e) {}
+            CCALLApplyToFrame(self, fk, direct[fk], self);
         }
         // 自定义进度条容器跟随进度条框
         @try {
@@ -110,12 +178,19 @@ static void CCALLLayoutSubviews(id self, SEL _cmd) {
 static void CCALLTryInstall(void) {
     @try {
         Class c = objc_getClass("CCCustomView");
-        if (!c) return;
+        if (!c) {
+            CCALLLogOnce(@"noClass", @"install: CCCustomView class not found yet");
+            return;
+        }
         Method m = class_getInstanceMethod(c, sel_registerName("layoutSubviews"));
-        if (!m) return;
+        if (!m) {
+            CCALLLogOnce(@"noMethod", @"install: layoutSubviews method missing");
+            return;
+        }
         if (method_getImplementation(m) == (IMP)CCALLLayoutSubviews) return;  // 已装
         ccal_orig_layoutSubviews = (void (*)(id, SEL))method_getImplementation(m);
         method_setImplementation(m, (IMP)CCALLLayoutSubviews);
+        CCALLLog([NSString stringWithFormat:@"hook installed on -[CCCustomView layoutSubviews], orig=%p", (void *)ccal_orig_layoutSubviews]);
     } @catch (id e) {}
 }
 
