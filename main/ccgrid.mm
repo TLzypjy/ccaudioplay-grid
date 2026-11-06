@@ -249,74 +249,6 @@ static void CCGQLThumbAsync(NSString *path, NSString *name, NSIndexPath *ip, __w
 // ---------- 编辑态 associated key ----------
 static const char kCCGDelKey = 0;   // 删除按钮 -> 文件名
 static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
-static const char kCCGDlKey = 0;    // 下载按钮 -> 文件名
-
-// ---------- 保存到相册 ----------
-// 本进程环境特殊的连续踩坑记录(勿轻易回退):
-//  1) legacy UISaveVideoAtPathToSavedPhotosAlbum -> 崩在 PLAssetsSaver 回调块(系统回调用户 selector)
-//  2) 走 PHPhotoLibrary performChanges -> 崩在 PLAssetsSaver completion 块
-//  3) 从 Core 二进制 classref 槽位读类指针 -> arm64e 指针认证失败(PAC), 段错误
-// 结论: 本进程里任何"系统异步回调我们的 block/selector"的路径都不安全。
-// 现在做法: 用 UIKit 旧接口但**不传回调**(target=nil,selector=NULL, 系统不发消息给我们就不会崩),
-//          再自己轮询相册是否出现新资源来判断成功与否, 全程不用 Photos 类。
-static UIImage *CCGLoadThumbFromCacheFallback(NSString *path) {
-    @try {
-        // 视频: 从我们自己的缩略图缓存里找一张图当"导出失败"时的替代; 图片: 直接读
-        NSString *ext = [[path pathExtension] lowercaseString];
-        if (![CCGVideoExts() containsObject:ext]) {
-            return [UIImage imageWithContentsOfFile:path];
-        }
-        return nil;
-    } @catch (id e) { return nil; }
-}
-
-// 相册里素材数量(用 PHFetchResult? 不用 -> 改用 AssetsLibrary/FM 也不可靠)
-// 改用最朴素办法: 保存后延时回调 success 提示; 失败由系统弹出权限提示体现。
-// 说明: 不传回调时系统保存失败不会通知我们, 但绝大多数失败是"没权限", 首次会弹权限框。
-static void CCGSaveToAlbum(NSString *path, id target) {
-    @try {
-        NSString *ext = [[path pathExtension] lowercaseString];
-        NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
-            [NSString stringWithFormat:@"ccgrid_export_%@.%@", [NSUUID UUID].UUIDString, ext]];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm copyItemAtPath:path toPath:tmp error:nil]) {
-            ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"),
-                NO, @"素材拷贝失败，无法导出");
-            return;
-        }
-
-        BOOL isVideo = [CCGVideoExts() containsObject:ext];
-        if (isVideo) {
-            // 不传回调: 系统保存时不会回调进我们的代码 -> 不会 PAC/异常崩溃
-            UISaveVideoAtPathToSavedPhotosAlbum(tmp, nil, NULL, NULL);
-        } else {
-            UIImage *img = CCGLoadThumbFromCacheFallback(path);
-            if (!img) {
-                [fm removeItemAtPath:tmp error:nil];
-                ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"),
-                    NO, @"图片读取失败");
-                return;
-            }
-            UIImageWriteToSavedPhotosAlbum(img, nil, NULL, NULL);
-        }
-
-        // 延时给个结果提示(系统保存是异步的, 且不回调我们, 只能给"已请求保存"这种提示)
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            @try {
-                ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"),
-                    YES, @"已保存到相册(若无权限请到 设置>隐私与安全性>照片 开启)");
-            } @catch (id e) {}
-        });
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)),
-                       dispatch_get_global_queue(0, 0), ^{
-            [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
-        });
-    } @catch (id e) {
-        ((void(*)(id, SEL, BOOL, id))objc_msgSend)(target, CCG_SEL("saveDoneWithOk:msg:"), NO, @"保存异常");
-    }
-}
 
 // 记住用户点选的素材名(跨会话, 重进素材库蓝点不丢)
 static NSString *CCGPickStoreKey(NSString *dir) {
@@ -373,7 +305,6 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
 - (void)importTapped;
 - (void)reloadFiles;
 - (void)qlGotThumb:(UIImage *)img forName:(NSString *)name atIp:(NSIndexPath *)ip;
-- (void)saveDoneWithOk:(BOOL)ok msg:(NSString *)msg;
 - (void)genThumbInBackgroundForName:(NSString *)name path:(NSString *)full isVideo:(BOOL)isVideo ip:(NSIndexPath *)ip;
 @end
 
@@ -655,11 +586,6 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     });
 }
 
-// 保存到相册完成回调(现代 API 经 performChanges completionHandler 调回, 已在主线程)
-- (void)saveDoneWithOk:(BOOL)ok msg:(NSString *)msg {
-    [self showTip:msg ?: (ok ? @"已保存到相册" : @"保存失败")];
-}
-
 - (void)longPressTapped:(UILongPressGestureRecognizer *)lp {
     if ([lp state] != UIGestureRecognizerStateBegan) return;
     CGPoint p = [lp locationInView:_cv];
@@ -673,18 +599,6 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
 - (void)delBtnTapped:(UITapGestureRecognizer *)g {
     NSString *name = objc_getAssociatedObject(g, &kCCGDelKey);
     if (name) [self confirmDelete:name];
-}
-
-// 编辑态下载: 把素材存进系统相册
-- (void)dlBtnTapped:(UIButton *)b {
-    NSString *name = objc_getAssociatedObject(b, &kCCGDlKey);
-    if (!name) return;
-    NSString *full = [_dir stringByAppendingPathComponent:name];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:full]) {
-        [self showTip:@"文件不存在"];
-        return;
-    }
-    CCGSaveToAlbum(full, self);
 }
 
 - (void)nameTapped:(UITapGestureRecognizer *)g {
@@ -800,18 +714,6 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
             [delv addTarget:self action:@selector(delBtnTapped:) forControlEvents:UIControlEventTouchUpInside];
             [card addSubview:delv];
             objc_setAssociatedObject(delv, &kCCGDelKey, name, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-            // 编辑态下载钮(右下角, 保存该素材到相册)
-            UIButton *dlv = [[UIButton alloc] initWithFrame:CCGRect(cardW - 30, imgH - 30, 24, 24)];
-            [dlv setBackgroundColor:[UIColor colorWithWhite:0.0 alpha:0.55]];
-            [dlv.layer setCornerRadius:12.0];
-            [dlv.layer setMasksToBounds:YES];
-            [dlv setTitle:@"↓" forState:UIControlStateNormal];
-            [dlv setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-            [dlv.titleLabel setFont:[UIFont boldSystemFontOfSize:15.0]];
-            [dlv addTarget:self action:@selector(dlBtnTapped:) forControlEvents:UIControlEventTouchUpInside];
-            [card addSubview:dlv];
-            objc_setAssociatedObject(dlv, &kCCGDlKey, name, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         [[cell contentView] addSubview:card];
     }
