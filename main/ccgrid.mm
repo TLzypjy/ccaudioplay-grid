@@ -4,9 +4,11 @@
  * 原理: 本二进制替换偏好设置 bundle 的主程序(CFBundleExecutable),
  *       +load 时 dlopen 同目录下的 CCAudioPlayPresCore(原二进制),
  *       原有全部设置逻辑(滑条/颜色/遮罩/3x2 自定义...)原样保留;
- *       仅 swizzle CCAssetCell 的两个素材入口:
+ *       swizzle CCAssetCell 的两个素材入口 + 细胞初始化:
  *       -selectExistingAsset(从已有素材选择): 列表式 SandboxFileBrowser -> 网格素材库;
- *       -selectImagePicker(从相册选择): 拉起 Filza 定位到该行素材的磁盘保存目录
+ *       -selectImagePicker(从相册选择, 改名「素材目录」): 拉起 Filza 定位到该行素材的
+ *       磁盘保存目录 (官方 URL 形式 filza://view/<路径>);
+ *       -initWithStyle:reuseIdentifier:specifier: 后扫描按钮把「从相册选择」改为「素材目录」
  *       (相册导入功能保留在网格库右上角"导入"入口)。
  *       三列网格 + GIF/视频 角标 + 名字胶囊 + 选中圆点,
  *       长按进入抖动编辑态(红-删除 + 点名字行内改名), 右上角导入(相册/文件)。
@@ -1180,6 +1182,33 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
 // ============ swizzle ============
 static void (*gOrigSelectExistingAsset)(id, SEL) = NULL;
 static void (*gOrigSelectImagePicker)(id, SEL) = NULL;
+static id (*gOrigAssetCellInit)(id, SEL, long, id, id) = NULL;
+
+// 按钮改名: 「从相册选择」的功能已被换成"跳转素材目录(Filza)", 标题同步改成「素材目录」。
+// 原文字不在包内任何文件里(运行时拼出/roothide 处理), 所以不走文本补丁,
+// 而是在细胞初始化完成后递归扫描子树, 对含"相册"字样的按钮直接改标题。
+static void CCGScanRetitle(id view) {
+    @try {
+        for (UIView *sub in [view subviews]) {
+            if ([sub isKindOfClass:[UIButton class]]) {
+                UIButton *b = (UIButton *)sub;
+                NSString *t = [b titleForState:UIControlStateNormal] ?: [b titleLabel].text;
+                if (t && [t containsString:@"相册"]) {
+                    [b setTitle:@"素材目录" forState:UIControlStateNormal];
+                    [b setTitle:@"素材目录" forState:UIControlStateHighlighted];
+                    [[b titleLabel] setText:@"素材目录"];
+                }
+            }
+            CCGScanRetitle(sub);
+        }
+    } @catch (id e) {}
+}
+
+static id CCGAssetCellInit(id self, SEL _cmd, long style, id rid, id spec) {
+    id r = gOrigAssetCellInit(self, _cmd, style, rid, spec);
+    CCGScanRetitle(self);
+    return r;
+}
 
 static void CCGSelectExistingAsset(id self, SEL _cmd) {
     @try {
@@ -1215,10 +1244,12 @@ static void CCGSelectExistingAsset(id self, SEL _cmd) {
 
 // 「从相册选择」按钮: 不再弹系统相册, 改为拉起 Filza 定位到该行素材的磁盘保存目录
 // (即 rootAssetPath, 与网格素材库打开的是同一个真实目录; 相册导入仍走网格库右上角"导入")。
-// 踩坑记录: v109 把路径整体 percent-encode(/ -> %2F)后 Filza 只开主页不跳转 --
-// Filza 不反转义 query 参数值, 必须传原始路径(官方示例 filza://view/Applications/Filza.app
-// 也是原始路径; Safari/快捷指令拉起时 query 值同样不带 %2F)。
-// 故这里仅转义 URL 真正非法的字符(空格/引号/非ASCII等), / : 等安全字符原样保留。
+// URL 形式踩坑记录:
+//   v109 filza://view?path=%2Fvar%2F...  -> Filza 打开但不跳转 (查询参数形式非官方格式, 且 Filza 不反转义)
+//   v110 filza://view?path=/var/...      -> URL 无路径成分, Filza 原样停在原处 (用户看=没反应)
+//   官方文档(tigisoftware)只有路径拼接形式: filza://view/路径/到/目标
+//   (scheme=filza, host=view, 目标路径就是 URL 的 path; 例: filza://view/Applications/Filza.app)
+//   -> v111 用 filza://view + 去尾斜杠的原始路径 (仅转义空格/引号/非ASCII等非法字符)。
 // 注意: 不用 canOpenURL (filza 未在宿主 Info.plist 的 LSApplicationQueriesSchemes 声明时必返回 NO),
 // 直接 openURL 异步拉起, completionHandler 传 nil -> 不回调进本进程, 无 PAC 风险;
 // 目录拿不到/构造失败时退回原相册实现。
@@ -1232,11 +1263,16 @@ static void CCGSelectImagePicker(id self, SEL _cmd) {
             if (gOrigSelectImagePicker) gOrigSelectImagePicker(self, _cmd);
             return;
         }
+        // 去掉尾部斜杠(rootAssetPath 以 / 结尾), 拼成 filza://view/var/mobile/...
+        NSString *path = root;
+        while ([path length] > 1 && [path hasSuffix:@"/"]) {
+            path = [path substringToIndex:[path length] - 1];
+        }
         // 最小转义: 字母数字与 -._~/:!$'()*,;=@ 原样保留, 其余(空格 # % <> 引号 中文等)才转义
         NSMutableCharacterSet *allowed = [[NSMutableCharacterSet alphanumericCharacterSet] mutableCopy];
         [allowed addCharactersInString:@"-._~/:!$'()*,;=@"];
-        NSString *enc = [root stringByAddingPercentEncodingWithAllowedCharacters:allowed];
-        NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"filza://view?path=%@", enc]];
+        NSString *enc = [path stringByAddingPercentEncodingWithAllowedCharacters:allowed];
+        NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"filza://view%@", enc]];
         if (!url) {
             if (gOrigSelectImagePicker) gOrigSelectImagePicker(self, _cmd);
             return;
@@ -1269,6 +1305,13 @@ static void CCGSwizzleAfterCoreLoad(void) {
     if (mIP) {
         gOrigSelectImagePicker = (void (*)(id, SEL))method_getImplementation(mIP);
         method_setImplementation(mIP, (IMP)CCGSelectImagePicker);
+    }
+    // 细胞初始化后把「从相册选择」按钮改名为「素材目录」
+    SEL selInit = CCG_SEL("initWithStyle:reuseIdentifier:specifier:");
+    Method mInit = class_getInstanceMethod(cell, selInit);
+    if (mInit) {
+        gOrigAssetCellInit = (id (*)(id, SEL, long, id, id))method_getImplementation(mInit);
+        method_setImplementation(mInit, (IMP)CCGAssetCellInit);
     }
 }
 
