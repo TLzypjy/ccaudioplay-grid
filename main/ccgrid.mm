@@ -1215,6 +1215,10 @@ static void CCGSelectExistingAsset(id self, SEL _cmd) {
 
 // 「从相册选择」按钮: 不再弹系统相册, 改为拉起 Filza 定位到该行素材的磁盘保存目录
 // (即 rootAssetPath, 与网格素材库打开的是同一个真实目录; 相册导入仍走网格库右上角"导入")。
+// 踩坑记录: v109 把路径整体 percent-encode(/ -> %2F)后 Filza 只开主页不跳转 --
+// Filza 不反转义 query 参数值, 必须传原始路径(官方示例 filza://view/Applications/Filza.app
+// 也是原始路径; Safari/快捷指令拉起时 query 值同样不带 %2F)。
+// 故这里仅转义 URL 真正非法的字符(空格/引号/非ASCII等), / : 等安全字符原样保留。
 // 注意: 不用 canOpenURL (filza 未在宿主 Info.plist 的 LSApplicationQueriesSchemes 声明时必返回 NO),
 // 直接 openURL 异步拉起, completionHandler 传 nil -> 不回调进本进程, 无 PAC 风险;
 // 目录拿不到/构造失败时退回原相册实现。
@@ -1228,9 +1232,9 @@ static void CCGSelectImagePicker(id self, SEL _cmd) {
             if (gOrigSelectImagePicker) gOrigSelectImagePicker(self, _cmd);
             return;
         }
-        // 路径按查询参数值编码: 仅保留字母数字与 -._~/, 其余(含 ?&= 空格中文)全部转义
+        // 最小转义: 字母数字与 -._~/:!$'()*,;=@ 原样保留, 其余(空格 # % <> 引号 中文等)才转义
         NSMutableCharacterSet *allowed = [[NSMutableCharacterSet alphanumericCharacterSet] mutableCopy];
-        [allowed addCharactersInString:@"-._~/"];
+        [allowed addCharactersInString:@"-._~/:!$'()*,;=@"];
         NSString *enc = [root stringByAddingPercentEncodingWithAllowedCharacters:allowed];
         NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"filza://view?path=%@", enc]];
         if (!url) {
