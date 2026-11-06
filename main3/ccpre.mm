@@ -18,15 +18,17 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 
 // 与 bundle_struct 一致的最小声明 (Preferences 私有框架, 运行时动态解析)
 @interface PSListController : UIViewController
 @property (retain, nonatomic) id specifier;
 @end
 
-#define DOMAIN @"com.thefool.ccaudioplaypres"
-#define NOTE_FRAME @"com.thefool.ccaudioplaypres/updateCustomFrameNotificationt"
-#define NOTE_FONT  @"com.thefool.ccaudioplaypres/updateCustomFontNotificationt"
+#define CCP_DOMAIN @"com.thefool.ccaudioplaypres"
+#define CCP_NOTE_FRAME @"com.thefool.ccaudioplaypres/updateCustomFrameNotificationt"
+#define CCP_NOTE_FONT  @"com.thefool.ccaudioplaypres/updateCustomFontNotificationt"
 
 static char _ccp_assoc_key;
 static char _ccp_assoc_font_idx;
@@ -213,7 +215,7 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
     _sliderRows = [NSMutableArray array];
 
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSDictionary *dom = [ud persistentDomainForName:DOMAIN] ?: @{};
+    NSDictionary *dom = [ud persistentDomainForName:CCP_DOMAIN] ?: @{};
     NSArray *keys = @[@"iconFrame", @"titleFrame", @"subTitleFrame", @"elapsedTitleFrame",
                       @"durationTitleFrame", @"progressFrame", @"leftButtonFrame",
                       @"centerButtonFrame", @"rightButtonFrame"];
@@ -351,7 +353,7 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
     [l setFont:[UIFont systemFontOfSize:14.0]];
     [_scroll addSubview:l];
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSDictionary *dom = [ud persistentDomainForName:DOMAIN] ?: @{};
+    NSDictionary *dom = [ud persistentDomainForName:CCP_DOMAIN] ?: @{};
     BOOL on = def;
     id v = [dom objectForKey:key];
     if (v) on = [v boolValue];
@@ -371,7 +373,7 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
 - (void)switchChanged:(UISwitch *)sw {
     NSString *key = objc_getAssociatedObject(sw, &_ccp_assoc_key);
     [self cc_write:key value:@([sw isOn])];
-    [self cc_postNote:NOTE_FRAME];
+    [self cc_postNote:CCP_NOTE_FRAME];
 }
 
 - (void)segChanged:(UISegmentedControl *)seg {
@@ -387,7 +389,7 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
     // 更新 label
     for (NSDictionary *row in _sliderRows) {
         if ([row[@"slider"] isEqual:sl]) {
-            [[row[@"label"]] setText:[NSString stringWithFormat:@"%@ %.1f", row[@"dim"], val]];
+            [row[@"label"] setText:[NSString stringWithFormat:@"%@ %.1f", row[@"dim"], val]];
             break;
         }
     }
@@ -412,8 +414,8 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
     _fontVals[i] = v;
     [_fontVal[i] setText:[NSString stringWithFormat:@"%.2f", v]];
     NSArray *fkeys = @[@"titleFont", @"subtitleFont", @"elapsedTitleFont", @"durationTitleFont"];
-    [self cc_write:fkeys[i] @(v)];
-    [self cc_postNote:NOTE_FONT];
+    [self cc_write:fkeys[i] value:@(v)];
+    [self cc_postNote:CCP_NOTE_FONT];
 }
 
 - (void)scheduleFrameSave {
@@ -441,9 +443,9 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
             }
         }
         NSString *val = CCPSubstitute4(tpl, cur.origin.x, cur.origin.y, cur.size.height, cur.size.width);
-        [self cc_write:k val];
+        [self cc_write:k value:val];
     }
-    [self cc_postNote:NOTE_FRAME];
+    [self cc_postNote:CCP_NOTE_FRAME];
 }
 
 - (void)refreshPreview {
@@ -453,9 +455,9 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
 - (void)cc_write:(NSString *)key value:(id)val {
     @try {
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        NSMutableDictionary *dom = [[ud persistentDomainForName:DOMAIN] mutableCopy] ?: [NSMutableDictionary dictionary];
+        NSMutableDictionary *dom = [[ud persistentDomainForName:CCP_DOMAIN] mutableCopy] ?: [NSMutableDictionary dictionary];
         [dom setObject:val forKey:key];
-        [ud setPersistentDomain:dom forName:DOMAIN];
+        [ud setPersistentDomain:dom forName:CCP_DOMAIN];
         [ud synchronize];
     } @catch (id e) {}
 }
