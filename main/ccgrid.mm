@@ -501,6 +501,10 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
 
     [self reloadFiles];
 
+    // 打印素材根目录与缓存目录, 方便在文件管理器里找到/清理 .ccthumbs
+    CCGDbg([NSString stringWithFormat:@"DIR root=%@ | cache=%@", _dir,
+            [[self class] ccgThumbDir:_dir]]);
+
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(kbdWillShow:) name:UIKeyboardWillShowNotification object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(kbdDidShow:) name:UIKeyboardDidShowNotification object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(kbdWillHide:) name:UIKeyboardWillHideNotification object:nil];
@@ -670,7 +674,7 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
             long long mt = (long long)([attr fileModificationDate].timeIntervalSince1970);
             NSString *base = [fullCopy stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
             cachePath = [[[CCGBrowserViewController ccgThumbDir:dirCopy]
-                stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%lld.jpg", base, mt]] copy];
+                stringByAppendingPathComponent:[NSString stringWithFormat:@"v2_%@.%lld.jpg", base, mt]] copy];
 
             if (cachePath && [[NSFileManager defaultManager] fileExistsAtPath:cachePath]) {
                 img = [UIImage imageWithContentsOfFile:cachePath];   // 秒出, 不解码视频
