@@ -186,7 +186,6 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
 @end
 
 @implementation CCALLCustomController
-@synthesize specifier;
 {
     UIScrollView *_scroll;
     CCALLPreviewView *_preview;
@@ -199,6 +198,7 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
     NSTimer *_saveTimer;
     BOOL _frameDirty;
 }
+@synthesize specifier;
 
 - (NSString *)cc_title {
     return @"自定义设置(全模块)";
