@@ -512,7 +512,7 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
     CGFloat inner = W - 32.0;
 
     // ---- 固定 header: 预览 + 模块大小 ----
-    CGFloat headerH = 16 + 18 + 4 + 178 + 8 + 18 + 2 + 32 + 10;
+    CGFloat headerH = 16 + 18 + 4 + 190 + 8 + 18 + 2 + 32 + 10;
     UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, headerH)];
     [header setBackgroundColor:[UIColor colorWithWhite:0.94 alpha:1.0]];
     [header setAutoresizingMask:UIViewAutoresizingFlexibleWidth];
@@ -526,18 +526,18 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
     [pt setTextColor:[UIColor grayColor]];
     [header addSubview:pt];
 
-    _replica = [[CCPReplicaView alloc] initWithFrame:CGRectMake(16, 36, inner, 178)];
+    _replica = [[CCPReplicaView alloc] initWithFrame:CGRectMake(16, 36, inner, 190)];
     [header addSubview:_replica];
     [_replica loadBackgroundMaterial];
 
-    UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(16, 220, inner, 18)];
+    UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(16, 232, inner, 18)];
     [st setText:@"预览模块大小"];
     [st setFont:[UIFont systemFontOfSize:12.0]];
     [st setTextColor:[UIColor grayColor]];
     [header addSubview:st];
 
     _seg = [[UISegmentedControl alloc] initWithItems:@[@"2x2", @"2x3", @"3x2", @"4x2", @"4x3"]];
-    [_seg setFrame:CGRectMake(16, 240, inner, 32)];
+    [_seg setFrame:CGRectMake(16, 252, inner, 32)];
     [_seg setSelectedSegmentIndex:2];
     [_seg addTarget:self action:@selector(segChanged:) forControlEvents:UIControlEventValueChanged];
     [header addSubview:_seg];
@@ -813,8 +813,11 @@ static int ccp_tries = 0;
 }
 - (void)ccpForceLayout {
     CGRect b = self.bounds;
-    [_header setFrame:CGRectMake(0, 0, b.size.width, _headerH)];
-    [_scroll setFrame:CGRectMake(0, _headerH, b.size.width, MAX(b.size.height - _headerH, 100))];
+    // 安全区: 设置页视图全屏, 状态栏+导航条是半透明压在上面的, header 要让开
+    CGFloat top = [self safeAreaInsets].top;
+    if (top < 20.0) top = 20.0;
+    [_header setFrame:CGRectMake(0, top, b.size.width, _headerH)];
+    [_scroll setFrame:CGRectMake(0, top + _headerH, b.size.width, MAX(b.size.height - top - _headerH, 100))];
 }
 @end
 
