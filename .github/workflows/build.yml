@@ -5,6 +5,7 @@ on:
     paths:
       - 'main/**'
       - 'main2/**'
+      - 'main3/**'
       - 'Makefile'
       - '.github/workflows/build.yml'
   workflow_dispatch:
