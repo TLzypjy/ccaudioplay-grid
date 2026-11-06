@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'main/**'
+      - 'main2/**'
       - 'Makefile'
       - '.github/workflows/build.yml'
   workflow_dispatch:
