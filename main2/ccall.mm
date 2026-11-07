@@ -317,11 +317,14 @@ static void CCALLApply(id self) {
         @try {
             NSMutableDictionary *metrics = [[NSDictionary dictionaryWithContentsOfFile:TLPXMetricsPathRootless]
                                             mutableCopy] ?: [NSMutableDictionary dictionary];
+            CGRect wb = [(UIView *)self bounds];
+            CGRect si = [(UIView *)self safeAreaInsets];
             [metrics setObject:@{
-                @"width": @([(UIView *)self bounds].size.width),
-                @"height": @([(UIView *)self bounds].size.height),
+                @"width": @(wb.size.width),
+                @"height": @(wb.size.height),
                 @"scale": @1.0,
-                @"safeInsets": NSStringFromCGRect([(UIView *)self safeAreaInsets]),
+                @"safeInsets": [NSString stringWithFormat:@"%f,%f,%f,%f",
+                                si.top, si.bottom, si.left, si.right],
             } forKey:[NSString stringWithFormat:@"%ld", (long)type]];
             [metrics writeToFile:TLPXMetricsPathRootless atomically:YES];
         } @catch (id e) {}
