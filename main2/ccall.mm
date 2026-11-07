@@ -146,6 +146,7 @@ static void CCALLApply(id self) {
             @try {
                 CGRect wb = [(UIView *)self bounds];
                 UIEdgeInsets si = [(UIView *)self safeAreaInsets];
+                NSInteger wt = [[self valueForKey:@"type"] integerValue];
                 NSMutableDictionary *metrics = [[NSDictionary dictionaryWithContentsOfFile:TLPXMetricsPathRootless]
                                                 mutableCopy] ?: [NSMutableDictionary dictionary];
                 [metrics setObject:@{
@@ -154,8 +155,7 @@ static void CCALLApply(id self) {
                     @"scale": @1.0,
                     @"safeInsets": [NSString stringWithFormat:@"%f,%f,%f,%f",
                                     si.top, si.bottom, si.left, si.right],
-                } forKey:[NSString stringWithFormat:@"%ld",
-                         (long)[[(id)self valueForKey:@"type"] integerValue]];
+                } forKey:[NSString stringWithFormat:@"%ld", (long)wt]];
                 [metrics writeToFile:TLPXMetricsPathRootless atomically:YES];
             } @catch (id e) {}
         }
