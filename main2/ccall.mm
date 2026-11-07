@@ -335,6 +335,21 @@ static void CCALLApply(id self) {
 static void CCALLLayoutSubviews(id self, SEL _cmd) {
     if (ccal_orig_layoutSubviews) ccal_orig_layoutSubviews(self, _cmd);
     CCALLApply(self);
+    // 渲染真模块为图片 (设置页预览用) — 布局完成后截图
+    @try {
+        UIView *v = (UIView *)self;
+        if (v.bounds.size.width < 10) return;
+        UIGraphicsBeginImageContextWithOptions(v.bounds.size, NO, [UIScreen mainScreen].scale);
+        @try {
+            BOOL ok = [(id)v drawViewHierarchyInRect:v.bounds afterScreenUpdates:YES];
+            if (ok) {
+                UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+                NSData *png = UIImagePNGRepresentation(img);
+                if (png) [png writeToFile:@"/var/mobile/Documents/ccpreview.png" atomically:YES];
+            }
+        } @catch (id e) {}
+        UIGraphicsEndImageContext();
+    } @catch (id e) {}
 }
 
 static void CCALLTryInstall(void) {
