@@ -143,6 +143,9 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
     return nil;
 }
 
+// 网格素材库 (ccgrid.mm) 提供的素材静态首帧加载 (带磁盘缓存)
+extern UIImage *CCGLoadMaterialThumb(NSString *path);
+
 // ---------------- 复刻预览视图 ----------------
 @interface CCPReplicaView : UIView
 - (void)updateWithModule:(int)module frames:(NSDictionary *)frames fonts:(NSDictionary *)fonts;
@@ -300,7 +303,6 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
 }
 
 - (void)loadBackgroundMaterial {
-    CCPEnsureAVF();
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     NSDictionary *dom = [ud persistentDomainForName:CCP_DOMAIN] ?: @{};
     NSString *sel = [dom objectForKey:@"PlayingAsset"];
@@ -317,55 +319,19 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
 
     if (!path) return;
 
-    if (isVideo) {
-        NSURL *url = [NSURL fileURLWithPath:path];
-        Class itemCls = objc_getClass("AVPlayerItem");
-        Class qCls = objc_getClass("AVQueuePlayer");
-        Class looperCls = objc_getClass("AVPlayerLooper");
-        Class layerCls = objc_getClass("AVPlayerLayer");
-        Class sesCls = objc_getClass("AVAudioSession");
-        if (!itemCls || !qCls || !looperCls || !layerCls) {
-            CCPLog(@"bg", @"AVF classes unavailable");
-            return;
-        }
-        @try {
-            // 关键: 先把音频会话切成 Ambient (与其他混音), 否则激活会话会打断正在放的歌
-            if (sesCls) {
-                id ses = ((id(*)(id, SEL))objc_msgSend)(sesCls, sel_registerName("sharedInstance"));
-                ((BOOL(*)(id, SEL, id, id, id, id))objc_msgSend)(ses,
-                    sel_registerName("setCategory:withOptions:error:"),
-                    @"AVAudioSessionCategoryAmbient", nil, nil);
-            }
-            id item = ((id(*)(id, SEL, id))objc_msgSend)(itemCls, sel_registerName("playerItemWithURL:"), url);
-            id alloc = ((id(*)(id, SEL))objc_msgSend)(qCls, sel_registerName("alloc"));
-            id player = ((id(*)(id, SEL, id))objc_msgSend)(alloc, sel_registerName("initWithItems:"), @[item]);
-            id looper = ((id(*)(id, SEL, id, id))objc_msgSend)((id)looperCls,
-                sel_registerName("playerLooperWithPlayer:templateItem:"), player, item);
-            ((void(*)(id, SEL, BOOL))objc_msgSend)(player, sel_registerName("setMuted:"), YES);
-            ((void(*)(id, SEL))objc_msgSend)(player, sel_registerName("play"));
-            id layer = ((id(*)(id, SEL, id))objc_msgSend)(layerCls, sel_registerName("playerLayerWithPlayer:"), player);
-            ((void(*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setVideoGravity:"),
-                                                 @"AVLayerVideoGravityResizeAspectFill");
-            [((CALayer *)layer) setFrame:_bgHolder.bounds];
-            [_bgHolder.layer addSublayer:(CALayer *)layer];
-            _player = player;
-            _looper = looper;
-            _playerLayer = layer;
-            CCPLog(@"bg", @"video background playing");
-        } @catch (id e) {
-            CCPLog(@"bg", [NSString stringWithFormat:@"player exception %@", e]);
-        }
-    } else {
-        UIImage *img = [UIImage imageWithContentsOfFile:path];
-        if (img) {
-            UIImageView *iv = [[UIImageView alloc] initWithFrame:_bgHolder.bounds];
-            [iv setImage:img];
-            [iv setContentMode:UIViewContentModeScaleAspectFill];
-            [iv setClipsToBounds:YES];
-            [iv setAutoresizingMask:UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight];
-            [_bgHolder addSubview:iv];
-        }
+    // v124: 只显示当前选中素材的静态首帧/图片, 不再播视频
+    // (设置进程里起 AVPlayer 激活音频会话会打断正在放的歌; 静态图由网格库的缓存逻辑秒出)
+    UIImage *img = CCGLoadMaterialThumb(path);
+    if (!img) {
+        CCPLog(@"bg", @"thumb decode failed");
+        return;
     }
+    UIImageView *iv = [[UIImageView alloc] initWithFrame:_bgHolder.bounds];
+    [iv setImage:img];
+    [iv setContentMode:UIViewContentModeScaleAspectFill];
+    [iv setClipsToBounds:YES];
+    [iv setAutoresizingMask:UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight];
+    [_bgHolder addSubview:iv];
 }
 
 - (void)setThemeImage:(UIImage *)img {
