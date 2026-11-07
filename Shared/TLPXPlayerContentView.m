@@ -140,13 +140,18 @@
         [self addSubview:_barFill];
 
         NSArray *syms = @[@"backward.fill", @"pause.fill", @"forward.fill"];
-        UIImageView **btns[3] = {&_btnLeft, &_btnCenter, &_btnRight};
+        UIImageView *b1 = [[UIImageView alloc] initWithFrame:CGRectZero];
+        UIImageView *b2 = [[UIImageView alloc] initWithFrame:CGRectZero];
+        UIImageView *b3 = [[UIImageView alloc] initWithFrame:CGRectZero];
+        UIImageView *btns[3] = {b1, b2, b3};
         for (int i = 0; i < 3; i++) {
-            UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectZero];
+            UIImageView *iv = btns[i];
             [iv setImage:[UIImage systemImageNamed:syms[i]]];
             [iv setContentMode:UIViewContentModeScaleAspectFit];
             [iv setTintColor:[UIColor whiteColor]];
-            *btns[i] = iv;
+            if (i == 0) _btnLeft = iv;
+            else if (i == 1) _btnCenter = iv;
+            else _btnRight = iv;
             [self addSubview:iv];
         }
     }
@@ -174,7 +179,6 @@
     [_subtitleMarquee setFrame:[rectMap[TLPXElSubtitle] CGRectValue]];
     [_subtitleLabel setFrame:_subtitleMarquee.bounds];
 
-    CGRect group = [rectMap[TLPXElProgressGroup] CGRectValue];
     [_barTrack setHidden:NO];
     [_elapsedLabel setFrame:[rectMap[TLPXElElapsed] CGRectValue]];
     [_durationLabel setFrame:[rectMap[TLPXElDuration] CGRectValue]];
