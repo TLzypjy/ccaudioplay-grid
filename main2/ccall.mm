@@ -253,7 +253,7 @@ static void CCPReqCB(CFNotificationCenterRef c, void *obs, CFStringRef n, const 
             ccp_capTimer = [NSTimer timerWithTimeInterval:0.7 target:[CCPCapture shared]
                                                  selector:@selector(tick) userInfo:nil repeats:YES];
             [[NSRunLoop mainRunLoop] addTimer:ccp_capTimer forMode:NSRunLoopCommonModes];
-            CCALLLog(@"snap", @"capture started");
+            CCALLLog(@"snap: capture started");
         }
     });
 }
@@ -270,7 +270,7 @@ static void CCPReqCB(CFNotificationCenterRef c, void *obs, CFStringRef n, const 
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                         CCPReqCB, CFSTR("ccaudioplay.grid/preview-need"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        CCALLLog(@"snap", @"capture listener ready");
+        CCALLLog(@"snap: capture listener ready");
     }
     return self;
 }
@@ -278,7 +278,7 @@ static void CCPReqCB(CFNotificationCenterRef c, void *obs, CFStringRef n, const 
     if ([NSDate date].timeIntervalSince1970 > ccp_expireAt) {
         [ccp_capTimer invalidate];
         ccp_capTimer = nil;
-        CCALLLog(@"snap", @"capture stopped (no renewal)");
+        CCALLLog(@"snap: capture stopped (no renewal)");
         return;
     }
     CCPWriteSnapshot();
