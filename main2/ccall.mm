@@ -318,7 +318,7 @@ static void CCALLApply(id self) {
             NSMutableDictionary *metrics = [[NSDictionary dictionaryWithContentsOfFile:TLPXMetricsPathRootless]
                                             mutableCopy] ?: [NSMutableDictionary dictionary];
             CGRect wb = [(UIView *)self bounds];
-            CGRect si = [(UIView *)self safeAreaInsets];
+            UIEdgeInsets si = [(UIView *)self safeAreaInsets];
             [metrics setObject:@{
                 @"width": @(wb.size.width),
                 @"height": @(wb.size.height),
