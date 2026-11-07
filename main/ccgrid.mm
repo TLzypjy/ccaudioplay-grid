@@ -4,12 +4,8 @@
  * 原理: 本二进制替换偏好设置 bundle 的主程序(CFBundleExecutable),
  *       +load 时 dlopen 同目录下的 CCAudioPlayPresCore(原二进制),
  *       原有全部设置逻辑(滑条/颜色/遮罩/3x2 自定义...)原样保留;
- *       swizzle CCAssetCell 的两个素材入口 + 细胞初始化:
- *       -selectExistingAsset(从已有素材选择): 列表式 SandboxFileBrowser -> 网格素材库;
- *       -selectImagePicker(从相册选择, 改名「素材目录」): 拉起 Filza 定位到该行素材的
- *       磁盘保存目录 (裸路径形式 filza:///<路径>, 直接跳进目录);
- *       -initWithStyle:reuseIdentifier:specifier: 后扫描按钮把「从相册选择」改为「素材目录」
- *       (相册导入功能保留在网格库右上角"导入"入口)。
+ *       仅 swizzle CCAssetCell 的 -selectExistingAsset,
+ *       把图一那种列表式 SandboxFileBrowser 换成图二那种网格素材库:
  *       三列网格 + GIF/视频 角标 + 名字胶囊 + 选中圆点,
  *       长按进入抖动编辑态(红-删除 + 点名字行内改名), 右上角导入(相册/文件)。
  *
@@ -33,9 +29,6 @@
 
 #define CCG_SEL(s) sel_registerName(s)
 #define CCG_CLS(s) ((id)objc_getClass(s))
-
-@class CCGBrowserViewController;
-
 static inline id CCG_MSG1(id o, SEL s, id a) { return ((id(*)(id, SEL, id))objc_msgSend)(o, s, a); }
 static inline id CCG_MSG0(id o, SEL s) { return ((id(*)(id, SEL))objc_msgSend)(o, s); }
 static inline BOOL CCG_RESP(id o, SEL s) { return ((BOOL(*)(id, SEL, SEL))objc_msgSend)(o, sel_registerName("respondsToSelector:"), s); }
@@ -72,34 +65,6 @@ static void CCGEnsureLibs(void) {
             fnCGSrcCount = dlsym(gImageIOLib, "CGImageSourceGetCount");
         }
     });
-}
-
-// 统一缩到方形小图(卡片显示尺寸的 retina 倍), 控制内存: 1080p 帧解出来是 8MB, 不缩会爆。
-// 注意用"居中裁切填满"(AspectFill)而不是 letterbox: 否则黑边会被烘进图里,
-// 卡片再做 AspectFill 就只能整体缩小, 看起来两边留黑不填满。
-static UIImage *CCGSquareThumb(UIImage *img, double side) {
-    if (!img) return nil;
-    double w = img.size.width, h = img.size.height;
-    if (w <= 1 || h <= 1) return img;
-    // 取短边做正方形裁切区域
-    double cropSide = MIN(w, h);
-    CGRect crop = CGRectMake((w - cropSide) / 2.0, (h - cropSide) / 2.0, cropSide, cropSide);
-    CGImageRef cg = img.CGImage;
-    if (cg) {
-        double sx = CGImageGetWidth(cg) / w, sy = CGImageGetHeight(cg) / h;
-        CGRect pxCrop = CGRectMake(crop.origin.x * sx, crop.origin.y * sy,
-                                   crop.size.width * sx, crop.size.height * sy);
-        CGImageRef cropped = CGImageCreateWithImageInRect(cg, pxCrop);
-        if (cropped) {
-            img = [UIImage imageWithCGImage:cropped];
-            CGImageRelease(cropped);
-        }
-    }
-    UIGraphicsBeginImageContextWithOptions(CGSizeMake(side, side), NO, 1.0);
-    [img drawInRect:CCGRect(0, 0, side, side)];
-    UIImage *outImg = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-    return outImg ?: img;
 }
 
 // 设置进程里 objc_getClass("AVURLAsset") 可能拿到不响应消息的假类(实测会转发崩溃),
@@ -144,7 +109,7 @@ static UIImage *CCGThumbForPath(NSString *path) {
         if (!cg) return nil;
         UIImage *img = [UIImage imageWithCGImage:cg];
         CGImageRelease(cg);
-        return CCGSquareThumb(img, 400.0);
+        return img;
     } @catch (id e) {
         return nil;
     }
@@ -175,33 +140,27 @@ static UIImage *CCGVideoThumbForPath(NSString *path) {
         if (!assetCls) { CCGDbg(@"AVF: real AVURLAsset unavailable"); return nil; }
         if (!genCls) { CCGDbg(@"AVF: real AVAssetImageGenerator unavailable"); return nil; }
         NSURL *url = [NSURL fileURLWithPath:path];
-        // 不用 respondsToSelector 当门槛(此进程里结果不可信, 原插件也是直接调用),
-        // 全部真调用 + @try 接异常, 失败一路降级
         id asset = ((id(*)(id, SEL, id, id))objc_msgSend)(assetCls, CCG_SEL("URLAssetWithURL:options:"), url, nil);
         if (!asset) { CCGDbg(@"AVF: asset nil"); return nil; }
         id gen = ((id(*)(id, SEL, id))objc_msgSend)(genCls, CCG_SEL("assetImageGeneratorWithAsset:"), asset);
         if (!gen) { CCGDbg(@"AVF: gen nil"); return nil; }
+        // 防御: 任何一步不响应都直接放弃, 绝不让异常冒出去
+        if (![gen respondsToSelector:CCG_SEL("copyCGImageAtTime:actualTime:")]) {
+            CCGDbg(@"AVF: gen no copyCGImage");
+            return nil;
+        }
         ((void(*)(id, SEL, id))objc_msgSend)(gen, CCG_SEL("setAppliesPreferredTrackTransform:"), (id)kCFBooleanTrue);
         // 手工构造 CMTime{value=0, timescale=1, flags=Valid, epoch=0}, 不引入 CoreMedia 链接依赖
         typedef struct { long long value; int timescale; unsigned flags; long long epoch; } CCGTime;
         CCGTime t; t.value = 0; t.timescale = 1; t.flags = 1; t.epoch = 0;
-        // 注意: 新 iOS 上是三段选择器 copyCGImageAtTime:actualTime:error:
-        // (逆向原插件得其真实调用; 两段的旧方法已不存在, 之前一直因此失败)
-        CGImageRef cg = ((CGImageRef(*)(id, SEL, CCGTime *, void *, void *))objc_msgSend)(
-            gen, CCG_SEL("copyCGImageAtTime:actualTime:error:"), &t, NULL, NULL);
-        if (!cg) {
-            CCGDbg([NSString stringWithFormat:@"AVF: cg nil (gen=%@)", [gen class]]);
-            return nil;
-        }
+        CGImageRef cg = ((CGImageRef(*)(id, SEL, CCGTime, void *))objc_msgSend)(gen, CCG_SEL("copyCGImageAtTime:actualTime:"), t, NULL);
+        if (!cg) { CCGDbg(@"AVF: cg nil"); return nil; }
         UIImage *img = [UIImage imageWithCGImage:cg];
         CGImageRelease(cg);
-        if (!img) return nil;
-        UIImage *small = CCGSquareThumb(img, 400.0);
-        CCGDbg(@"AVF: ok");
-        return small;
+        if (img) CCGDbg(@"AVF: ok");
+        return img;
     } @catch (id e) {
-        // 转发异常也在这里接住
-        CCGDbg(@"AVF: exception (copyCGImage)");
+        CCGDbg(@"AVF: exception");
         return nil;
     }
 }
@@ -213,17 +172,22 @@ static void CCGQLThumbAsync(NSString *path, NSString *name, NSIndexPath *ip, __w
         static void *qlLib = NULL;
         static dispatch_once_t once;
         dispatch_once(&once, ^{
-            // 同 AVF: 先补伞层再补子框架, 防止类/方法只注册了一半
-            dlopen("/System/Library/Frameworks/QuickLook.framework/QuickLook", RTLD_LAZY);
             qlLib = dlopen("/System/Library/Frameworks/QuickLookThumbnailing.framework/QuickLookThumbnailing", RTLD_LAZY);
         });
         Class qlCls = objc_getClass("QLThumbnailGenerator");
         if (!qlLib || !qlCls) { CCGDbg(@"QL: framework/class unavailable"); return; }
-        // 不用 respondsToSelector 当门槛, 直接调, 异常 @try 接
+        if (![qlCls respondsToSelector:CCG_SEL("generatorWithMaximumSize:scale:requestOptions:")]) {
+            CCGDbg(@"QL: no class factory");
+            return;
+        }
         double scale = [UIScreen mainScreen].scale;
         id gen = ((id(*)(id, SEL, CGSize, double, long long))objc_msgSend)(
             qlCls, CCG_SEL("generatorWithMaximumSize:scale:requestOptions:"), CGSizeMake(600, 600), scale, 0);
         if (!gen) { CCGDbg(@"QL: generator nil"); return; }
+        if (![gen respondsToSelector:CCG_SEL("generateBestRepresentationForFile:completionHandler:")]) {
+            CCGDbg(@"QL: no generate method");
+            return;
+        }
         NSURL *url = [NSURL fileURLWithPath:path];
         void (^blk)(id, id) = ^(id thumb, id err) {
             @try {
@@ -232,45 +196,32 @@ static void CCGQLThumbAsync(NSString *path, NSString *name, NSIndexPath *ip, __w
                     img = CCG_MSG0(thumb, CCG_SEL("uiKitImage"));
                 }
                 if (!img && thumb && [thumb respondsToSelector:CCG_SEL("CGImage")]) {
-                    CGImageRef cg = (__bridge CGImageRef)CCG_MSG0(thumb, CCG_SEL("CGImage"));
+                    CGImageRef cg = (CGImageRef)CCG_MSG0(thumb, CCG_SEL("CGImage"));
                     if (cg) img = [UIImage imageWithCGImage:cg];
                 }
                 if (!img) { CCGDbg(@"QL: completion no image"); return; }
                 CCGDbg(@"QL: ok");
                 dispatch_async(dispatch_get_main_queue(), ^{
                     @try {
-                        id s = wself;
-                        if (!s) return;
-                        ((void(*)(id, SEL, id, id, id))objc_msgSend)(s, CCG_SEL("qlGotThumb:forName:atIp:"), img, name, ip);
+                        CCGBrowserViewController *s = wself;
+                        if (!s || !s->_cv || s->_thumbs == nil) return;
+                        [s->_thumbs setObject:img forKey:name];
+                        if ([s->_cv cellForItemAtIndexPath:ip]) {
+                            UICollectionViewCell *cell = [s->_cv cellForItemAtIndexPath:ip];
+                            UIImageView *iv = (UIImageView *)[cell viewWithTag:930];
+                            [iv setImage:img];
+                        }
                     } @catch (id e) {}
                 });
             } @catch (id e) { CCGDbg(@"QL: completion exception"); }
         };
-        ((void(*)(id, SEL, id, void (^)(id, id)))objc_msgSend)(gen, CCG_SEL("generateBestRepresentationForFile:completionHandler:"), url, blk);
+        ((void(*)(id, SEL, id, void (^)()))objc_msgSend)(gen, CCG_SEL("generateBestRepresentationForFile:completionHandler:"), url, blk);
     } @catch (id e) { CCGDbg(@"QL: exception"); }
 }
 
 // ---------- 编辑态 associated key ----------
-static const char kCCGDelKey = 0;   // 删除按钮 -> 文件名
+static const char kCCGDelKey = 0;   // 删除按钮手势 -> 文件名
 static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
-
-// 记住用户点选的素材名(跨会话, 重进素材库蓝点不丢)
-static NSString *CCGPickStoreKey(NSString *dir) {
-    return [NSString stringWithFormat:@"CCGridPicked::%@", dir ?: @""];
-}
-static NSString *CCGLoadPicked(NSString *dir) {
-    @try {
-        return [[NSUserDefaults standardUserDefaults] stringForKey:CCGPickStoreKey(dir)];
-    } @catch (id e) { return nil; }
-}
-static void CCGSavePicked(NSString *dir, NSString *name) {
-    @try {
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        if (name.length) [ud setObject:name forKey:CCGPickStoreKey(dir)];
-        else [ud removeObjectForKey:CCGPickStoreKey(dir)];
-        [ud synchronize];
-    } @catch (id e) {}
-}
 
 // ============ 网格素材库 ============
 @interface CCGBrowserViewController : UIViewController <UICollectionViewDataSource, UICollectionViewDelegate,
@@ -281,8 +232,7 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     NSString *_dir;                  // 当前目录
     NSMutableArray *_files;          // 文件/目录名(仅末级)
     NSMutableDictionary *_thumbs;    // 名字 -> UIImage
-    NSString *_selName;              // 从细胞读到的选中名(格式未知, 仅参考)
-    NSString *_pickedName;           // 本界面实际点选的素材名(绝对准确, 蓝点以它为准)
+    NSString *_selName;              // 当前选中素材名
     UICollectionView *_cv;
     // 导入暂存
     id _pendImg;
@@ -301,15 +251,11 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     CGPoint _lastTapPt;              // 普通模式下点名字直接改名的位置检测
     double _lastTapAt;
     NSMutableSet *_qlPending;        // QuickLook 异步生成中的素材名(防重复请求)
-    NSString *_pendSelPath;          // 去抖: 待执行的点选全路径
-    NSString *_pendSelName;          // 去抖: 待执行的点选名
 }
 - (instancetype)initWithCell:(id)cell directory:(NSString *)dir isRoot:(BOOL)root;
 - (void)closeTapped;
 - (void)importTapped;
 - (void)reloadFiles;
-- (void)qlGotThumb:(UIImage *)img forName:(NSString *)name atIp:(NSIndexPath *)ip;
-- (void)genThumbInBackgroundForName:(NSString *)name path:(NSString *)full isVideo:(BOOL)isVideo ip:(NSIndexPath *)ip;
 @end
 
 @implementation CCGBrowserViewController
@@ -339,7 +285,7 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
                                                            target:self action:@selector(importTapped)];
     [self navigationItem].rightBarButtonItem = imp;
 
-    // 当前选中素材名: 优先用本界面保存过的点选记录(跨会话稳定), 细胞存储仅作参考
+    // 当前选中素材名
     @try {
         id c = _cell;
         if (c && [c respondsToSelector:@selector(Key)] && [c respondsToSelector:@selector(assetNameWithKey:)]) {
@@ -347,7 +293,6 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
             _selName = CCG_MSG1(c, CCG_SEL("assetNameWithKey:"), key);
         }
     } @catch (id e) { _selName = nil; }
-    _pickedName = CCGLoadPicked(_dir);
 
     UICollectionViewFlowLayout *flow = [[UICollectionViewFlowLayout alloc] init];
     [flow setMinimumInteritemSpacing:0];
@@ -370,13 +315,14 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     _editLP = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(longPressTapped:)];
     [_editLP setMinimumPressDuration:0.4];
     [_cv addGestureRecognizer:_editLP];
+    // 点击位置观察器: 不拦截触摸(cancelsTouchesInView=NO), 只记录位置,
+    // 供 didSelect 判断"点的是名字胶囊" -> 普通模式直接改名, 不用进编辑态
+    UITapGestureRecognizer *tapProbe = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(recordTap:)];
+    [tapProbe setCancelsTouchesInView:NO];
+    [_cv addGestureRecognizer:tapProbe];
     [[self view] addSubview:_cv];
 
     [self reloadFiles];
-
-    // 打印素材根目录与缓存目录, 方便在文件管理器里找到/清理 .ccthumbs
-    CCGDbg([NSString stringWithFormat:@"DIR root=%@ | cache=%@", _dir,
-            [[self class] ccgThumbDir:_dir]]);
 
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(kbdWillShow:) name:UIKeyboardWillShowNotification object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(kbdDidShow:) name:UIKeyboardDidShowNotification object:nil];
@@ -449,7 +395,8 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     return (NSInteger)[_files count];
 }
 
-- (void)jiggleCard:(UIView *)card {    CABasicAnimation *anim = [CABasicAnimation animationWithKeyPath:@"transform.rotation"];
+- (void)jiggleCard:(UIView *)card {
+    CABasicAnimation *anim = [CABasicAnimation animationWithKeyPath:@"transform.rotation"];
     [anim setFromValue:@(-0.03)];
     [anim setToValue:@(0.03)];
     [anim setDuration:0.12];
@@ -497,97 +444,9 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     [_cv reloadData];
 }
 
-// QuickLook 异步回调: 缓存缩略图并就地刷新可见 cell
-- (void)qlGotThumb:(UIImage *)img forName:(NSString *)name atIp:(NSIndexPath *)ip {
-    @try {
-        if (!img || !_cv || _thumbs == nil) return;
-        [_thumbs setObject:img forKey:name];
-        [_qlPending removeObject:name];
-        UICollectionViewCell *cell = [_cv cellForItemAtIndexPath:ip];
-        if (cell) {
-            UIImageView *iv = (UIImageView *)[cell viewWithTag:930];
-            [iv setImage:img];
-        }
-    } @catch (id e) {}
-}
-
-// 缩略图磁盘缓存: 首帧只取一次, 落盘后永久复用(文件改动会因 mtime 变化自动重取)
-// 缓存目录 = 素材目录下的 .ccthumbs (点前缀不会出现在列表里)
-- (NSString *)thumbCachePathForFull:(NSString *)full {
-    @try {
-        NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:full error:nil];
-        long long mt = (long long)([attr fileModificationDate].timeIntervalSince1970);
-        NSString *base = [full stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
-        return [[[self class] ccgThumbDir:_dir] stringByAppendingPathComponent:
-            [NSString stringWithFormat:@"%@.%lld.jpg", base, mt]];
-    } @catch (id e) {
-        return nil;
-    }
-}
-
-+ (NSString *)ccgThumbDir:(NSString *)dir {
-    return [dir stringByAppendingPathComponent:@".ccthumbs"];
-}
-
-// 缩略图后台生成: ① 磁盘缓存命中直接用 ② 未命中才解码首帧并落盘 ③ AVF 失败落 QL 兜底
-// 完成后主线程就地刷新对应 cell
-- (void)genThumbInBackgroundForName:(NSString *)name path:(NSString *)full isVideo:(BOOL)isVideo ip:(NSIndexPath *)ip {
-    if ([_qlPending containsObject:name]) return;
-    [_qlPending addObject:name];
-    NSIndexPath *ipCopy = [ip copy];
-    NSString *nameCopy = [name copy];
-    NSString *fullCopy = [full copy];
-    NSString *dirCopy = [_dir copy];
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        UIImage *img = nil;
-        NSString *cachePath = nil;
-        @try {
-            // ① 磁盘缓存(键含 mtime, 素材改动自动失效)
-            NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:fullCopy error:nil];
-            long long mt = (long long)([attr fileModificationDate].timeIntervalSince1970);
-            NSString *base = [fullCopy stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
-            cachePath = [[[CCGBrowserViewController ccgThumbDir:dirCopy]
-                stringByAppendingPathComponent:[NSString stringWithFormat:@"v2_%@.%lld.jpg", base, mt]] copy];
-
-            if (cachePath && [[NSFileManager defaultManager] fileExistsAtPath:cachePath]) {
-                img = [UIImage imageWithContentsOfFile:cachePath];   // 秒出, 不解码视频
-            }
-
-            // ② 未命中: 解码首帧并落盘
-            if (!img) {
-                img = isVideo ? CCGVideoThumbForPath(fullCopy) : CCGThumbForPath(fullCopy);
-                if (img && cachePath) {
-                    [[NSFileManager defaultManager] createDirectoryAtPath:
-                        [cachePath stringByDeletingLastPathComponent]
-                        withIntermediateDirectories:YES attributes:nil error:nil];
-                    NSData *jd = UIImageJPEGRepresentation(img, 0.82);
-                    if (jd) [jd writeToFile:cachePath atomically:YES];
-                }
-            }
-        } @catch (id e) {}
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            @try {
-                if (!_cv) return;
-                if (img) {
-                    [_thumbs setObject:img forKey:nameCopy];
-                } else if (isVideo) {
-                    // AVF 取帧失败 -> QuickLook 异步兜底
-                    [_qlPending removeObject:nameCopy];
-                    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-                        CCGQLThumbAsync(fullCopy, nameCopy, ipCopy, self);
-                    });
-                    return;
-                }
-                [_qlPending removeObject:nameCopy];
-                UICollectionViewCell *cell = [_cv cellForItemAtIndexPath:ipCopy];
-                if (cell) {
-                    UIImageView *iv = (UIImageView *)[cell viewWithTag:930];
-                    [iv setImage:img];
-                }
-            } @catch (id e) {}
-        });
-    });
+- (void)recordTap:(UITapGestureRecognizer *)g {
+    _lastTapPt = [g locationInView:_cv];
+    _lastTapAt = CFAbsoluteTimeGetCurrent();
 }
 
 - (void)longPressTapped:(UILongPressGestureRecognizer *)lp {
@@ -667,9 +526,20 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
         NSString *typeTag = isVideo ? @"视频" : (isGif ? @"GIF" : @"图片");
 
         UIImage *thumb = [_thumbs objectForKey:name];
-        if (!thumb && !isDir) {
-            // 缩略图后台生成(主线程同步解码视频帧会卡滑动), 完成后就地刷新对应 cell
-            [self genThumbInBackgroundForName:name path:full isVideo:isVideo ip:ip];
+        if (!thumb) {
+            thumb = isVideo ? CCGVideoThumbForPath(full) : CCGThumbForPath(full);
+            if (thumb) {
+                [_thumbs setObject:thumb forKey:name];
+            } else if (isVideo && ![_qlPending containsObject:name]) {
+                // AVF 不通 -> QuickLook 异步兜底, 完成后就地刷新
+                [_qlPending addObject:name];
+                NSIndexPath *ipCopy = [ip copy];
+                NSString *nameCopy = [name copy];
+                NSString *fullCopy = [full copy];
+                dispatch_async(dispatch_get_global_queue(0, 0), ^{
+                    CCGQLThumbAsync(fullCopy, nameCopy, ipCopy, self);
+                });
+            }
         }
         UIImageView *iv = [[UIImageView alloc] initWithFrame:CCGRect(0, 0, cardW, imgH)];
         [iv setTag:930];
@@ -690,6 +560,21 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
         [badge.layer setCornerRadius:8.0];
         [badge.layer setMasksToBounds:YES];
         [card addSubview:badge];
+
+        // 视频: 没取到缩略图时给居中大播放钮占位, 不显得像坏了
+        if (isVideo && !thumb) {
+            UIView *pc = [[UIView alloc] initWithFrame:CCGRect((cardW - 44) / 2.0, (imgH - 44) / 2.0, 44, 44)];
+            [pc setBackgroundColor:[UIColor colorWithWhite:0.0 alpha:0.35]];
+            [pc.layer setCornerRadius:22.0];
+            [pc.layer setMasksToBounds:YES];
+            UILabel *plc = [[UILabel alloc] initWithFrame:pc.bounds];
+            [plc setText:@"▶"];
+            [plc setFont:[UIFont systemFontOfSize:17.0]];
+            [plc setTextAlignment:NSTextAlignmentCenter];
+            [plc setTextColor:[UIColor whiteColor]];
+            [pc addSubview:plc];
+            [card addSubview:pc];
+        }
 
         // 视频左下角播放标志
         if (isVideo) {
@@ -724,11 +609,10 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
 
     if (_editMode) [self jiggleCard:card];
 
-    // 名字胶囊(仅编辑态可点 -> 行内改名; 普通态穿透给 cell = 选中素材)
+    // 名字胶囊(点按 -> 行内改名)
     UIView *pill = [[UIView alloc] initWithFrame:CCGRect(10, imgH + 8, cardW - 8, 22)];
     [pill setTag:921];
     [pill setBackgroundColor:[UIColor colorWithWhite:0.62 alpha:0.85]];
-    [pill setUserInteractionEnabled:_editMode];
     [pill.layer setCornerRadius:11.0];
     [pill.layer setMasksToBounds:YES];
     UILabel *plb = [[UILabel alloc] initWithFrame:CCGRect(0, 0, cardW - 8, 22)];
@@ -744,18 +628,14 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     objc_setAssociatedObject(ng, &kCCGNameKey, name, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     // 选中圆点(目录/编辑态不显示)
-    // 蓝点以用户在本界面实际点选的素材为准(原始细胞存储名格式不可控);
-    // 首次进入时用细胞里读到的名字兜底匹配
     if (!_editMode && !isDir) {
-        NSString *base = [name stringByDeletingPathExtension];
         BOOL on = NO;
-        if (_pickedName.length) {
-            on = [[[_pickedName lastPathComponent] stringByDeletingPathExtension] isEqualToString:base];
-        } else if (_selName.length) {
-            on = [[[_selName lastPathComponent] stringByDeletingPathExtension] isEqualToString:base];
+        if (_selName) {
+            on = [_selName isEqualToString:name] || [_selName isEqualToString:full]
+              || [_selName isEqualToString:[name stringByDeletingPathExtension]];
         }
-         UIView *dot = [[UIView alloc] initWithFrame:CCGRect(6 + cardW / 2 - 9, imgH + 35, 18, 18)];
-         [dot.layer setCornerRadius:9.0];
+        UIView *dot = [[UIView alloc] initWithFrame:CCGRect(6 + cardW / 2 - 8, imgH + 36, 16, 16)];
+        [dot.layer setCornerRadius:9.0];
         [dot.layer setMasksToBounds:YES];
         [dot setBackgroundColor:on ? [UIColor systemBlueColor] : [UIColor colorWithWhite:0.80 alpha:1.0]];
         [[cell contentView] addSubview:dot];
@@ -772,39 +652,41 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     BOOL isDir = NO;
     [[NSFileManager defaultManager] fileExistsAtPath:full isDirectory:&isDir];
 
+    // 普通模式: 点在名字胶囊上 -> 直接行内改名(不用进编辑态)
+    if (!isDir) {
+        BOOL tappedPill = NO;
+        if (_activeField != nil) {
+            // 名字胶囊自己的手势已经先触发行内改名, 本次选择作废
+            tappedPill = YES;
+        } else {
+            double age = CFAbsoluteTimeGetCurrent() - _lastTapAt;
+            if (age >= 0 && age < 0.6) {
+                UICollectionViewCell *cell = [_cv cellForItemAtIndexPath:ip];
+                if (cell) {
+                    UIView *pill = [cell viewWithTag:921];
+                    if (pill) {
+                        CGRect pillFrame = [pill convertRect:pill.bounds toView:_cv];
+                        if (CGRectContainsPoint(pillFrame, _lastTapPt)) {
+                            [self beginRename:name inCell:cell atPill:pill];
+                            tappedPill = YES;
+                        }
+                    }
+                }
+            }
+        }
+        if (tappedPill) return;
+    }
+
     if (isDir) {
         // 子目录: 推入新浏览器(同一 delegate)
         CCGBrowserViewController *sub = [[CCGBrowserViewController alloc] initWithCell:_cell directory:full isRoot:NO];
         [[self navigationController] pushViewController:sub animated:YES];
         return;
     }
-    // 选择素材: 原细胞会读整个视频文件+写配置(主线程重活), 然后 dismiss 整个弹出层。
-    // 1) 蓝点立即重绘(用 _pickedName, 不等原细胞)
-    // 2) 原细胞调用做 0.3s 去抖: 连续快速点选时只执行最后一次, 避免排队卡死主线程
-    // 3) 递一个透明"替身"VC 接住原细胞自带的 dismiss, 网格留在原地
+    // 选择素材 -> 原细胞处理存储/通知/关闭
     id d = _cell;
     if (d && [d respondsToSelector:@selector(fileBrowser:didSelectFilePath:fileName:)]) {
-        _pickedName = name;
-        _selName = name;
-        CCGSavePicked(_dir, name);   // 持久化, 重进素材库蓝点仍在
-        [_cv reloadData];   // 圆点立即切换
-
-        _pendSelPath = [full copy];
-        _pendSelName = [name copy];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            // 只有仍是最新一次点选才真正调用原细胞(去抖)
-            if (![self->_pendSelPath isEqualToString:full]) return;
-            NSString *p = self->_pendSelPath;
-            NSString *n = self->_pendSelName;
-            self->_pendSelPath = nil;
-            self->_pendSelName = nil;
-            UIViewController *sacrifice = [[UIViewController alloc] init];
-            [sacrifice setModalPresentationStyle:UIModalPresentationOverFullScreen];
-            [sacrifice setView:[[UIView alloc] initWithFrame:CGRectZero]];
-            [self presentViewController:sacrifice animated:NO completion:^{
-                ((void(*)(id, SEL, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:didSelectFilePath:fileName:"), self, p, n);
-            }];
-        });
+        ((void(*)(id, SEL, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:didSelectFilePath:fileName:"), self, full, name);
     } else {
         [self closeTapped];
     }
@@ -817,23 +699,14 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
                                                                 message:[NSString stringWithFormat:@"确定删除「%@」? 不可恢复", name]
                                                          preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction *yes = [UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-        // 先算缩略图缓存路径(依赖被删文件的 mtime)
-        NSString *thumbCache = [self thumbCachePathForFull:full];
         [[NSFileManager defaultManager] removeItemAtPath:full error:nil];
         [_thumbs removeObjectForKey:name];
-        if (_pickedName && [_pickedName isEqualToString:name]) { _pickedName = nil; CCGSavePicked(_dir, nil); }
-        if (thumbCache) [[NSFileManager defaultManager] removeItemAtPath:thumbCache error:nil];
-        [self reloadFiles];   // 立即刷新列表
+        // 原细胞: 若当前素材指向被删文件则清空存储并刷新行/发通知
         id d = _cell;
         if (d && [d respondsToSelector:@selector(fileBrowser:deleteFileName:filePath:)]) {
-            // 原实现删除后也会 dismiss 整个素材库; 用替身 VC 接住, 删除后留在网格里
-            UIViewController *sacrifice = [[UIViewController alloc] init];
-            [sacrifice setModalPresentationStyle:UIModalPresentationOverFullScreen];
-            [sacrifice setView:[[UIView alloc] initWithFrame:CGRectZero]];
-            [self presentViewController:sacrifice animated:NO completion:^{
-                ((void(*)(id, SEL, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:deleteFileName:filePath:"), self, name, full);
-            }];
+            ((void(*)(id, SEL, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:deleteFileName:filePath:"), self, name, full);
         }
+        [self reloadFiles];
     }];
     UIAlertAction *cc = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     [al addAction:yes];
@@ -958,17 +831,6 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     NSError *err = nil;
     if ([fm moveItemAtPath:src toPath:dst error:&err]) {
         [_thumbs removeObjectForKey:old];
-        if (_pickedName && [_pickedName isEqualToString:old]) { _pickedName = newName; CCGSavePicked(_dir, newName); }
-        // 同步移动缩略图缓存(同文件 mtime 不变, 仅路径键变化)
-        NSString *oldCache = [self thumbCachePathForFull:src];
-        NSString *newCache = [self thumbCachePathForFull:dst];
-        if (oldCache && [[NSFileManager defaultManager] fileExistsAtPath:oldCache]) {
-            [[NSFileManager defaultManager] createDirectoryAtPath:
-                [newCache stringByDeletingLastPathComponent]
-                withIntermediateDirectories:YES attributes:nil error:nil];
-            [[NSFileManager defaultManager] removeItemAtPath:newCache error:nil];
-            [[NSFileManager defaultManager] moveItemAtPath:oldCache toPath:newCache error:nil];
-        }
         id d = _cell;
         if (d && [d respondsToSelector:@selector(fileBrowser:renameNewFileName:oldFileName:filePath:)]) {
             ((void(*)(id, SEL, id, id, id, id))objc_msgSend)(d, CCG_SEL("fileBrowser:renameNewFileName:oldFileName:filePath:"),
@@ -1169,46 +1031,25 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     }
     (void)ok;
     [self reloadFiles];
-    // 导入成功: 后台取一次首帧并落盘缩略图缓存, 之后打开素材库秒出图、永不重复解码
-    NSString *dstName = [dst lastPathComponent];
-    BOOL dstIsVideo = [CCGVideoExts() containsObject:[[dstName pathExtension] lowercaseString]];
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        [self genThumbInBackgroundForName:dstName path:dst isVideo:dstIsVideo ip:nil];
-    });
 }
 
 @end
 
+// 供 ccpre.mm 的自定义设置页调用: 加载素材静态首帧/图片 (带 .ccthumbs 磁盘缓存)
+UIImage *CCGLoadMaterialThumb(NSString *path) {
+    @try {
+        if (![path length]) return nil;
+        NSString *ext = [[path pathExtension] lowercaseString];
+        NSArray *vid = @[@"mp4", @"mov", @"m4v"];
+        if ([vid containsObject:ext]) return CCGVideoThumbForPath(path);
+        return CCGThumbForPath(path);
+    } @catch (id e) {
+        return nil;
+    }
+}
+
 // ============ swizzle ============
 static void (*gOrigSelectExistingAsset)(id, SEL) = NULL;
-static void (*gOrigSelectImagePicker)(id, SEL) = NULL;
-static id (*gOrigAssetCellInit)(id, SEL, long, id, id) = NULL;
-
-// 按钮改名: 「从相册选择」的功能已被换成"跳转素材目录(Filza)", 标题同步改成「素材目录」。
-// 原文字不在包内任何文件里(运行时拼出/roothide 处理), 所以不走文本补丁,
-// 而是在细胞初始化完成后递归扫描子树, 对含"相册"字样的按钮直接改标题。
-static void CCGScanRetitle(id view) {
-    @try {
-        for (UIView *sub in [view subviews]) {
-            if ([sub isKindOfClass:[UIButton class]]) {
-                UIButton *b = (UIButton *)sub;
-                NSString *t = [b titleForState:UIControlStateNormal] ?: [b titleLabel].text;
-                if (t && [t containsString:@"相册"]) {
-                    [b setTitle:@"素材目录" forState:UIControlStateNormal];
-                    [b setTitle:@"素材目录" forState:UIControlStateHighlighted];
-                    [[b titleLabel] setText:@"素材目录"];
-                }
-            }
-            CCGScanRetitle(sub);
-        }
-    } @catch (id e) {}
-}
-
-static id CCGAssetCellInit(id self, SEL _cmd, long style, id rid, id spec) {
-    id r = gOrigAssetCellInit(self, _cmd, style, rid, spec);
-    CCGScanRetitle(self);
-    return r;
-}
 
 static void CCGSelectExistingAsset(id self, SEL _cmd) {
     @try {
@@ -1242,74 +1083,14 @@ static void CCGSelectExistingAsset(id self, SEL _cmd) {
     }
 }
 
-// 「从相册选择」按钮: 不再弹系统相册, 改为拉起 Filza 定位到该行素材的磁盘保存目录
-// (即 rootAssetPath, 与网格素材库打开的是同一个真实目录; 相册导入仍走网格库右上角"导入")。
-// URL 形式踩坑记录:
-//   v109 filza://view?path=%2Fvar%2F...  -> Filza 打开但不跳转 (Filza 不反转义 query 值)
-//   v110 filza://view?path=/var/...      -> URL 无路径成分, Filza 原样停在原处
-//   v111 filza://view/var/mobile/...     -> 停在父目录高亮目标 (view=host 是"打开文件并高亮"动作)
-//   实测+社区标准写法(快捷指令/StackOverflow tweak): 裸路径形式直接跳进目录:
-//   filza://<路径>  例: filza:///var/mobile/Documents/  (无动作host, 保留尾部斜杠标记目录)
-//   -> v112 用 filza:// + rootAssetPath 原样 (仅转义空格/引号/非ASCII等非法字符)。
-// 注意: 不用 canOpenURL (filza 未在宿主 Info.plist 的 LSApplicationQueriesSchemes 声明时必返回 NO),
-// 直接 openURL 异步拉起, completionHandler 传 nil -> 不回调进本进程, 无 PAC 风险;
-// 目录拿不到/构造失败时退回原相册实现。
-static void CCGSelectImagePicker(id self, SEL _cmd) {
-    @try {
-        NSString *root = nil;
-        if ([self respondsToSelector:@selector(rootAssetPath)]) {
-            root = ((NSString *(*)(id, SEL))objc_msgSend)(self, CCG_SEL("rootAssetPath"));
-        }
-        if (![root length]) {
-            if (gOrigSelectImagePicker) gOrigSelectImagePicker(self, _cmd);
-            return;
-        }
-        // 裸路径形式: filza:///var/mobile/... (rootAssetPath 自带尾部斜杠, 原样保留标记目录)
-        // 最小转义: 字母数字与 -._~/:!$'()*,;=@ 原样保留, 其余(空格 # % <> 引号 中文等)才转义
-        NSMutableCharacterSet *allowed = [[NSMutableCharacterSet alphanumericCharacterSet] mutableCopy];
-        [allowed addCharactersInString:@"-._~/:!$'()*,;=@"];
-        NSString *enc = [root stringByAddingPercentEncodingWithAllowedCharacters:allowed];
-        NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"filza://%@", enc]];
-        if (!url) {
-            if (gOrigSelectImagePicker) gOrigSelectImagePicker(self, _cmd);
-            return;
-        }
-        SEL openSel = CCG_SEL("openURL:options:completionHandler:");
-        UIApplication *app = [UIApplication sharedApplication];
-        if ([app respondsToSelector:openSel]) {
-            ((void(*)(id, SEL, id, id, id))objc_msgSend)(app, openSel, url, [NSDictionary dictionary], nil);
-        } else {
-            // 极老系统兜底
-            ((void(*)(id, SEL, id))objc_msgSend)(app, CCG_SEL("openURL:"), url);
-        }
-    } @catch (id e) {
-        if (gOrigSelectImagePicker) gOrigSelectImagePicker(self, _cmd);
-    }
-}
-
 static void CCGSwizzleAfterCoreLoad(void) {
     Class cell = objc_getClass("CCAssetCell");
     if (!cell) return;
     SEL sel = CCG_SEL("selectExistingAsset");
     Method m = class_getInstanceMethod(cell, sel);
-    if (m) {
-        gOrigSelectExistingAsset = (void (*)(id, SEL))method_getImplementation(m);
-        method_setImplementation(m, (IMP)CCGSelectExistingAsset);
-    }
-    // 「从相册选择」-> 拉起 Filza 定位素材目录
-    SEL selIP = CCG_SEL("selectImagePicker");
-    Method mIP = class_getInstanceMethod(cell, selIP);
-    if (mIP) {
-        gOrigSelectImagePicker = (void (*)(id, SEL))method_getImplementation(mIP);
-        method_setImplementation(mIP, (IMP)CCGSelectImagePicker);
-    }
-    // 细胞初始化后把「从相册选择」按钮改名为「素材目录」
-    SEL selInit = CCG_SEL("initWithStyle:reuseIdentifier:specifier:");
-    Method mInit = class_getInstanceMethod(cell, selInit);
-    if (mInit) {
-        gOrigAssetCellInit = (id (*)(id, SEL, long, id, id))method_getImplementation(mInit);
-        method_setImplementation(mInit, (IMP)CCGAssetCellInit);
-    }
+    if (!m) return;
+    gOrigSelectExistingAsset = (void (*)(id, SEL))method_getImplementation(m);
+    method_setImplementation(m, (IMP)CCGSelectExistingAsset);
 }
 
 @interface CCGBootstrap : NSObject
