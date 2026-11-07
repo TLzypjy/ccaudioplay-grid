@@ -23,6 +23,7 @@
 #import "TLPXConstants.h"
 #import "TLPXLayoutEngine.h"
 #import "TLPXMediaSnapshot.h"
+#import "ccedit_mode.h"
 
 static void (*ccal_orig_layoutSubviews)(id, SEL) = NULL;
 static int ccal_install_tries = 0;
@@ -335,6 +336,12 @@ static void CCALLApply(id self) {
 static void CCALLLayoutSubviews(id self, SEL _cmd) {
     if (ccal_orig_layoutSubviews) ccal_orig_layoutSubviews(self, _cmd);
     CCALLApply(self);
+    // 安装编辑模式双击手势 (首次)
+    static char cce_gesture_installed = 0;
+    if (!cce_gesture_installed) {
+        cce_gesture_installed = 1;
+        CCEInstallEditMode((UIView *)self);
+    }
     // 渲染真模块为图片 (设置页预览用) — 布局完成后截图
     @try {
         UIView *v = (UIView *)self;
