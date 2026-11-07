@@ -18,6 +18,11 @@
 #import <dlfcn.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+
+#import "TLPXConstants.h"
+#import "TLPXLayoutEngine.h"
+#import "TLPXMediaSnapshot.h"
 
 static void (*ccal_orig_layoutSubviews)(id, SEL) = NULL;
 static int ccal_install_tries = 0;
@@ -99,37 +104,7 @@ static NSString *ccp_lastTreeStr = nil;
 static double ccp_lastNowFetch = 0;
 
 static void CCPExportNowPlaying(void) {
-    @try {
-        void *mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY);
-        if (!mr) return;
-        void (*MRGNI)(dispatch_queue_t, void (^)(CFDictionaryRef)) =
-            (void (*)(dispatch_queue_t, void (^)(CFDictionaryRef)))dlsym(mr, "MRMediaRemoteGetNowPlayingInfo");
-        if (!MRGNI) return;
-        MRGNI(dispatch_get_global_queue(0, 0), ^(CFDictionaryRef info) {
-            @try {
-                NSMutableDictionary *out = [NSMutableDictionary dictionary];
-                UIImage *art = nil;
-                if (info) {
-                    NSDictionary *d = (__bridge NSDictionary *)info;
-                    NSString *t = [d objectForKey:@"kMRMediaRemoteNowPlayingInfoTitle"];
-                    NSString *a = [d objectForKey:@"kMRMediaRemoteNowPlayingInfoArtist"];
-                    double e = [[d objectForKey:@"kMRMediaRemoteNowPlayingInfoElapsedTime"] doubleValue];
-                    double du = [[d objectForKey:@"kMRMediaRemoteNowPlayingInfoDuration"] doubleValue];
-                    NSData *ad = [d objectForKey:@"kMRMediaRemoteNowPlayingInfoArtworkData"];
-                    if ([t length]) out[@"title"] = t;
-                    if ([a length]) out[@"artist"] = a;
-                    out[@"elapsed"] = @(e);
-                    out[@"duration"] = @(du);
-                    if (ad) art = [UIImage imageWithData:ad];
-                }
-                [out writeToFile:@"/var/mobile/Documents/ccnow.plist" atomically:YES];
-                if (art) {
-                    NSData *png = UIImagePNGRepresentation(art);
-                    if (png) [png writeToFile:@"/var/mobile/Documents/ccart.png" atomically:YES];
-                }
-            } @catch (id e) {}
-        });
-    } @catch (id e) {}
+    [TLPXMediaSnapshot exportFromSpringBoard];   // 共享层统一导出
 }
 
 // 视图树递归导出 (类名 + 模块坐标系 frame), 供精确对齐预览
@@ -143,6 +118,15 @@ static void CCPDumpNode(UIView *v, int depth, CGPoint off, NSMutableArray *out) 
     for (UIView *s in [v subviews]) {
         CCPDumpNode(s, depth + 1, CGPointMake(abs.origin.x, abs.origin.y), out);
     }
+}
+
+// 应用引擎 rectMap 的单个元素 (等值跳过防拉锯)
+static void CCPApplyRect(UIView *v, CGRect r, NSString *logKey) {
+    if (!v || ![v isKindOfClass:[UIView class]]) return;
+    if (CGRectEqualToRect([v frame], r)) return;
+    [v setFrame:r];
+    CCALLLogOnce([@"ok" stringByAppendingString:logKey],
+        [NSString stringWithFormat:@"%@ ok fr=%@", logKey, NSStringFromCGRect(r)]);
 }
 
 static void CCALLApply(id self) {
@@ -252,36 +236,65 @@ static void CCALLApply(id self) {
         if ([sig isEqualToString:lastSig]) return;
         objc_setAssociatedObject(self, &_ccp_sig_key, sig, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-        // ---- 直属元素 (CCCustomView 自己的属性) ----
-        NSDictionary *direct = @{
-            @"iconFrame"         : @"playingIconView",
-            @"elapsedTitleFrame" : @"elapsedTitleLabel",
-            @"durationTitleFrame": @"durationTitleLabel",
-            @"progressFrame"     : @"progressView",
-        };
-        for (NSString *fk in direct) {
-            CCALLApplyToFrame(self, fk, direct[fk], self);
+        // ---- 共享引擎: 配置 → rectMap (真机与预览同一份几何) ----
+        // 只应用配置已设置的元素; 未设置的保持原版布局, 不引入回归。
+        NSMutableDictionary *cfg = [NSMutableDictionary dictionary];
+        NSArray *cfgKeys = @[TLPXKeyIconFrame, TLPXKeyTitleFrame, TLPXKeySubTitleFrame,
+                             TLPXKeyElapsedTitleFrame, TLPXKeyDurationTitleFrame, TLPXKeyProgressFrame,
+                             TLPXKeyLeftButtonFrame, TLPXKeyCenterButtonFrame, TLPXKeyRightButtonFrame];
+        for (NSString *k in cfgKeys) {
+            id v = [self valueForKey:k];
+            if ([v isKindOfClass:[NSValue class]]) [cfg setObject:v forKey:k];
         }
-        // 自定义进度条容器跟随进度条框
-        @try {
-            NSValue *pf = [self valueForKey:@"progressFrame"];
-            UIView *pcv = [self valueForKey:@"progressCustomView"];
-            if (pf && pcv) {
-                CGRect fr = [pf CGRectValue];
-                if (fr.size.width > 0 && fr.size.height > 0 && !CGRectEqualToRect([pcv frame], fr)) {
-                    [pcv setFrame:fr];
-                }
-            }
-        } @catch (id e) {}
+        NSDictionary *rm = [TLPXLayoutEngine rectMapWithSize:[(UIView *)self bounds].size
+                                                       tier:(TLPXTier)type
+                                                     frames:cfg
+                                                textSamples:nil];
+
+        UIView *iv = [self valueForKey:@"playingIconView"];
+        if ([cfg objectForKey:TLPXKeyIconFrame]) {
+            CCPApplyRect(iv, [[rm objectForKey:TLPXElIconContainer] CGRectValue], @"icon");
+        }
+        UIView *el = [self valueForKey:@"elapsedTitleLabel"];
+        if ([cfg objectForKey:TLPXKeyElapsedTitleFrame]) {
+            CCPApplyRect(el, [[rm objectForKey:TLPXElElapsed] CGRectValue], @"elapsed");
+        }
+        UIView *dl = [self valueForKey:@"durationTitleLabel"];
+        if ([cfg objectForKey:TLPXKeyDurationTitleFrame]) {
+            CCPApplyRect(dl, [[rm objectForKey:TLPXElDuration] CGRectValue], @"duration");
+        }
+        UIView *pv = [self valueForKey:@"progressView"];
+        if ([cfg objectForKey:TLPXKeyProgressFrame]) {
+            CCPApplyRect(pv, [[rm objectForKey:TLPXElBar] CGRectValue], @"progress");
+        }
+        UIView *pcv = [self valueForKey:@"progressCustomView"];
+        if (pcv && [cfg objectForKey:TLPXKeyProgressFrame]) {
+            CCPApplyRect(pcv, [[rm objectForKey:TLPXElBar] CGRectValue], @"progressCustom");
+        }
 
         // ---- 系统播放视图内部元素 (歌词/歌曲/三个按钮) ----
         UIView *npv = [self valueForKey:@"nowPlayingView"];
         if ([npv isKindOfClass:[UIView class]]) {
-            CCALLApplyToFrame(npv, @"titleFrame",        @"titleMarqueeView",      self);
-            CCALLApplyToFrame(npv, @"subTitleFrame",     @"subtitleMarqueeView",   self);
-            CCALLApplyToFrame(npv, @"leftButtonFrame",   @"leftButton",            self);
-            CCALLApplyToFrame(npv, @"centerButtonFrame", @"centerButton",          self);
-            CCALLApplyToFrame(npv, @"rightButtonFrame",  @"rightButton",           self);
+            if ([cfg objectForKey:TLPXKeyTitleFrame]) {
+                CCPApplyRect([npv valueForKey:@"titleMarqueeView"],
+                             [[rm objectForKey:TLPXElTitle] CGRectValue], @"title");
+            }
+            if ([cfg objectForKey:TLPXKeySubTitleFrame]) {
+                CCPApplyRect([npv valueForKey:@"subtitleMarqueeView"],
+                             [[rm objectForKey:TLPXElSubtitle] CGRectValue], @"subtitle");
+            }
+            if ([cfg objectForKey:TLPXKeyLeftButtonFrame]) {
+                CCPApplyRect([npv valueForKey:@"leftButton"],
+                             [[rm objectForKey:TLPXElButtonLeft] CGRectValue], @"btnL");
+            }
+            if ([cfg objectForKey:TLPXKeyCenterButtonFrame]) {
+                CCPApplyRect([npv valueForKey:@"centerButton"],
+                             [[rm objectForKey:TLPXElButtonCenter] CGRectValue], @"btnC");
+            }
+            if ([cfg objectForKey:TLPXKeyRightButtonFrame]) {
+                CCPApplyRect([npv valueForKey:@"rightButton"],
+                             [[rm objectForKey:TLPXElButtonRight] CGRectValue], @"btnR");
+            }
 
             // 字体 (跑马灯内部的 label)
             @try {
@@ -299,6 +312,19 @@ static void CCALLApply(id self) {
         // ---- 两个时间标签字体 ----
         CCALLApplyFont([self valueForKey:@"elapsedTitleLabel"],  @"elapsedTitleFont",  self);
         CCALLApplyFont([self valueForKey:@"durationTitleLabel"], @"durationTitleFont", self);
+
+        // ---- metrics.plist: 真机实测尺寸回写 (预览按档位读取, 不猜尺寸) ----
+        @try {
+            NSMutableDictionary *metrics = [[NSDictionary dictionaryWithContentsOfFile:TLPXMetricsPathRootless]
+                                            mutableCopy] ?: [NSMutableDictionary dictionary];
+            [metrics setObject:@{
+                @"width": @([(UIView *)self bounds].size.width),
+                @"height": @([(UIView *)self bounds].size.height),
+                @"scale": @1.0,
+                @"safeInsets": NSStringFromCGRect([(UIView *)self safeAreaInsets]),
+            } forKey:[NSString stringWithFormat:@"%ld", (long)type]];
+            [metrics writeToFile:TLPXMetricsPathRootless atomically:YES];
+        } @catch (id e) {}
     } @catch (id e) {}
 }
 
