@@ -25,7 +25,6 @@
 #define CCP_DOMAIN @"com.thefool.ccaudioplaypres"
 #define CCP_NOTE_FRAME @"com.thefool.ccaudioplaypres/updateCustomFrameNotificationt"
 #define CCP_NOTE_FONT  @"com.thefool.ccaudioplaypres/updateCustomFontNotificationt"
-#define CCP_NEED_SNAP  @"ccaudioplay.grid/preview-need"
 #define CCP_BG_DIR_PLAY @"/var/mobile/CCAudioPlay-BackGround/PlayingAsset"
 #define CCP_BG_DIR_BACK @"/var/mobile/CCAudioPlay-BackGround/BackAsset"
 #define CCP_MASK_DIR    @"/var/mobile/Library/Application Support/CCAudioPlay/CCAudioPlay-Mask-N95"
@@ -378,9 +377,17 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     for (int i = 0; i < 9; i++) {
         NSValue *fv = frames[order[i]];
         UIView *v = views[i];
-        if (!fv) { [v setHidden:YES]; continue; }
-        CGRect fr = [fv CGRectValue];
-        if (fr.size.width <= 0.5 && fr.size.height <= 0.5 && i != 5) { [v setHidden:YES]; continue; }
+        CGRect fr;
+        BOOL unset = NO;
+        if (!fv) {
+            unset = YES;
+        } else {
+            fr = [fv CGRectValue];
+            if (fr.size.width <= 0.5 && fr.size.height <= 0.5 &&
+                fr.origin.x <= 0.5 && fr.origin.y <= 0.5) unset = YES;
+        }
+        // 全部元素常驻显示: 未设置位置的用默认排布, 方便用户看到要调的东西
+        if (unset) fr = [self defaultFrame:i size:ms];
         [v setHidden:NO];
         CGRect scaled = CGRectMake(fr.origin.x * sc, fr.origin.y * sc,
                                    fr.size.width * sc, fr.size.height * sc);
@@ -415,7 +422,6 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
             [_progTrack setFrame:scaled];
             [_progFill setFrame:CGRectMake(scaled.origin.x, scaled.origin.y,
                                            scaled.size.width * _fraction, scaled.size.height)];
-            [views[5] setHidden:NO];
         }
     }
 
@@ -433,6 +439,23 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     if (df >= 4) [_durationLabel setFont:[UIFont systemFontOfSize:df]];
 }
 
+// 未设置 frame 时的默认排布 (按模块尺寸比例), 让所有元素都可见可调
+- (CGRect)defaultFrame:(int)i size:(CGSize)ms {
+    CGFloat W = ms.width, H = ms.height;
+    switch (i) {
+        case 0: return CGRectMake(0.04 * W, 0.26 * H, 0.26 * W, 0.42 * H);   // 专辑
+        case 1: return CGRectMake(0.34 * W, 0.10 * H, 0.60 * W, 0.22 * H);   // 歌词
+        case 2: return CGRectMake(0.34 * W, 0.36 * H, 0.58 * W, 0.16 * H);   // 歌曲
+        case 3: return CGRectMake(0.34 * W, 0.76 * H, 0.15 * W, 0.12 * H);   // 当前时间
+        case 4: return CGRectMake(0.81 * W, 0.76 * H, 0.15 * W, 0.12 * H);   // 总时间
+        case 5: return CGRectMake(0.34 * W, 0.64 * H, 0.60 * W, 3.0);        // 进度条
+        case 6: return CGRectMake(0.34 * W, 0.86 * H, 0.10 * W, 0.12 * H);   // 左按钮
+        case 7: return CGRectMake(0.45 * W, 0.86 * H, 0.10 * W, 0.12 * H);   // 中按钮
+        case 8: return CGRectMake(0.56 * W, 0.86 * H, 0.10 * W, 0.12 * H);   // 右按钮
+    }
+    return CGRectZero;
+}
+
 @end
 
 // ---------------- 页面 ----------------
@@ -443,8 +466,6 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
 @property (nonatomic, retain) NSMutableDictionary *templates;
 @property (nonatomic, retain) NSMutableArray *sliderRows;
 @property (nonatomic, retain) NSTimer *saveTimer;
-@property (nonatomic, retain) NSTimer *snapTimer;
-@property (nonatomic, retain) UIImageView *snapView;
 @property (nonatomic, retain) NSTimer *nowTimer;
 @property (nonatomic, assign) BOOL frameDirty;
 @property (nonatomic, assign) BOOL nowLive;
@@ -506,12 +527,6 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     _replica = [[CCPReplicaView alloc] initWithFrame:CGRectMake(16, 36, inner, 190)];
     [header addSubview:_replica];
     [_replica loadBackgroundMaterial];
-
-    // 真机模块快照 (SpringBoard 侧伴随 tweak 截图, 0.6s 一张): 新鲜时盖在复刻层上
-    _snapView = [[UIImageView alloc] initWithFrame:CGRectMake(16, 36, inner, 190)];
-    [_snapView setContentMode:UIViewContentModeScaleAspectFit];
-    [_snapView setHidden:YES];
-    [header addSubview:_snapView];
 
     UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(16, 232, inner, 18)];
     [st setText:@"预览模块大小"];
@@ -628,29 +643,6 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     [self refreshReplica];
     [self fetchNowPlaying];
     // 播放进度不刷新 (用户要求): 只在进入页面时取一次播放信息, 不再起定时器
-
-    // 真机快照管道: 0.6s 一轮 —— 发续约通知 + 读取新鲜快照 (mtime < 4s) 显示
-    [self cc_postNote:CCP_NEED_SNAP];
-    _snapTimer = [NSTimer timerWithTimeInterval:0.6 target:self selector:@selector(snapTick)
-                                       userInfo:nil repeats:YES];
-    [[NSRunLoop mainRunLoop] addTimer:_snapTimer forMode:NSRunLoopCommonModes];
-}
-
-- (void)snapTick {
-    @try {
-        [self cc_postNote:CCP_NEED_SNAP];   // 续约快照采集
-        NSString *p = @"/var/mobile/Documents/ccpreview.jpg";
-        NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
-        NSDate *mt = [a fileModificationDate];
-        BOOL fresh = mt && ([mt timeIntervalSinceNow] > -4.0);
-        UIImage *img = fresh ? [UIImage imageWithContentsOfFile:p] : nil;
-        if (img) {
-            [_snapView setImage:img];
-            [_snapView setHidden:NO];
-        } else {
-            [_snapView setHidden:YES];
-        }
-    } @catch (id e) {}
 }
 
 - (void)fetchNowPlaying {
