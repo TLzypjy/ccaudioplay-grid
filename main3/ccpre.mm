@@ -30,7 +30,6 @@ static char _ccp_assoc_key;
 static char _ccp_assoc_font_idx;
 static char _ccp_assoc_info;
 static char _ccp_assoc_built;
-static char _ccp_align_switch;
 
 // ---------------- 容器 (强制布局, 免疫构建时机) ----------------
 @interface CCPContainerView : UIView
@@ -351,7 +350,6 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
 
     // 背景 = 当前选中素材静态首帧
     NSString *sel = [dom objectForKey:TLPXKeyPlayingAsset] ?: @"";
-    BOOL isVideo = NO;
     NSString *path = [self resolveMaterial:sel];
     if (path) {
         UIImage *thumb = CCGLoadMaterialThumb(path);
