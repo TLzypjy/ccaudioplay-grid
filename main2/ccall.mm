@@ -91,8 +91,58 @@ static void CCALLApplyFont(UILabel *lab, NSString *fontKey, id self) {
     } @catch (id e) {}
 }
 
+// ---- 真机信息导出 (供设置页预览对齐): 模块 bounds + 正在播放的歌名/封面/时间 ----
+static NSString *ccp_lastBoundsStr = nil;
+static double ccp_lastNowFetch = 0;
+
+static void CCPExportNowPlaying(void) {
+    @try {
+        void *mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY);
+        if (!mr) return;
+        void (*MRGNI)(dispatch_queue_t, void (^)(CFDictionaryRef)) =
+            (void (*)(dispatch_queue_t, void (^)(CFDictionaryRef)))dlsym(mr, "MRMediaRemoteGetNowPlayingInfo");
+        if (!MRGNI) return;
+        MRGNI(dispatch_get_global_queue(0, 0), ^(CFDictionaryRef info) {
+            @try {
+                NSMutableDictionary *out = [NSMutableDictionary dictionary];
+                UIImage *art = nil;
+                if (info) {
+                    NSDictionary *d = (__bridge NSDictionary *)info;
+                    NSString *t = [d objectForKey:@"kMRMediaRemoteNowPlayingInfoTitle"];
+                    NSString *a = [d objectForKey:@"kMRMediaRemoteNowPlayingInfoArtist"];
+                    double e = [[d objectForKey:@"kMRMediaRemoteNowPlayingInfoElapsedTime"] doubleValue];
+                    double du = [[d objectForKey:@"kMRMediaRemoteNowPlayingInfoDuration"] doubleValue];
+                    NSData *ad = [d objectForKey:@"kMRMediaRemoteNowPlayingInfoArtworkData"];
+                    if ([t length]) out[@"title"] = t;
+                    if ([a length]) out[@"artist"] = a;
+                    out[@"elapsed"] = @(e);
+                    out[@"duration"] = @(du);
+                    if (ad) art = [UIImage imageWithData:ad];
+                }
+                [out writeToFile:@"/var/mobile/Documents/ccnow.plist" atomically:YES];
+                if (art) {
+                    NSData *png = UIImagePNGRepresentation(art);
+                    if (png) [png writeToFile:@"/var/mobile/Documents/ccart.png" atomically:YES];
+                }
+            } @catch (id e) {}
+        });
+    } @catch (id e) {}
+}
+
 static void CCALLApply(id self) {
     @try {
+        // 真机模块 bounds 导出 (设置页预览按真实尺寸对齐); 变化时才写
+        NSString *bs = NSStringFromCGRect(self.bounds);
+        if (![bs isEqualToString:ccp_lastBoundsStr]) {
+            ccp_lastBoundsStr = bs;
+            [bs writeToFile:@"/var/mobile/Documents/ccbounds.txt" atomically:YES];
+            double now = [NSDate date].timeIntervalSince1970;
+            if (now - ccp_lastNowFetch > 5.0) {
+                ccp_lastNowFetch = now;
+                CCPExportNowPlaying();
+            }
+        }
+
         // 3x2 由原实现自己处理
         int type = [[self valueForKey:@"type"] intValue];
         BOOL en = [[self valueForKey:@"IsEnableCustomFrame"] boolValue];
