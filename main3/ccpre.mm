@@ -25,6 +25,7 @@
 #define CCP_DOMAIN @"com.thefool.ccaudioplaypres"
 #define CCP_NOTE_FRAME @"com.thefool.ccaudioplaypres/updateCustomFrameNotificationt"
 #define CCP_NOTE_FONT  @"com.thefool.ccaudioplaypres/updateCustomFontNotificationt"
+#define CCP_NEED_SNAP  @"ccaudioplay.grid/preview-need"
 #define CCP_BG_DIR_PLAY @"/var/mobile/CCAudioPlay-BackGround/PlayingAsset"
 #define CCP_BG_DIR_BACK @"/var/mobile/CCAudioPlay-BackGround/BackAsset"
 #define CCP_MASK_DIR    @"/var/mobile/Library/Application Support/CCAudioPlay/CCAudioPlay-Mask-N95"
@@ -322,11 +323,19 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
         Class qCls = objc_getClass("AVQueuePlayer");
         Class looperCls = objc_getClass("AVPlayerLooper");
         Class layerCls = objc_getClass("AVPlayerLayer");
+        Class sesCls = objc_getClass("AVAudioSession");
         if (!itemCls || !qCls || !looperCls || !layerCls) {
             CCPLog(@"bg", @"AVF classes unavailable");
             return;
         }
         @try {
+            // 关键: 先把音频会话切成 Ambient (与其他混音), 否则激活会话会打断正在放的歌
+            if (sesCls) {
+                id ses = ((id(*)(id, SEL))objc_msgSend)(sesCls, sel_registerName("sharedInstance"));
+                ((BOOL(*)(id, SEL, id, id, id, id))objc_msgSend)(ses,
+                    sel_registerName("setCategory:withOptions:error:"),
+                    @"AVAudioSessionCategoryAmbient", nil, nil);
+            }
             id item = ((id(*)(id, SEL, id))objc_msgSend)(itemCls, sel_registerName("playerItemWithURL:"), url);
             id alloc = ((id(*)(id, SEL))objc_msgSend)(qCls, sel_registerName("alloc"));
             id player = ((id(*)(id, SEL, id))objc_msgSend)(alloc, sel_registerName("initWithItems:"), @[item]);
@@ -468,6 +477,8 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
 @property (nonatomic, retain) NSMutableDictionary *templates;
 @property (nonatomic, retain) NSMutableArray *sliderRows;
 @property (nonatomic, retain) NSTimer *saveTimer;
+@property (nonatomic, retain) NSTimer *snapTimer;
+@property (nonatomic, retain) UIImageView *snapView;
 @property (nonatomic, retain) NSTimer *nowTimer;
 @property (nonatomic, assign) BOOL frameDirty;
 @property (nonatomic, assign) BOOL nowLive;
@@ -530,6 +541,12 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
     [header addSubview:_replica];
     [_replica loadBackgroundMaterial];
 
+    // 真机模块快照 (SpringBoard 侧伴随 tweak 截图, 0.6s 一张): 新鲜时盖在复刻层上
+    _snapView = [[UIImageView alloc] initWithFrame:CGRectMake(16, 36, inner, 190)];
+    [_snapView setContentMode:UIViewContentModeScaleAspectFit];
+    [_snapView setHidden:YES];
+    [header addSubview:_snapView];
+
     UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(16, 232, inner, 18)];
     [st setText:@"预览模块大小"];
     [st setFont:[UIFont systemFontOfSize:12.0]];
@@ -538,7 +555,10 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
 
     _seg = [[UISegmentedControl alloc] initWithItems:@[@"2x2", @"2x3", @"3x2", @"4x2", @"4x3"]];
     [_seg setFrame:CGRectMake(16, 252, inner, 32)];
-    [_seg setSelectedSegmentIndex:2];
+    // 默认显示当前实际使用的模块尺寸 (LayoutType), 而不是固定 3x2
+    NSInteger lt = [[dom objectForKey:@"LayoutType"] integerValue];
+    if (lt < 0 || lt > 4) lt = 2;
+    [_seg setSelectedSegmentIndex:lt];
     [_seg addTarget:self action:@selector(segChanged:) forControlEvents:UIControlEventValueChanged];
     [header addSubview:_seg];
 
@@ -642,6 +662,29 @@ static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVi
     [self refreshReplica];
     [self fetchNowPlaying];
     // 播放进度不刷新 (用户要求): 只在进入页面时取一次播放信息, 不再起定时器
+
+    // 真机快照管道: 0.6s 一轮 —— 发续约通知 + 读取新鲜快照 (mtime < 4s) 显示
+    [self cc_postNote:CCP_NEED_SNAP];
+    _snapTimer = [NSTimer timerWithTimeInterval:0.6 target:self selector:@selector(snapTick)
+                                       userInfo:nil repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:_snapTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)snapTick {
+    @try {
+        [self cc_postNote:CCP_NEED_SNAP];   // 续约快照采集
+        NSString *p = @"/var/mobile/Documents/ccpreview.jpg";
+        NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+        NSDate *mt = [a fileModificationDate];
+        BOOL fresh = mt && ([mt timeIntervalSinceNow] > -4.0);
+        UIImage *img = fresh ? [UIImage imageWithContentsOfFile:p] : nil;
+        if (img) {
+            [_snapView setImage:img];
+            [_snapView setHidden:NO];
+        } else {
+            [_snapView setHidden:YES];
+        }
+    } @catch (id e) {}
 }
 
 - (void)fetchNowPlaying {
