@@ -21,6 +21,12 @@
 static void (*ccal_orig_layoutSubviews)(id, SEL) = NULL;
 static int ccal_install_tries = 0;
 
+// 快照预览: 最近的真实 CCCustomView (SpringBoard 侧) + 采集端前向声明
+@class CCPCapture;
+static __weak UIView *ccp_lastCV = nil;
+static NSTimer *ccp_capTimer = nil;
+static double ccp_expireAt = 0;
+
 // ---------- 调试日志: /var/mobile/Documents/ccall_debug.log ----------
 static void CCALLLog(NSString *line) {
     @try {
@@ -58,15 +64,17 @@ static void CCALLApplyToFrame(UIView *npv, NSString *frameKey, NSString *viewKey
         if (!fv) { CCALLLogOnce([@"nf" stringByAppendingString:frameKey], [NSString stringWithFormat:@"%@: frame ivar nil", frameKey]); return; }
         CGRect fr = [fv CGRectValue];
         if (fr.origin.x == 0 && fr.origin.y == 0 && fr.size.width == 0 && fr.size.height == 0) {
-            CCALLLogOnce([@"z" stringByAppendingString:frameKey], [NSString stringWithFormat:@"%@: zero, skip", frameKey]);
             return;
         }
         UIView *v = [npv valueForKey:viewKey];
         if ([v isKindOfClass:[UIView class]]) {
+            // 关键防卡顿: 只有 frame 真的变化才写入。
+            // 每次布局都 setFrame 会触发下一次布局 -> 无限布局循环把整机拖卡 (v122 教训)。
+            CGRect cur = [v frame];
+            if (CGRectEqualToRect(cur, fr)) return;
             [v setFrame:fr];
             CCALLLogOnce([@"ok" stringByAppendingString:frameKey],
-                [NSString stringWithFormat:@"%@ -> %@ ok fr=%@ old=%@", frameKey, viewKey,
-                 NSStringFromCGRect(fr), NSStringFromCGRect(v.frame)]);
+                [NSString stringWithFormat:@"%@ -> %@ ok fr=%@", frameKey, viewKey, NSStringFromCGRect(fr)]);
         } else {
             CCALLLogOnce([@"miss" stringByAppendingString:frameKey],
                 [NSString stringWithFormat:@"%@: KVC %@ -> %@ (not UIView)", frameKey, viewKey, v]);
@@ -81,7 +89,9 @@ static void CCALLApplyFont(UILabel *lab, NSString *fontKey, id self) {
     @try {
         if (!lab) return;
         double fs = [[self valueForKey:fontKey] doubleValue];
-        if (fs >= 4.0 && fs <= 30.0) [lab setFont:[UIFont systemFontOfSize:fs]];
+        if (fs >= 4.0 && fs <= 30.0) {
+            if (fabs([lab font].pointSize - fs) > 0.01) [lab setFont:[UIFont systemFontOfSize:fs]];
+        }
     } @catch (id e) {}
 }
 
@@ -138,7 +148,9 @@ static void CCALLApply(id self) {
             UIView *pcv = [self valueForKey:@"progressCustomView"];
             if (pf && pcv) {
                 CGRect fr = [pf CGRectValue];
-                if (fr.size.width > 0 && fr.size.height > 0) [pcv setFrame:fr];
+                if (fr.size.width > 0 && fr.size.height > 0 && !CGRectEqualToRect([pcv frame], fr)) {
+                    [pcv setFrame:fr];
+                }
             }
         } @catch (id e) {}
 
@@ -172,6 +184,7 @@ static void CCALLApply(id self) {
 
 static void CCALLLayoutSubviews(id self, SEL _cmd) {
     if (ccal_orig_layoutSubviews) ccal_orig_layoutSubviews(self, _cmd);
+    ccp_lastCV = self;   // 记录最近的真实模块实例 (快照预览用)
     CCALLApply(self);
 }
 
@@ -205,12 +218,80 @@ static void CCALLRetry(void) {
     }
 }
 
+// ---------------- 真机模块快照 (SpringBoard 侧, 供设置页实时预览) ----------------
+// 设置页每 0.6s 发 Darwin 通知 ccaudioplay.grid/preview-need 续约;
+// 本侧 0.7s 一次把最近的真实 CCCustomView 截图写到 /var/mobile/Documents/ccpreview.jpg;
+// 5s 内没有续约就自动停。设置页只显示新鲜快照 (mtime < 4s), 否则回退自绘复刻。
+static void CCPWriteSnapshot(void) {
+    @try {
+        UIView *v = ccp_lastCV;
+        if (!v || v.bounds.size.width < 10) return;
+        UIGraphicsBeginImageContextWithOptions(v.bounds.size, NO, [UIScreen mainScreen].scale);
+        BOOL ok = NO;
+        @try {
+            ok = [(id)v drawViewHierarchyInRect:v.bounds afterScreenUpdates:NO];
+        } @catch (id e) {
+            ok = NO;
+        }
+        UIImage *img = ok ? UIGraphicsGetImageFromCurrentImageContext() : nil;
+        UIGraphicsEndImageContext();
+        if (!img) return;
+        NSData *jpg = UIImageJPEGRepresentation(img, 0.85);
+        if (jpg) [jpg writeToFile:@"/var/mobile/Documents/ccpreview.jpg" atomically:YES];
+    } @catch (id e) {}
+}
+
+static void CCPReqCB(CFNotificationCenterRef c, void *obs, CFStringRef n, const void *o, CFDictionaryRef ui) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ccp_expireAt = [NSDate date].timeIntervalSince1970 + 5.0;
+        if (!ccp_capTimer) {
+            ccp_capTimer = [NSTimer timerWithTimeInterval:0.7 target:[CCPCapture shared]
+                                                 selector:@selector(tick) userInfo:nil repeats:YES];
+            [[NSRunLoop mainRunLoop] addTimer:ccp_capTimer forMode:NSRunLoopCommonModes];
+            CCPLog(@"snap", @"capture started");
+        }
+    });
+}
+
+@interface CCPCapture : NSObject
++ (instancetype)shared;
+- (void)tick;
+@end
+
+@implementation CCPCapture
++ (instancetype)shared {
+    static id s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [[self alloc] init]; });
+    return s;
+}
+- (id)init {
+    if ((self = [super init])) {
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+                                        CCPReqCB, CFSTR("ccaudioplay.grid/preview-need"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CCPLog(@"snap", @"capture listener ready");
+    }
+    return self;
+}
+- (void)tick {
+    if ([NSDate date].timeIntervalSince1970 > ccp_expireAt) {
+        [ccp_capTimer invalidate];
+        ccp_capTimer = nil;
+        CCPLog(@"snap", @"capture stopped (no renewal)");
+        return;
+    }
+    CCPWriteSnapshot();
+}
+@end
+
 @interface CCALLBootstrap : NSObject
 @end
 @implementation CCALLBootstrap
 + (void)load {
     dispatch_async(dispatch_get_main_queue(), ^{
         CCALLRetry();
+        [CCPCapture shared];   // 装快照请求监听
     });
 }
 @end
