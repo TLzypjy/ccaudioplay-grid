@@ -21,6 +21,7 @@
 
 static void (*ccal_orig_layoutSubviews)(id, SEL) = NULL;
 static int ccal_install_tries = 0;
+static char _ccp_sig_key = 0;   // 防拉锯: 每实例记录上次应用的存储值签名
 
 // 快照预览: 最近的真实 CCCustomView (SpringBoard 侧) + 采集端前向声明
 
@@ -55,8 +56,7 @@ static void CCALLLogOnce(NSString *key, NSString *line) {
     } @catch (id e) {}
 }
 
-static void CCALLApplyToFrame(UIView *npv, NSString *frameKey, NSString *viewKey, id self) {
-    @try {
+static void CCALLApplyToFrame(UIView *npv, NSString *frameKey, NSString *viewKey, id self) {    @try {
         NSValue *fv = [self valueForKey:frameKey];
         if (!fv) { CCALLLogOnce([@"nf" stringByAppendingString:frameKey], [NSString stringWithFormat:@"%@: frame ivar nil", frameKey]); return; }
         CGRect fr = [fv CGRectValue];
@@ -214,6 +214,18 @@ static void CCALLApply(id self) {
         }
         if (type == 2) return;   // 3x2 由原实现自己处理
         if (!en) return;
+
+        // 防拉锯 (v122 卡顿根因): 原版布局每轮写它的缩放值, 我们再覆盖成存储值点数,
+        // 互相触发布局 -> 无限拉锯。存储值没变化就不再写, 拉锯自然停止。
+        NSString *sig = [NSString stringWithFormat:@"%@|%@|%@|%@|%@|%@|%@|%@|%@|t%d",
+            [self valueForKey:@"iconFrame"], [self valueForKey:@"titleFrame"],
+            [self valueForKey:@"subTitleFrame"], [self valueForKey:@"elapsedTitleFrame"],
+            [self valueForKey:@"durationTitleFrame"], [self valueForKey:@"progressFrame"],
+            [self valueForKey:@"leftButtonFrame"], [self valueForKey:@"centerButtonFrame"],
+            [self valueForKey:@"rightButtonFrame"], (int)type];
+        NSString *lastSig = objc_getAssociatedObject(self, &_ccp_sig_key);
+        if ([sig isEqualToString:lastSig]) return;
+        objc_setAssociatedObject(self, &_ccp_sig_key, sig, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
         // ---- 直属元素 (CCCustomView 自己的属性) ----
         NSDictionary *direct = @{
