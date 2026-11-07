@@ -439,19 +439,19 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     if (df >= 4) [_durationLabel setFont:[UIFont systemFontOfSize:df]];
 }
 
-// 未设置 frame 时的默认排布 (按模块尺寸比例), 让所有元素都可见可调
+// 未设置 frame 时的默认排布 (与组的默认框分解一致), 让所有元素都可见可调
 - (CGRect)defaultFrame:(int)i size:(CGSize)ms {
     CGFloat W = ms.width, H = ms.height;
     switch (i) {
-        case 0: return CGRectMake(0.04 * W, 0.26 * H, 0.26 * W, 0.42 * H);   // 专辑
-        case 1: return CGRectMake(0.34 * W, 0.10 * H, 0.60 * W, 0.22 * H);   // 歌词
-        case 2: return CGRectMake(0.34 * W, 0.36 * H, 0.58 * W, 0.16 * H);   // 歌曲
-        case 3: return CGRectMake(0.34 * W, 0.76 * H, 0.15 * W, 0.12 * H);   // 当前时间
-        case 4: return CGRectMake(0.81 * W, 0.76 * H, 0.15 * W, 0.12 * H);   // 总时间
-        case 5: return CGRectMake(0.34 * W, 0.64 * H, 0.60 * W, 3.0);        // 进度条
-        case 6: return CGRectMake(0.34 * W, 0.86 * H, 0.10 * W, 0.12 * H);   // 左按钮
-        case 7: return CGRectMake(0.45 * W, 0.86 * H, 0.10 * W, 0.12 * H);   // 中按钮
-        case 8: return CGRectMake(0.56 * W, 0.86 * H, 0.10 * W, 0.12 * H);   // 右按钮
+        case 0: return CGRectMake(0.04 * W, 0.26 * H, 0.26 * W, 0.42 * H);        // 专辑
+        case 1: return CGRectMake(0.34 * W, 0.10 * H, 0.60 * W, 0.22 * H);        // 歌词
+        case 2: return CGRectMake(0.34 * W, 0.36 * H, 0.58 * W, 0.16 * H);        // 歌曲
+        case 3: return CGRectMake(0.24 * W, 0.62 * H, 0.1144 * W, 0.10 * H);      // 当前时间 (进度条组左)
+        case 4: return CGRectMake(0.6456 * W, 0.62 * H, 0.1144 * W, 0.10 * H);    // 总时间 (进度条组右)
+        case 5: return CGRectMake(0.37 * W, 0.62 * H, 0.26 * W, 0.10 * H);        // 进度条
+        case 6: return CGRectMake(0.28 * W, 0.80 * H, 0.1232 * W, 0.14 * H);      // 左按钮
+        case 7: return CGRectMake(0.4296 * W, 0.80 * H, 0.132 * W, 0.14 * H);     // 中按钮
+        case 8: return CGRectMake(0.588 * W, 0.80 * H, 0.1232 * W, 0.14 * H);     // 右按钮
     }
     return CGRectZero;
 }
@@ -464,6 +464,7 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
 @property (nonatomic, retain) UISegmentedControl *seg;
 @property (nonatomic, retain) NSMutableDictionary *frames;
 @property (nonatomic, retain) NSMutableDictionary *templates;
+@property (nonatomic, retain) NSMutableArray *groupRects;
 @property (nonatomic, retain) NSMutableArray *sliderRows;
 @property (nonatomic, retain) NSTimer *saveTimer;
 @property (nonatomic, retain) NSTimer *nowTimer;
@@ -496,6 +497,8 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     _frames = [NSMutableDictionary dictionary];
     _templates = [NSMutableDictionary dictionary];
     _sliderRows = [NSMutableArray array];
+    _groupRects = [NSMutableArray array];
+    for (int i = 0; i < 5; i++) [_groupRects addObject:[NSValue valueWithCGRect:CGRectZero]];
     for (NSString *k in keys) {
         id v = [dom objectForKey:k];
         double a[4] = {0, 0, 0, 0};
@@ -555,21 +558,44 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     y = [self addSwitchRowIn:scroll y:y label:@"启用自定义" key:@"isEnableCustomFrame" def:NO width:W];
     y = [self addSwitchRowIn:scroll y:y label:@"启用颜色调试" key:@"isEnableColor" def:NO width:W];
 
-    NSArray *names = @[@"专辑", @"歌词", @"歌曲", @"当前时间", @"总时间",
-                       @"进度条", @"左边按钮", @"中间按钮", @"右边按钮"];
+    // ---- 位置滑条: 5 组 (按钮三键一体 / 进度条含两边时间) ----
+    NSArray *groupNames = @[@"专辑", @"歌词", @"歌曲", @"播放按钮 (三键一体)", @"进度条 (含两边时间)"];
+    NSArray *groupKind = @[@"single", @"single", @"single", @"buttons", @"progress"];
+    NSArray *groupKeys = @[
+        @[@"iconFrame"],
+        @[@"titleFrame"],
+        @[@"subTitleFrame"],
+        @[@"leftButtonFrame", @"centerButtonFrame", @"rightButtonFrame"],
+        @[@"progressFrame", @"elapsedTitleFrame", @"durationTitleFrame"],
+    ];
     NSArray *dims = @[@"X", @"Y", @"高", @"宽"];
-    for (int e = 0; e < 9; e++) {
-        NSString *k = keys[e];
+    for (int g = 0; g < 5; g++) {
+        NSString *kind = groupKind[g];
+        NSArray *ks = groupKeys[g];
         UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(16, y, inner, 20)];
-        [h setText:[NSString stringWithFormat:@"%@  (%@)", names[e], k]];
+        [h setText:[NSString stringWithFormat:@"%@  (%@)", groupNames[g], [ks componentsJoinedByString:@", "]]];
         [h setFont:[UIFont boldSystemFontOfSize:13.0]];
         [scroll addSubview:h];
         y += 24;
-        CGRect cur;
-        [[_frames objectForKey:k] getValue:&cur];
+
+        // 组框 = 组内非零 frame 的包围盒; 全零用默认排布
+        CGRect gr = CGRectNull;
+        for (NSString *k in ks) {
+            CGRect cur;
+            [[_frames objectForKey:k] getValue:&cur];
+            if (cur.size.width <= 0.5 && cur.size.height <= 0.5 &&
+                cur.origin.x <= 0.5 && cur.origin.y <= 0.5) continue;
+            gr = CGRectIsNull(gr) ? cur : CGRectUnion(gr, cur);
+        }
+        if (CGRectIsNull(gr)) {
+            CGSize ms = [self moduleSizeForGroup];
+            gr = [self defaultGroupFrame:g size:ms];
+        }
+        [_groupRects setObject:[NSValue valueWithBytes:&gr objCType:@encode(CGRect)] atIndex:g];
+
         for (int d = 0; d < 4; d++) {
-            double val = (d == 0) ? cur.origin.x : (d == 1) ? cur.origin.y
-                       : (d == 2) ? cur.size.height : cur.size.width;
+            double val = (d == 0) ? gr.origin.x : (d == 1) ? gr.origin.y
+                       : (d == 2) ? gr.size.height : gr.size.width;
             UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(16, y, inner - 78, 30)];
             [sl setMinimumValue:0.0];
             [sl setMaximumValue:(d <= 1) ? 340.0 : 260.0];
@@ -580,7 +606,7 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
             [vl setTextAlignment:NSTextAlignmentRight];
             [vl setTextColor:[UIColor darkGrayColor]];
             objc_setAssociatedObject(sl, &_ccp_assoc_info,
-                                     @{@"key": k, @"idx": @(d), @"dim": dims[d], @"vlabel": vl},
+                                     @{@"gi": @(g), @"idx": @(d), @"dim": dims[d], @"vlabel": vl},
                                      OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [sl addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
             [scroll addSubview:sl];
@@ -724,23 +750,86 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     [self refreshReplica];
 }
 
+- (CGSize)moduleSizeForGroup {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSDictionary *dom = [ud persistentDomainForName:CCP_DOMAIN] ?: @{};
+    NSInteger lt = [[dom objectForKey:@"LayoutType"] integerValue];
+    if (lt < 0 || lt > 4) lt = 2;
+    switch (lt) {
+        case 0: return CGSizeMake(164.0, 159.0);
+        case 1: return CGSizeMake(164.0, 238.5);
+        case 2: return CGSizeMake(246.0, 159.0);
+        case 3: return CGSizeMake(328.0, 159.0);
+        default:return CGSizeMake(328.0, 238.5);
+    }
+}
+
+// 未设置时的默认组框 (按模块尺寸比例)
+- (CGRect)defaultGroupFrame:(int)g size:(CGSize)ms {
+    CGFloat W = ms.width, H = ms.height;
+    switch (g) {
+        case 0: return CGRectMake(0.04 * W, 0.26 * H, 0.26 * W, 0.42 * H);   // 专辑
+        case 1: return CGRectMake(0.34 * W, 0.10 * H, 0.60 * W, 0.22 * H);   // 歌词
+        case 2: return CGRectMake(0.34 * W, 0.36 * H, 0.58 * W, 0.16 * H);   // 歌曲
+        case 3: return CGRectMake(0.28 * W, 0.80 * H, 0.44 * W, 0.14 * H);   // 播放按钮组
+        default:return CGRectMake(0.24 * W, 0.62 * H, 0.52 * W, 0.10 * H);   // 进度条组
+    }
+}
+
+// 组框 -> 组内各键的实际 frame
+- (void)applyGroupRect:(int)g {
+    NSArray *groupKeys = @[
+        @[@"iconFrame"],
+        @[@"titleFrame"],
+        @[@"subTitleFrame"],
+        @[@"leftButtonFrame", @"centerButtonFrame", @"rightButtonFrame"],
+        @[@"progressFrame", @"elapsedTitleFrame", @"durationTitleFrame"],
+    ];
+    CGRect gr;
+    [[_groupRects objectAtIndex:g] getValue:&gr];
+    CGFloat gx = gr.origin.x, gy = gr.origin.y, gw = gr.size.width, gh = gr.size.height;
+    if (g == 3) {
+        // 三键一体: 左(28%) 播放(30%) 右(28%), 间隙 6%
+        CGRect l = CGRectMake(gx,             gy, gw * 0.28, gh);
+        CGRect c = CGRectMake(gx + gw * 0.34, gy, gw * 0.30, gh);
+        CGRect r = CGRectMake(gx + gw * 0.70, gy, gw * 0.28, gh);
+        [_frames setObject:[NSValue valueWithBytes:&l objCType:@encode(CGRect)] forKey:groupKeys[3][0]];
+        [_frames setObject:[NSValue valueWithBytes:&c objCType:@encode(CGRect)] forKey:groupKeys[3][1]];
+        [_frames setObject:[NSValue valueWithBytes:&r objCType:@encode(CGRect)] forKey:groupKeys[3][2]];
+        return;
+    }
+    if (g == 4) {
+        // 进度条组: 时间(22%) 条(50%) 时间(22%), 间隙 3%
+        CGFloat tw = gw * 0.22;
+        CGRect b = CGRectMake(gx + gw * 0.25, gy, gw * 0.50, gh);
+        CGRect e = CGRectMake(gx,             gy, tw,      gh);
+        CGRect d = CGRectMake(gx + gw * 0.78, gy, tw,      gh);
+        [_frames setObject:[NSValue valueWithBytes:&b objCType:@encode(CGRect)] forKey:groupKeys[4][0]];
+        [_frames setObject:[NSValue valueWithBytes:&e objCType:@encode(CGRect)] forKey:groupKeys[4][1]];
+        [_frames setObject:[NSValue valueWithBytes:&d objCType:@encode(CGRect)] forKey:groupKeys[4][2]];
+        return;
+    }
+    [_frames setObject:[NSValue valueWithBytes:&gr objCType:@encode(CGRect)] forKey:groupKeys[g][0]];
+}
+
 - (void)sliderChanged:(UISlider *)sl {
     NSDictionary *info = objc_getAssociatedObject(sl, &_ccp_assoc_info);
     if (!info) return;
-    NSString *key = info[@"key"];
-    int idx = [info[@"idx"] intValue];
+    int gi = [info[@"gi"] intValue];
+    int d = [info[@"idx"] intValue];
     double val = [sl value];
     UILabel *vl = info[@"vlabel"];
     if ([vl isKindOfClass:[UILabel class]]) {
         [vl setText:[NSString stringWithFormat:@"%@ %.1f", info[@"dim"], val]];
     }
-    CGRect cur;
-    [[_frames objectForKey:key] getValue:&cur];
-    if (idx == 0) cur.origin.x = val;
-    else if (idx == 1) cur.origin.y = val;
-    else if (idx == 2) cur.size.height = val;
-    else cur.size.width = val;
-    [_frames setObject:[NSValue valueWithBytes:&cur objCType:@encode(CGRect)] forKey:key];
+    CGRect gr;
+    [[_groupRects objectAtIndex:gi] getValue:&gr];
+    if (d == 0) gr.origin.x = val;
+    else if (d == 1) gr.origin.y = val;
+    else if (d == 2) gr.size.height = val;
+    else gr.size.width = val;
+    [_groupRects replaceObjectAtIndex:gi withObject:[NSValue valueWithBytes:&gr objCType:@encode(CGRect)]];
+    [self applyGroupRect:gi];
     [self refreshReplica];
     _frameDirty = YES;
     [_saveTimer invalidate];
@@ -758,6 +847,9 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     for (NSString *k in keys) {
         CGRect cur;
         [[_frames objectForKey:k] getValue:&cur];
+        // 全零 = 未设置: 不写, 保持运行时自己的默认排布
+        if (cur.size.width <= 0.5 && cur.size.height <= 0.5 &&
+            cur.origin.x <= 0.5 && cur.origin.y <= 0.5) continue;
         NSString *tpl = [_templates objectForKey:k];
         if (![tpl length]) {
             for (NSString *other in keys) {
