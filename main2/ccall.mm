@@ -92,9 +92,10 @@ static void CCALLApplyFont(UILabel *lab, NSString *fontKey, id self) {
     } @catch (id e) {}
 }
 
-// ---- 真机信息导出 (供设置页预览对齐): 模块 bounds + 各元素实际 frame + 正在播放信息 ----
+// ---- 真机信息导出 (供设置页预览对齐): 模块 bounds + 各元素实际 frame + 视图树 + 正在播放信息 ----
 static NSString *ccp_lastBoundsStr = nil;
 static NSString *ccp_lastFramesStr = nil;
+static NSString *ccp_lastTreeStr = nil;
 static double ccp_lastNowFetch = 0;
 
 static void CCPExportNowPlaying(void) {
@@ -129,6 +130,19 @@ static void CCPExportNowPlaying(void) {
             } @catch (id e) {}
         });
     } @catch (id e) {}
+}
+
+// 视图树递归导出 (类名 + 模块坐标系 frame), 供精确对齐预览
+static void CCPDumpNode(UIView *v, int depth, CGPoint off, NSMutableArray *out) {
+    if (depth > 8 || [out count] > 300) return;
+    CGRect f = [v frame];
+    CGRect abs = CGRectMake(off.x + f.origin.x, off.y + f.origin.y, f.size.width, f.size.height);
+    [out addObject:@{@"c": NSStringFromClass([v class]),
+                     @"f": NSStringFromCGRect(abs),
+                     @"d": @(depth)}];
+    for (UIView *s in [v subviews]) {
+        CCPDumpNode(s, depth + 1, CGPointMake(abs.origin.x, abs.origin.y), out);
+    }
 }
 
 static void CCALLApply(id self) {
@@ -177,6 +191,17 @@ static void CCALLApply(id self) {
             if (![ser isEqualToString:ccp_lastFramesStr]) {
                 ccp_lastFramesStr = ser;
                 [rf writeToFile:@"/var/mobile/Documents/ccreal_frames.plist" atomically:YES];
+            }
+        } @catch (id e) {}
+
+        // 视图树导出 (变化才写): 预览精确对齐用
+        @try {
+            NSMutableArray *tree = [NSMutableArray array];
+            CCPDumpNode((UIView *)self, 0, CGPointZero, tree);
+            NSString *tser = [NSString stringWithFormat:@"%@", tree];
+            if (![tser isEqualToString:ccp_lastTreeStr]) {
+                ccp_lastTreeStr = tser;
+                [tree writeToFile:@"/var/mobile/Documents/ccviewtree.plist" atomically:YES];
             }
         } @catch (id e) {}
 
