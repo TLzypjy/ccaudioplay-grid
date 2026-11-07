@@ -204,6 +204,7 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
         [_themeImg setContentMode:UIViewContentModeScaleAspectFit];
         [_iconView addSubview:_themeImg];
 
+        // 黑胶盘 (在卡片后面, 右侧露出)
         _discView = [[UIView alloc] initWithFrame:CGRectZero];
         [_discView setBackgroundColor:[UIColor colorWithWhite:0.10 alpha:1.0]];
         [_discView.layer setCornerRadius:1000.0];
@@ -211,11 +212,12 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
         [_discView.layer setBorderColor:[UIColor colorWithWhite:1.0 alpha:0.25].CGColor];
         [_iconView addSubview:_discView];
 
+        // 封面卡片 (圆角矩形, 前层) —— 与真机"专辑卡片+黑胶"复合作画一致
         _artView = [[UIImageView alloc] initWithFrame:CGRectZero];
         [_artView setContentMode:UIViewContentModeScaleAspectFill];
         [_artView setClipsToBounds:YES];
-        [_artView.layer setCornerRadius:1000.0];
-        [_artView setBackgroundColor:[UIColor colorWithRed:0.15 green:0.45 blue:0.95 alpha:1.0]];
+        [_artView.layer setCornerRadius:6.0];
+        [_artView setBackgroundColor:[UIColor colorWithWhite:0.15 alpha:1.0]];
         [_iconView addSubview:_artView];
 
         _ringTrack = [CAShapeLayer layer];
@@ -399,21 +401,19 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
         [v setFrame:scaled];
 
         if (i == 0) {
-            // 黑胶布局: 盘 + 封面 + 环 (取短边画圆)
-            double side = MIN(scaled.size.width, scaled.size.height);
-            double cx = scaled.origin.x + scaled.size.width / 2.0;
-            double cy = scaled.origin.y + scaled.size.height / 2.0;
-            double discSide = side * 0.72;
-            [_discView setFrame:CGRectMake(cx - discSide / 2, cy - discSide / 2, discSide, discSide)];
-            [_themeImg setFrame:CGRectMake(0, 0, scaled.size.width, scaled.size.height)];
-            double artSide = discSide * 0.42;
-            [_artView setFrame:CGRectMake(cx - artSide / 2, cy - artSide / 2, artSide, artSide)];
-            // 环: path 用 _mod 坐标系, layer frame 对齐 _mod
-            // 注意: 不要 release layer.path 的旧值 (getter 返回非持有引用),
-            // v118 每秒刷新时对它 CGPathRelease 造成过度释放 -> setPath CFEqual 野指针崩溃
+            // 专辑复合作画: 封面卡片(左, 62%宽) + 黑胶盘(右后半) + 进度环绕盘
+            double w = scaled.size.width, h = scaled.size.height;
+            double discSide = h * 0.92;
+            [_discView setFrame:CGRectMake(w - discSide * 0.72, (h - discSide) / 2.0, discSide, discSide)];
+            [_themeImg setFrame:CGRectMake(0, 0, w, h)];
+            double cardW = w * 0.62;
+            [_artView setFrame:CGRectMake(0, 0, cardW, h)];
+            // 环绕黑胶盘中心
+            double dcx = w - discSide * 0.72 + discSide / 2.0;
+            double dcy = h / 2.0;
             CGMutablePathRef path = CGPathCreateMutable();
-            double r = side / 2.0 - 1.5;
-            CGPathAddEllipseInRect(path, NULL, CGRectMake(cx - r, cy - r, r * 2, r * 2));
+            double r = discSide / 2.0 - 1.5;
+            CGPathAddEllipseInRect(path, NULL, CGRectMake(dcx - r, dcy - r, r * 2, r * 2));
             [_ringTrack setPath:path];
             [_ringProg setPath:path];
             CGPathRelease(path);
