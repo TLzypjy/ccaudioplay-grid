@@ -468,6 +468,9 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
 @property (nonatomic, retain) CCPReplicaView *replica;
 @property (nonatomic, retain) UISegmentedControl *seg;
 @property (nonatomic, retain) NSMutableDictionary *frames;
+@property (nonatomic, retain) NSMutableDictionary *realFrames;   // 真机坐标系 frame (显示用)
+@property (nonatomic, assign) double sx;
+@property (nonatomic, assign) double sy;
 @property (nonatomic, retain) NSMutableDictionary *templates;
 @property (nonatomic, retain) NSMutableArray *groupRects;
 @property (nonatomic, retain) NSMutableArray *sliderRows;
@@ -542,6 +545,49 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
         [_frames setObject:[NSValue valueWithBytes:&a objCType:@encode(CGRect)] forKey:k];
     }
 
+    // ---- 真机实际 frame (伴随 tweak 导出) + 缩放系数换算 ----
+    NSDictionary *rf = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Documents/ccreal_frames.plist"] ?: @{};
+    CGRect realBounds = CGRectFromString([rf objectForKey:@"bounds"] ?: @"");
+    NSArray *pKeys = @[@"iconFrame", @"titleFrame", @"subTitleFrame", @"elapsedTitleFrame",
+                       @"durationTitleFrame", @"progressFrame", @"leftButtonFrame",
+                       @"centerButtonFrame", @"rightButtonFrame"];
+    NSArray *rKeys = @[@"icon", @"title", @"subtitle", @"elapsed", @"duration",
+                       @"progress", @"left", @"center", @"right"];
+    _realFrames = [NSMutableDictionary dictionary];
+    double sx = 0, sy = 0;
+    for (int i = 0; i < 9; i++) {
+        NSString *rs = [rf objectForKey:rKeys[i]];
+        CGRect rr = CGRectFromString(rs ?: @"");
+        CGRect st;
+        [[_frames objectForKey:pKeys[i]] getValue:&st];
+        [_realFrames setObject:[NSValue valueWithCGRect:rr] forKey:pKeys[i]];
+        if (sx <= 0 && rr.size.width > 1 && st.size.width > 1) {
+            sx = rr.size.width / st.size.width;
+            sy = (rr.size.height > 1 && st.size.height > 1 && st.size.height / rr.size.height > 0.01)
+                 ? rr.size.height / st.size.height : sx;
+            if (sy <= 0) sy = sx;
+        }
+    }
+    if (sx <= 0 || sy <= 0) {
+        if (realBounds.size.width > 60) { sx = realBounds.size.width / 246.0; sy = realBounds.size.height / 159.0; }
+        else { sx = sy = 1.0; }
+    }
+    if (sx <= 0) sx = 1.0;
+    if (sy <= 0) sy = 1.0;
+    _sx = sx; _sy = sy;
+    CCPLog(@"scale", [NSString stringWithFormat:@"sx=%.3f sy=%.3f realBounds=%@", sx, sy, NSStringFromCGRect(realBounds)]);
+    // 真机没导出的元素: stored × S 兜底
+    for (int i = 0; i < 9; i++) {
+        CGRect rr = [[_realFrames objectForKey:pKeys[i]] CGRectValue];
+        if (rr.size.width <= 0.5 && rr.size.height <= 0.5 && rr.origin.x <= 0.5 && rr.origin.y <= 0.5) {
+            CGRect st;
+            [[_frames objectForKey:pKeys[i]] getValue:&st];
+            [_realFrames setObject:[NSValue valueWithCGRect:
+                CGRectMake(st.origin.x * _sx, st.origin.y * _sy, st.size.width * _sx, st.size.height * _sy)]
+                forKey:pKeys[i]];
+        }
+    }
+
     CGFloat W = [UIScreen mainScreen].bounds.size.width;
     CGFloat inner = W - 32.0;
 
@@ -609,11 +655,11 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
         [scroll addSubview:h];
         y += 24;
 
-        // 组框 = 组内非零 frame 的包围盒; 全零用默认排布
+        // 组框 = 组内真机 frame 的包围盒 (WYSIWYG); 没有真机数据用默认排布
         CGRect gr = CGRectNull;
         for (NSString *k in ks) {
             CGRect cur;
-            [[_frames objectForKey:k] getValue:&cur];
+            [[_realFrames objectForKey:k] getValue:&cur];
             if (cur.size.width <= 0.5 && cur.size.height <= 0.5 &&
                 cur.origin.x <= 0.5 && cur.origin.y <= 0.5) continue;
             gr = CGRectIsNull(gr) ? cur : CGRectUnion(gr, cur);
@@ -732,7 +778,7 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     [_replica setNowTitle:_nowTitle artist:_nowArtist
                   elapsed:_nowElapsed duration:_nowDuration
                   artwork:_nowArt live:live];
-    [_replica updateWithModule:(int)[_seg selectedSegmentIndex] frames:_frames fonts:[self currentFonts]];
+    [_replica updateWithModule:(int)[_seg selectedSegmentIndex] frames:_realFrames fonts:[self currentFonts]];
 }
 
 - (CGFloat)addSwitchRowIn:(UIScrollView *)scroll y:(CGFloat)y label:(NSString *)label
@@ -792,6 +838,14 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     }
 }
 
+// 组框(真机坐标) -> 组内各键: 写 realFrames (显示) + frames (存储 = 真机/缩放)
+- (void)ccpSetKey:(NSString *)k real:(CGRect)rr {
+    [_realFrames setObject:[NSValue valueWithCGRect:rr] forKey:k];
+    CGRect st = CGRectMake(rr.origin.x / _sx, rr.origin.y / _sy,
+                           rr.size.width / _sx, rr.size.height / _sy);
+    [_frames setObject:[NSValue valueWithBytes:&st objCType:@encode(CGRect)] forKey:k];
+}
+
 // 组框 -> 组内各键的实际 frame
 - (void)applyGroupRect:(int)g {
     NSArray *groupKeys = @[
@@ -806,27 +860,21 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     CGFloat gx = gr.origin.x, gy = gr.origin.y, gw = gr.size.width, gh = gr.size.height;
     if (g == 3) {
         // 三键一体: 左(28%) 播放(30%) 右(28%), 间隙 6%
-        CGRect l = CGRectMake(gx,             gy, gw * 0.28, gh);
-        CGRect c = CGRectMake(gx + gw * 0.34, gy, gw * 0.30, gh);
-        CGRect r = CGRectMake(gx + gw * 0.70, gy, gw * 0.28, gh);
-        [_frames setObject:[NSValue valueWithBytes:&l objCType:@encode(CGRect)] forKey:groupKeys[3][0]];
-        [_frames setObject:[NSValue valueWithBytes:&c objCType:@encode(CGRect)] forKey:groupKeys[3][1]];
-        [_frames setObject:[NSValue valueWithBytes:&r objCType:@encode(CGRect)] forKey:groupKeys[3][2]];
+        [self ccpSetKey:groupKeys[3][0] real:CGRectMake(gx,             gy, gw * 0.28, gh)];
+        [self ccpSetKey:groupKeys[3][1] real:CGRectMake(gx + gw * 0.34, gy, gw * 0.30, gh)];
+        [self ccpSetKey:groupKeys[3][2] real:CGRectMake(gx + gw * 0.70, gy, gw * 0.28, gh)];
         return;
     }
     if (g == 4) {
         // 进度条组: 时间固定 34pt 宽 (不随组宽压扁), 拉伸只作用于进度条
         CGFloat tw = (gw >= 120.0) ? 34.0 : (gw * 0.22);
         CGFloat gap = 4.0;
-        CGRect b = CGRectMake(gx + tw + gap, gy, MAX(gw - 2 * (tw + gap), 10.0), gh);
-        CGRect e = CGRectMake(gx,             gy, tw, gh);
-        CGRect d = CGRectMake(gx + gw - tw,   gy, tw, gh);
-        [_frames setObject:[NSValue valueWithBytes:&b objCType:@encode(CGRect)] forKey:groupKeys[4][0]];
-        [_frames setObject:[NSValue valueWithBytes:&e objCType:@encode(CGRect)] forKey:groupKeys[4][1]];
-        [_frames setObject:[NSValue valueWithBytes:&d objCType:@encode(CGRect)] forKey:groupKeys[4][2]];
+        [self ccpSetKey:groupKeys[4][0] real:CGRectMake(gx + tw + gap, gy, MAX(gw - 2 * (tw + gap), 10.0), gh)];
+        [self ccpSetKey:groupKeys[4][1] real:CGRectMake(gx,             gy, tw, gh)];
+        [self ccpSetKey:groupKeys[4][2] real:CGRectMake(gx + gw - tw,   gy, tw, gh)];
         return;
     }
-    [_frames setObject:[NSValue valueWithBytes:&gr objCType:@encode(CGRect)] forKey:groupKeys[g][0]];
+    [self ccpSetKey:groupKeys[g][0] real:gr];
 }
 
 - (void)sliderChanged:(UISlider *)sl {
