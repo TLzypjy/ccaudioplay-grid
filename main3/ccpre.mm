@@ -568,14 +568,13 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
             if (sy <= 0) sy = sx;
         }
     }
-    if (sx <= 0 || sy <= 0) {
-        if (realBounds.size.width > 60) { sx = realBounds.size.width / 246.0; sy = realBounds.size.height / 159.0; }
-        else { sx = sy = 1.0; }
-    }
-    if (sx <= 0) sx = 1.0;
-    if (sy <= 0) sy = 1.0;
-    _sx = sx; _sy = sy;
-    CCPLog(@"scale", [NSString stringWithFormat:@"sx=%.3f sy=%.3f realBounds=%@", sx, sy, NSStringFromCGRect(realBounds)]);
+    // 缩放系数: 伴随 tweak 会把存储值按原始点数写回真模块 (非 3x2 模块),
+    // 所以真机显示 = 存储值直接当点数, 预览也必须用 1:1 (v127 推导出的 1.834/2.024 是
+    // 原版布局在伴随覆盖前的瞬时值, 不能作为预览缩放)。
+    _sx = 1.0;
+    _sy = 1.0;
+    CCPLog(@"scale", [NSString stringWithFormat:@"forced 1:1 (companion normalizes real widget to stored points); realBounds=%@",
+           NSStringFromCGRect(realBounds)]);
     // 真机没导出的元素: stored × S 兜底
     for (int i = 0; i < 9; i++) {
         CGRect rr = [[_realFrames objectForKey:pKeys[i]] CGRectValue];
