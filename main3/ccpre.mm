@@ -560,7 +560,6 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
 
     // ---- 位置滑条: 5 组 (按钮三键一体 / 进度条含两边时间) ----
     NSArray *groupNames = @[@"专辑", @"歌词", @"歌曲", @"播放按钮 (三键一体)", @"进度条 (含两边时间)"];
-    NSArray *groupKind = @[@"single", @"single", @"single", @"buttons", @"progress"];
     NSArray *groupKeys = @[
         @[@"iconFrame"],
         @[@"titleFrame"],
@@ -570,7 +569,6 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     ];
     NSArray *dims = @[@"X", @"Y", @"高", @"宽"];
     for (int g = 0; g < 5; g++) {
-        NSString *kind = groupKind[g];
         NSArray *ks = groupKeys[g];
         UILabel *h = [[UILabel alloc] initWithFrame:CGRectMake(16, y, inner, 20)];
         [h setText:[NSString stringWithFormat:@"%@  (%@)", groupNames[g], [ks componentsJoinedByString:@", "]]];
@@ -591,7 +589,7 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
             CGSize ms = [self moduleSizeForGroup];
             gr = [self defaultGroupFrame:g size:ms];
         }
-        [_groupRects setObject:[NSValue valueWithBytes:&gr objCType:@encode(CGRect)] atIndex:g];
+        [_groupRects replaceObjectAtIndex:g withObject:[NSValue valueWithBytes:&gr objCType:@encode(CGRect)]];
 
         for (int d = 0; d < 4; d++) {
             double val = (d == 0) ? gr.origin.x : (d == 1) ? gr.origin.y
