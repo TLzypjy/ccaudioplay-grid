@@ -171,13 +171,10 @@ static char cce_helper_key = 0;
 static void CCEInstallEditMode(UIView *widget) {
     @try {
         if (![widget isKindOfClass:[UIView class]]) return;
-        // 检查是否已装
+        // 检查是否已装 (已有 UITapGestureRecognizer 双击)
         for (UIGestureRecognizer *gr in [widget gestureRecognizers] ?: @[]) {
             if ([gr isKindOfClass:[UITapGestureRecognizer class]] &&
-                [gr isKindOfClass:[UITapGestureRecognizer class]]) {
-                // 简单检查: 已有双击手势就跳过
-                if ([gr numberOfTapsRequired] == 2) return;
-            }
+                [(UITapGestureRecognizer *)gr numberOfTapsRequired] == 2) return;
         }
         UITapGestureRecognizer *dt = [[UITapGestureRecognizer alloc]
             initWithTarget:[CCEditGestureTarget shared]
