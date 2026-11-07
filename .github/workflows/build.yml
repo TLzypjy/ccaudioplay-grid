@@ -4,9 +4,6 @@ on:
   push:
     paths:
       - 'main/**'
-      - 'main2/**'
-      - 'main3/**'
-      - 'Shared/**'
       - 'Makefile'
       - '.github/workflows/build.yml'
   workflow_dispatch:
@@ -58,4 +55,3 @@ jobs:
           name: ccgrid-dylib
           path: |
             .theos/obj/CCAudioPlayPres.dylib
-            .theos/obj/CCAudioPlayAllLayout.dylib
