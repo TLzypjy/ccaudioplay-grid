@@ -13,6 +13,8 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+@class TLPXMediaSnapshot;
+
 @interface TLPXPlayerContentView : UIView
 
 // 外部塞静态素材 (当前选中素材的静态首帧/图片); 视频由真机负责, 预览不播视频
