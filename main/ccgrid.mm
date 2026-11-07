@@ -1048,6 +1048,19 @@ UIImage *CCGLoadMaterialThumb(NSString *path) {
     }
 }
 
+// 供 ccpre.mm 的自定义设置页调用: 加载素材静态首帧/图片 (带 .ccthumbs 磁盘缓存)
+UIImage *CCGLoadMaterialThumb(NSString *path) {
+    @try {
+        if (![path length]) return nil;
+        NSString *ext = [[path pathExtension] lowercaseString];
+        NSArray *vid = @[@"mp4", @"mov", @"m4v"];
+        if ([vid containsObject:ext]) return CCGVideoThumbForPath(path);
+        return CCGThumbForPath(path);
+    } @catch (id e) {
+        return nil;
+    }
+}
+
 // ============ swizzle ============
 static void (*gOrigSelectExistingAsset)(id, SEL) = NULL;
 
