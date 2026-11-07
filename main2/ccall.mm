@@ -92,8 +92,9 @@ static void CCALLApplyFont(UILabel *lab, NSString *fontKey, id self) {
     } @catch (id e) {}
 }
 
-// ---- 真机信息导出 (供设置页预览对齐): 模块 bounds + 正在播放的歌名/封面/时间 ----
+// ---- 真机信息导出 (供设置页预览对齐): 模块 bounds + 各元素实际 frame + 正在播放信息 ----
 static NSString *ccp_lastBoundsStr = nil;
+static NSString *ccp_lastFramesStr = nil;
 static double ccp_lastNowFetch = 0;
 
 static void CCPExportNowPlaying(void) {
@@ -143,6 +144,41 @@ static void CCALLApply(id self) {
                 CCPExportNowPlaying();
             }
         }
+
+        // 真机各元素实际 frame 导出 (设置页预览 WYSIWYG 对齐; npv 内部元素换算到模块坐标系)
+        @try {
+            NSMutableDictionary *rf = [NSMutableDictionary dictionary];
+            [rf setObject:bs forKey:@"bounds"];
+            UIView *iv = [self valueForKey:@"playingIconView"];
+            if ([iv isKindOfClass:[UIView class]]) [rf setObject:NSStringFromCGRect([iv frame]) forKey:@"icon"];
+            UILabel *el = [self valueForKey:@"elapsedTitleLabel"];
+            if ([el isKindOfClass:[UIView class]]) [rf setObject:NSStringFromCGRect([el frame]) forKey:@"elapsed"];
+            UILabel *dl = [self valueForKey:@"durationTitleLabel"];
+            if ([dl isKindOfClass:[UIView class]]) [rf setObject:NSStringFromCGRect([dl frame]) forKey:@"duration"];
+            UIView *pv = [self valueForKey:@"progressView"];
+            if ([pv isKindOfClass:[UIView class]]) [rf setObject:NSStringFromCGRect([pv frame]) forKey:@"progress"];
+            UIView *npv = [self valueForKey:@"nowPlayingView"];
+            if ([npv isKindOfClass:[UIView class]]) {
+                CGPoint no = [(UIView *)npv frame].origin;
+                NSArray *pairs = @[@[@"titleMarqueeView", @"title"], @[@"subtitleMarqueeView", @"subtitle"],
+                                   @[@"leftButton", @"left"], @[@"centerButton", @"center"], @[@"rightButton", @"right"]];
+                for (NSArray *pr in pairs) {
+                    @try {
+                        UIView *sv = [npv valueForKey:pr[0]];
+                        if ([sv isKindOfClass:[UIView class]]) {
+                            CGRect f = [sv frame];
+                            [rf setObject:NSStringFromCGRect(CGRectMake(no.x + f.origin.x, no.y + f.origin.y, f.size.width, f.size.height))
+                                   forKey:pr[1]];
+                        }
+                    } @catch (id e) {}
+                }
+            }
+            NSString *ser = [NSString stringWithFormat:@"%@", rf];
+            if (![ser isEqualToString:ccp_lastFramesStr]) {
+                ccp_lastFramesStr = ser;
+                [rf writeToFile:@"/var/mobile/Documents/ccreal_frames.plist" atomically:YES];
+            }
+        } @catch (id e) {}
 
         // 3x2 由原实现自己处理
         int type = [[self valueForKey:@"type"] intValue];
