@@ -67,34 +67,34 @@ static BOOL TLPXRectIsUnset(CGRect r) {
     };
 
     // 背景
-    [out setObject:[NSValue valueWithCGRect:CGRectMake(0, 0, W, H)] forKey:TLPXElBackground];
+    [out setObject:[NSValue valueWithBytes:&(CGRectMake(0, 0, W, H)) objCType:@encode(CGRect)] forKey:TLPXElBackground];
 
     // 专辑容器 + 黑胶盘 + 黑胶中心封面 (容器内局部坐标)
     CGRect icon = rect(TLPXKeyIconFrame, TLPXElIconContainer);
-    [out setObject:[NSValue valueWithCGRect:icon] forKey:TLPXElIconContainer];
+    [out setObject:[NSValue valueWithBytes:&(icon) objCType:@encode(CGRect)] forKey:TLPXElIconContainer];
     {
         CGFloat discSide = icon.size.height * 0.92;
         CGRect disc = CGRectMake(icon.size.width - discSide * 0.72,
                                  (icon.size.height - discSide) / 2.0,
                                  discSide, discSide);
-        [out setObject:[NSValue valueWithCGRect:disc] forKey:TLPXElVinylDisc];
+        [out setObject:[NSValue valueWithBytes:&(disc) objCType:@encode(CGRect)] forKey:TLPXElVinylDisc];
         CGRect card = CGRectMake(0, 0, icon.size.width * 0.62, icon.size.height);
-        [out setObject:[NSValue valueWithCGRect:card] forKey:TLPXElVinylArt];
+        [out setObject:[NSValue valueWithBytes:&(card) objCType:@encode(CGRect)] forKey:TLPXElVinylArt];
     }
 
     // 歌词 / 歌曲
-    [out setObject:[NSValue valueWithCGRect:rect(TLPXKeyTitleFrame, TLPXElTitle)] forKey:TLPXElTitle];
-    [out setObject:[NSValue valueWithCGRect:rect(TLPXKeySubTitleFrame, TLPXElSubtitle)] forKey:TLPXElSubtitle];
+    [out setObject:[NSValue valueWithBytes:&(rect(TLPXKeyTitleFrame, TLPXElTitle)) objCType:@encode(CGRect)] forKey:TLPXElTitle];
+    [out setObject:[NSValue valueWithBytes:&(rect(TLPXKeySubTitleFrame, TLPXElSubtitle)) objCType:@encode(CGRect)] forKey:TLPXElSubtitle];
 
     // 进度组: 容器 (默认比例) + 容器内三键 (配置为局部坐标)
     CGRect group = rect(TLPXKeyProgressFrame, TLPXElProgressGroup);
     // 配置的 progressFrame 是"条"的局部坐标; 容器框由三键包围盒 + 容器默认框共同决定:
     // 引擎以容器默认框为基准, 条/时间局部值原样透传 (与真机行为一致 —— 真机容器由原布局摆放)。
-    [out setObject:[NSValue valueWithCGRect:[self defaultRectForElement:TLPXElProgressGroup size:moduleSize]]
+    [out setObject:[NSValue valueWithBytes:&([self defaultRectForElement:TLPXElProgressGroup size:moduleSize) objCType:@encode(CGRect)]]
              forKey:TLPXElProgressGroup];
-    [out setObject:[NSValue valueWithCGRect:rect(TLPXKeyElapsedTitleFrame, TLPXElElapsed)]  forKey:TLPXElElapsed];
-    [out setObject:[NSValue valueWithCGRect:rect(TLPXKeyDurationTitleFrame, TLPXElDuration)] forKey:TLPXElDuration];
-    [out setObject:[NSValue valueWithCGRect:rect(TLPXKeyProgressFrame, TLPXElBar)]           forKey:TLPXElBar];
+    [out setObject:[NSValue valueWithBytes:&(rect(TLPXKeyElapsedTitleFrame, TLPXElElapsed)) objCType:@encode(CGRect)]  forKey:TLPXElElapsed];
+    [out setObject:[NSValue valueWithBytes:&(rect(TLPXKeyDurationTitleFrame, TLPXElDuration)) objCType:@encode(CGRect)] forKey:TLPXElDuration];
+    [out setObject:[NSValue valueWithBytes:&(rect(TLPXKeyProgressFrame, TLPXElBar)) objCType:@encode(CGRect)]           forKey:TLPXElBar];
     (void)group;
 
     // 播放按钮三键 (局部均为模块坐标, 三键一体由配置各自表达; 未设置按组默认分解)
@@ -107,9 +107,9 @@ static BOOL TLPXRectIsUnset(CGRect r) {
         gc = CGRectMake(gx + gw * 0.34,     gy, gw * 0.30, gh);
         gr = CGRectMake(gx + gw * 0.70,     gy, gw * 0.28, gh);
     }
-    [out setObject:[NSValue valueWithCGRect:gl] forKey:TLPXElButtonLeft];
-    [out setObject:[NSValue valueWithCGRect:gc] forKey:TLPXElButtonCenter];
-    [out setObject:[NSValue valueWithCGRect:gr] forKey:TLPXElButtonRight];
+    [out setObject:[NSValue valueWithBytes:&(gl) objCType:@encode(CGRect)] forKey:TLPXElButtonLeft];
+    [out setObject:[NSValue valueWithBytes:&(gc) objCType:@encode(CGRect)] forKey:TLPXElButtonCenter];
+    [out setObject:[NSValue valueWithBytes:&(gr) objCType:@encode(CGRect)] forKey:TLPXElButtonRight];
 
     return out;
 }
