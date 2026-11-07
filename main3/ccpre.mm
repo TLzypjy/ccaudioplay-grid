@@ -147,6 +147,7 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
 
 // ---------------- 复刻预览视图 ----------------
 @interface CCPReplicaView : UIView
+@property (nonatomic, retain) NSMutableDictionary *sizeTable;   // @(module) -> NSValue(CGSize) 真机尺寸
 - (void)updateWithModule:(int)module frames:(NSDictionary *)frames fonts:(NSDictionary *)fonts;
 - (void)setNowTitle:(NSString *)t artist:(NSString *)a elapsed:(double)e duration:(double)d artwork:(UIImage *)img live:(BOOL)live;
 - (void)loadBackgroundMaterial;
@@ -292,6 +293,10 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
 }
 
 - (CGSize)moduleSize:(int)m {
+    if (_sizeTable) {
+        NSValue *v = [_sizeTable objectForKey:@(m)];
+        if (v) return [v CGSizeValue];
+    }
     switch (m) {
         case 0: return CGSizeMake(164.0, 159.0);
         case 1: return CGSizeMake(164.0, 238.5);
@@ -466,6 +471,8 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
 @property (nonatomic, retain) NSMutableDictionary *templates;
 @property (nonatomic, retain) NSMutableArray *groupRects;
 @property (nonatomic, retain) NSMutableArray *sliderRows;
+@property (nonatomic, retain) NSMutableDictionary *sizeTable;
+@property (nonatomic, retain) NSMutableSet *touchedGroups;
 @property (nonatomic, retain) NSTimer *saveTimer;
 @property (nonatomic, retain) NSTimer *nowTimer;
 @property (nonatomic, assign) BOOL frameDirty;
@@ -499,6 +506,32 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     _sliderRows = [NSMutableArray array];
     _groupRects = [NSMutableArray array];
     for (int i = 0; i < 5; i++) [_groupRects addObject:[NSValue valueWithCGRect:CGRectZero]];
+    _touchedGroups = [NSMutableSet set];
+
+    // 真机模块尺寸 (伴随 tweak 导出 ccbounds.txt) -> 各模块尺寸表
+    _sizeTable = [NSMutableDictionary dictionary];
+    @try {
+        NSString *bs = [NSString stringWithContentsOfFile:@"/var/mobile/Documents/ccbounds.txt"
+                                                 encoding:NSUTF8StringEncoding error:nil];
+        CGRect rb = CGRectFromString(bs);
+        NSInteger realLt = [[dom objectForKey:@"LayoutType"] integerValue];
+        if (realLt < 0 || realLt > 4) realLt = 2;
+        if (rb.size.width > 60 && rb.size.height > 40) {
+            int cols[] = {2, 2, 3, 4, 4};
+            int rows[] = {2, 3, 2, 2, 3};
+            double uw = rb.size.width / cols[realLt];
+            double uh = rb.size.height / rows[realLt];
+            for (int mm = 0; mm < 5; mm++) {
+                [_sizeTable setObject:[NSValue valueWithCGSize:CGSizeMake(uw * cols[mm], uh * rows[mm])]
+                               forKey:@(mm)];
+            }
+            CCPLog(@"size", [NSString stringWithFormat:@"real bounds %@ lt=%ld unit=%.1fx%.1f",
+                   NSStringFromCGRect(rb), (long)realLt, uw, uh]);
+        } else {
+            CCPLog(@"size", @"no real bounds yet, using estimates");
+        }
+    } @catch (id e) {}
+    [_replica setSizeTable:_sizeTable];
     for (NSString *k in keys) {
         id v = [dom objectForKey:k];
         double a[4] = {0, 0, 0, 0};
@@ -614,6 +647,9 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
         y += 6;
     }
 
+    // 组框 -> 各键 frame (预览与滑条完全一致; 未碰的组不在保存时写出)
+    for (int g = 0; g < 5; g++) [self applyGroupRect:g];
+
     UILabel *fh = [[UILabel alloc] initWithFrame:CGRectMake(16, y, inner, 20)];
     [fh setText:@"字体自定义设置"];
     [fh setFont:[UIFont boldSystemFontOfSize:13.0]];
@@ -670,36 +706,16 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
 }
 
 - (void)fetchNowPlaying {
+    // 播放信息由 SpringBoard 侧伴随 tweak 导出 (ccnow.plist / ccart.png) —— 设置进程无 MediaRemote 权限
     @try {
-        CCPEnsureMR();
-        if (!ccp_mr) { [self applyNow:NO]; return; }
-        void (*MRGNI)(dispatch_queue_t, void (^)(CFDictionaryRef)) =
-            (void (*)(dispatch_queue_t, void (^)(CFDictionaryRef)))dlsym(ccp_mr, "MRMediaRemoteGetNowPlayingInfo");
-        if (!MRGNI) { [self applyNow:NO]; return; }
-        dispatch_queue_t q = dispatch_get_global_queue(0, 0);
-        MRGNI(q, ^(CFDictionaryRef info) {
-            @try {
-                if (!info) { dispatch_async(dispatch_get_main_queue(), ^{ [self applyNow:NO]; }); return; }
-                NSDictionary *d = (__bridge NSDictionary *)info;
-                NSString *title = [d objectForKey:@"kMRMediaRemoteNowPlayingInfoTitle"];
-                NSString *artist = [d objectForKey:@"kMRMediaRemoteNowPlayingInfoArtist"];
-                double elapsed = [[d objectForKey:@"kMRMediaRemoteNowPlayingInfoElapsedTime"] doubleValue];
-                double duration = [[d objectForKey:@"kMRMediaRemoteNowPlayingInfoDuration"] doubleValue];
-                NSData *art = [d objectForKey:@"kMRMediaRemoteNowPlayingInfoArtworkData"];
-                UIImage *img = art ? [UIImage imageWithData:art] : nil;
-                BOOL live = ([title length] > 0 || duration > 0.5);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    _nowTitle = title ?: @"";
-                    _nowArtist = artist ?: @"";
-                    _nowElapsed = elapsed;
-                    _nowDuration = duration;
-                    _nowArt = img;
-                    [self applyNow:live];
-                });
-            } @catch (id e) {
-                dispatch_async(dispatch_get_main_queue(), ^{ [self applyNow:NO]; });
-            }
-        });
+        NSDictionary *nd = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Documents/ccnow.plist"];
+        _nowTitle = [nd objectForKey:@"title"] ?: @"";
+        _nowArtist = [nd objectForKey:@"artist"] ?: @"";
+        _nowElapsed = [[nd objectForKey:@"elapsed"] doubleValue];
+        _nowDuration = [[nd objectForKey:@"duration"] doubleValue];
+        _nowArt = [UIImage imageWithContentsOfFile:@"/var/mobile/Documents/ccart.png"];
+        BOOL live = (_nowDuration > 0.5 || [_nowTitle length] > 0);
+        [self applyNow:live];
     } @catch (id e) {
         [self applyNow:NO];
     }
@@ -753,6 +769,8 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     NSDictionary *dom = [ud persistentDomainForName:CCP_DOMAIN] ?: @{};
     NSInteger lt = [[dom objectForKey:@"LayoutType"] integerValue];
     if (lt < 0 || lt > 4) lt = 2;
+    NSValue *v = [_sizeTable objectForKey:@(lt)];
+    if (v) return [v CGSizeValue];
     switch (lt) {
         case 0: return CGSizeMake(164.0, 159.0);
         case 1: return CGSizeMake(164.0, 238.5);
@@ -797,11 +815,12 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
         return;
     }
     if (g == 4) {
-        // 进度条组: 时间(22%) 条(50%) 时间(22%), 间隙 3%
-        CGFloat tw = gw * 0.22;
-        CGRect b = CGRectMake(gx + gw * 0.25, gy, gw * 0.50, gh);
-        CGRect e = CGRectMake(gx,             gy, tw,      gh);
-        CGRect d = CGRectMake(gx + gw * 0.78, gy, tw,      gh);
+        // 进度条组: 时间固定 34pt 宽 (不随组宽压扁), 拉伸只作用于进度条
+        CGFloat tw = (gw >= 120.0) ? 34.0 : (gw * 0.22);
+        CGFloat gap = 4.0;
+        CGRect b = CGRectMake(gx + tw + gap, gy, MAX(gw - 2 * (tw + gap), 10.0), gh);
+        CGRect e = CGRectMake(gx,             gy, tw, gh);
+        CGRect d = CGRectMake(gx + gw - tw,   gy, tw, gh);
         [_frames setObject:[NSValue valueWithBytes:&b objCType:@encode(CGRect)] forKey:groupKeys[4][0]];
         [_frames setObject:[NSValue valueWithBytes:&e objCType:@encode(CGRect)] forKey:groupKeys[4][1]];
         [_frames setObject:[NSValue valueWithBytes:&d objCType:@encode(CGRect)] forKey:groupKeys[4][2]];
@@ -827,6 +846,7 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     else if (d == 2) gr.size.height = val;
     else gr.size.width = val;
     [_groupRects replaceObjectAtIndex:gi withObject:[NSValue valueWithBytes:&gr objCType:@encode(CGRect)]];
+    [_touchedGroups addObject:@(gi)];
     [self applyGroupRect:gi];
     [self refreshReplica];
     _frameDirty = YES;
@@ -839,24 +859,32 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
 - (void)flushFrameSave {
     if (!_frameDirty) return;
     _frameDirty = NO;
-    NSArray *keys = @[@"iconFrame", @"titleFrame", @"subTitleFrame", @"elapsedTitleFrame",
-                      @"durationTitleFrame", @"progressFrame", @"leftButtonFrame",
-                      @"centerButtonFrame", @"rightButtonFrame"];
-    for (NSString *k in keys) {
-        CGRect cur;
-        [[_frames objectForKey:k] getValue:&cur];
-        // 全零 = 未设置: 不写, 保持运行时自己的默认排布
-        if (cur.size.width <= 0.5 && cur.size.height <= 0.5 &&
-            cur.origin.x <= 0.5 && cur.origin.y <= 0.5) continue;
-        NSString *tpl = [_templates objectForKey:k];
-        if (![tpl length]) {
-            for (NSString *other in keys) {
-                NSString *t2 = [_templates objectForKey:other];
-                if ([t2 length]) { tpl = t2; break; }
+    NSArray *groupKeys = @[
+        @[@"iconFrame"],
+        @[@"titleFrame"],
+        @[@"subTitleFrame"],
+        @[@"leftButtonFrame", @"centerButtonFrame", @"rightButtonFrame"],
+        @[@"progressFrame", @"elapsedTitleFrame", @"durationTitleFrame"],
+    ];
+    // 只写用户碰过的组 (未碰的组保持运行时自己的默认排布)
+    for (int g = 0; g < 5; g++) {
+        if (![_touchedGroups containsObject:@(g)]) continue;
+        for (NSString *k in groupKeys[g]) {
+            CGRect cur;
+            [[_frames objectForKey:k] getValue:&cur];
+            NSString *tpl = [_templates objectForKey:k];
+            if (![tpl length]) {
+                for (NSArray *gk in groupKeys) {
+                    for (NSString *other in gk) {
+                        NSString *t2 = [_templates objectForKey:other];
+                        if ([t2 length]) { tpl = t2; break; }
+                    }
+                    if ([tpl length]) break;
+                }
             }
+            NSString *val = CCPSubstitute4(tpl, cur.origin.x, cur.origin.y, cur.size.height, cur.size.width);
+            [self cc_write:k value:val];
         }
-        NSString *val = CCPSubstitute4(tpl, cur.origin.x, cur.origin.y, cur.size.height, cur.size.width);
-        [self cc_write:k value:val];
     }
     [self cc_postNote:CCP_NOTE_FRAME];
 }
