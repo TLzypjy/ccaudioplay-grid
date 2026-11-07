@@ -1,38 +1,36 @@
-/**
- * CCALLCustomPage — 自定义设置页 (全模块): 真实内容预览 + 模块大小切换 + 滑条
- *
- * v118:
- *  - 预览 = 真实内容复刻:
- *      背景 = 素材目录里"当前选中"的真实视频/图片 (AVPlayerLooper 循环播放);
- *      专辑 = 黑胶复刻 (主题包有 Vinyl.png/Underlay.png 就用图, 否则画深色圆盘),
- *             圆心贴当前歌曲封面 (MediaRemote, 取不到画蓝色盘标);
- *      进度环/进度条 = 真实进度 (MediaRemote elapsed/duration), 没播放画 35%;
- *      歌词/歌名 = MediaRemote 标题/歌手, 没有则画示例文本; 字体大小走字体滑条;
- *      时间 = 真实 elapsed/duration, 没有画 1:23 / 3:45; 三按钮 = 系统图标。
- *  - 预览+模块大小选择固定在页面顶部 (header), 滑条区独立滚动, 不再有黑边
- *    (不再套深色容器, 直接渲染模块圆角矩形)。
- *  - MediaRemote 在 loader 里嵌入了 com.apple.mediaremote.get-now-playing-info
- *    entitlement (repack 时 ldid -S 签入), iOS16 未授权进程拿不到时自动走自绘。
- *  - 调试日志: /var/mobile/Documents/ccpre_debug.log
- */
+//
+//  CCALLCustomPage — 自定义设置页 (全模块): 共享视图实时预览 + 模块大小切换 + 分组滑条
+//
+//  v131 (共享层架构, 指令化改造):
+//  - 预览 = TLPXPlayerContentView (Shared/ 共享视图, 与真机同一引擎 TLPXLayoutEngine
+//    计算的 rectMap 驱动), 不再使用手绘复刻 CCPReplicaView (已删除)。
+//  - 模块尺寸 = metrics.plist 真机实测值 (伴随 tweak 布局后回写), 不写死常数;
+//    未同步时显示"请先去控制中心打开一次播放器以同步尺寸"并退回兜底尺寸。
+//  - 预览缩放: 真实 point 尺寸建视图 + 外层容器 CGAffineTransformMakeScale,
+//    禁止把缩放后尺寸再喂给引擎。
+//  - 滑条 5 组: 专辑 / 歌词 / 歌曲 / 播放按钮(三键一体) / 进度条(含两边时间);
+//    时间固定 34pt 宽不随组宽压扁。
+//  - 对齐检查开关: 模块描边 + 每元素边框与 x,y,w,h 标注 + 10pt 网格;
+//    开启时输出真机/预览逐元素对照表 (差值 >0.5pt 标记 FAIL)。
+//  - 背景为当前选中素材的静态首帧 (不播视频, 不打断音乐); 歌名/封面/时间由
+//    TLPXMediaSnapshot 统一取数 (真机侧导出 + MPNowPlayingInfoCenter + 样本兜底)。
+//
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <dlfcn.h>
 
-#define CCP_DOMAIN @"com.thefool.ccaudioplaypres"
-#define CCP_NOTE_FRAME @"com.thefool.ccaudioplaypres/updateCustomFrameNotificationt"
-#define CCP_NOTE_FONT  @"com.thefool.ccaudioplaypres/updateCustomFontNotificationt"
-#define CCP_BG_DIR_PLAY @"/var/mobile/CCAudioPlay-BackGround/PlayingAsset"
-#define CCP_BG_DIR_BACK @"/var/mobile/CCAudioPlay-BackGround/BackAsset"
-#define CCP_MASK_DIR    @"/var/mobile/Library/Application Support/CCAudioPlay/CCAudioPlay-Mask-N95"
+#import "TLPXConstants.h"
+#import "TLPXLayoutEngine.h"
+#import "TLPXMediaSnapshot.h"
+#import "TLPXPlayerContentView.h"
 
 static char _ccp_assoc_key;
 static char _ccp_assoc_font_idx;
 static char _ccp_assoc_info;
 static char _ccp_assoc_built;
+static char _ccp_align_switch;
 
 // ---------------- 容器 (强制布局, 免疫构建时机) ----------------
 @interface CCPContainerView : UIView
@@ -49,7 +47,7 @@ static void CCPLog(NSString *tag, NSString *line) {
         NSDictionary *attr = [fm attributesOfItemAtPath:p error:nil];
         NSMutableString *existing = nil;
         unsigned long long sz = [attr fileSize];
-        if (sz > 0 && sz < 100000) {
+        if (sz > 0 && sz < 200000) {
             existing = [NSMutableString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
         }
         NSMutableString *next = existing ?: [NSMutableString string];
@@ -58,7 +56,7 @@ static void CCPLog(NSString *tag, NSString *line) {
     } @catch (id e) {}
 }
 
-// ---------------- 模板工具 ----------------
+// ---------------- 存储格式模板工具 (写入与原 CCFrameCell 兼容的字符串) ----------------
 static NSString *CCPDefaultTemplate(void) {
     return @"X:%.1f Y:%.1f 高度:%.1f 宽度:%.1f";
 }
@@ -94,447 +92,74 @@ static NSString *CCPSubstitute4(NSString *tpl, double x, double y, double h, dou
     return s;
 }
 
-// ---------------- AVF (dlopen + 运行时调用, 不做静态引用) ----------------
-static void *ccp_avf = NULL;
-static void CCPEnsureAVF(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        dlopen("/System/Library/Frameworks/CoreMedia.framework/CoreMedia", RTLD_LAZY);
-        ccp_avf = dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_LAZY);
-    });
-}
-
-// ---------------- MediaRemote (dlopen + dlsym; 拿不到返回 NO) ----------------
-static void *ccp_mr = NULL;
-static void CCPEnsureMR(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        ccp_mr = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_LAZY);
-    });
-}
-
-// ---------------- 素材解析 ----------------
-// 依据 prefs 里选中的素材名, 在素材目录中定位真实文件 (视频或图片); 找不到取第一个媒体文件
-static NSString *CCPResolveMaterial(NSString *dir, NSString *selName, BOOL *isVideo) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *all = [fm contentsOfDirectoryAtPath:dir error:nil];
-    NSArray *vidExts = @[@"mp4", @"mov", @"m4v"];
-    NSArray *imgExts = @[@"png", @"jpg", @"jpeg", @"gif", @"webp", @"heic", @"bmp", @"tiff"];
-    NSString *first = nil;
-    BOOL firstIsVideo = NO;
-    for (NSString *f in all) {
-        if (![f length] || [f hasPrefix:@"."]) continue;
-        NSString *ext = [[f pathExtension] lowercaseString];
-        BOOL isV = [vidExts containsObject:ext];
-        BOOL isI = [imgExts containsObject:ext];
-        if (!isV && !isI) continue;
-        if (!first) { first = f; firstIsVideo = isV; }
-        if ([selName length]) {
-            if ([f isEqualToString:selName] ||
-                [[f stringByDeletingPathExtension] isEqualToString:selName] ||
-                [f hasPrefix:selName]) {
-                if (isVideo) *isVideo = isV;
-                return [dir stringByAppendingPathComponent:f];
-            }
-        }
-    }
-    if (first) { if (isVideo) *isVideo = firstIsVideo; return [dir stringByAppendingPathComponent:first]; }
-    return nil;
-}
-
-// 网格素材库 (ccgrid.mm) 提供的素材静态首帧加载 (带磁盘缓存)
+// 素材静态首帧 (网格素材库提供, 带 .ccthumbs 磁盘缓存)
 extern UIImage *CCGLoadMaterialThumb(NSString *path);
-
-// ---------------- 复刻预览视图 ----------------
-@interface CCPReplicaView : UIView
-@property (nonatomic, retain) NSMutableDictionary *sizeTable;   // @(module) -> NSValue(CGSize) 真机尺寸
-- (void)updateWithModule:(int)module frames:(NSDictionary *)frames fonts:(NSDictionary *)fonts;
-- (void)setNowTitle:(NSString *)t artist:(NSString *)a elapsed:(double)e duration:(double)d artwork:(UIImage *)img live:(BOOL)live;
-- (void)loadBackgroundMaterial;
-@end
-
-@implementation CCPReplicaView {
-    UIView *_mod;
-    UIView *_bgHolder;          // 背景视频/图片
-    id _player;                 // AVQueuePlayer (retain)
-    id _looper;                 // AVPlayerLooper
-    id _playerLayer;            // AVPlayerLayer
-    UIImageView *_bgImageView;
-
-    UIView *_iconView;          // 专辑 = 黑胶 + 封面 + 进度环
-    UIImageView *_themeImg;     // 主题包 Vinyl.png / Underlay.png (若有)
-    UIView *_discView;          // 画的深色圆盘
-    UIImageView *_artView;      // 封面圆
-    CAShapeLayer *_ringTrack;
-    CAShapeLayer *_ringProg;
-
-    UILabel *_titleLabel;       // 歌词
-    UILabel *_subtitleLabel;    // 歌曲
-    UILabel *_elapsedLabel;     // 当前时间
-    UILabel *_durationLabel;    // 总时间
-    UIView *_progTrack;
-    UIView *_progFill;
-    UIImageView *_btnL;
-    UIImageView *_btnC;
-    UIImageView *_btnR;
-
-    int _module;
-    double _fraction;           // 0..1
-}
-
-- (id)initWithFrame:(CGRect)f {
-    if ((self = [super initWithFrame:f])) {
-        [self setBackgroundColor:[UIColor clearColor]];
-        _mod = [[UIView alloc] initWithFrame:f];
-        [_mod.layer setCornerRadius:12.0];
-        [_mod.layer setMasksToBounds:YES];
-        [_mod.layer setBorderWidth:1.0];
-        [_mod.layer setBorderColor:[UIColor colorWithWhite:0.75 alpha:1.0].CGColor];
-        [_mod setBackgroundColor:[UIColor colorWithWhite:0.30 alpha:1.0]];
-        [self addSubview:_mod];
-
-        _bgHolder = [[UIView alloc] initWithFrame:_mod.bounds];
-        [_bgHolder setAutoresizingMask:UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight];
-        [_mod addSubview:_bgHolder];
-
-        _iconView = [[UIView alloc] initWithFrame:CGRectZero];
-        [_mod addSubview:_iconView];
-
-        _themeImg = [[UIImageView alloc] initWithFrame:_iconView.bounds];
-        [_themeImg setContentMode:UIViewContentModeScaleAspectFit];
-        [_iconView addSubview:_themeImg];
-
-        // 黑胶盘 (在卡片后面, 右侧露出)
-        _discView = [[UIView alloc] initWithFrame:CGRectZero];
-        [_discView setBackgroundColor:[UIColor colorWithWhite:0.10 alpha:1.0]];
-        [_discView.layer setCornerRadius:1000.0];
-        [_discView.layer setBorderWidth:1.0];
-        [_discView.layer setBorderColor:[UIColor colorWithWhite:1.0 alpha:0.25].CGColor];
-        [_iconView addSubview:_discView];
-
-        // 封面卡片 (圆角矩形, 前层) —— 与真机"专辑卡片+黑胶"复合作画一致
-        _artView = [[UIImageView alloc] initWithFrame:CGRectZero];
-        [_artView setContentMode:UIViewContentModeScaleAspectFill];
-        [_artView setClipsToBounds:YES];
-        [_artView.layer setCornerRadius:6.0];
-        [_artView setBackgroundColor:[UIColor colorWithWhite:0.15 alpha:1.0]];
-        [_iconView addSubview:_artView];
-
-        _ringTrack = [CAShapeLayer layer];
-        [_ringTrack setStrokeColor:[UIColor colorWithWhite:1.0 alpha:0.30].CGColor];
-        [_ringTrack setFillColor:[UIColor clearColor].CGColor];
-        [_ringTrack setLineWidth:2.5];
-        [_iconView.layer addSublayer:_ringTrack];
-
-        _ringProg = [CAShapeLayer layer];
-        [_ringProg setStrokeColor:[UIColor colorWithRed:0.20 green:0.55 blue:1.0 alpha:1.0].CGColor];
-        [_ringProg setFillColor:[UIColor clearColor].CGColor];
-        [_ringProg setLineWidth:2.5];
-        [_ringProg setLineCap:kCALineCapRound];
-        [_iconView.layer addSublayer:_ringProg];
-
-        _titleLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-        [_titleLabel setText:@"歌名示例文本"];
-        [_titleLabel setTextColor:[UIColor whiteColor]];
-        [_titleLabel setFont:[UIFont systemFontOfSize:10.0]];
-        [_titleLabel.layer setShadowColor:[UIColor blackColor].CGColor];
-        [_titleLabel.layer setShadowOpacity:0.6];
-        [_titleLabel.layer setShadowRadius:2.0];
-        [_titleLabel.layer setShadowOffset:CGSizeMake(0, 1)];
-        [_mod addSubview:_titleLabel];
-
-        _subtitleLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-        [_subtitleLabel setText:@"歌手名示例"];
-        [_subtitleLabel setTextColor:[UIColor colorWithWhite:1.0 alpha:0.9]];
-        [_subtitleLabel setFont:[UIFont systemFontOfSize:9.0]];
-        [_subtitleLabel.layer setShadowColor:[UIColor blackColor].CGColor];
-        [_subtitleLabel.layer setShadowOpacity:0.6];
-        [_subtitleLabel.layer setShadowRadius:2.0];
-        [_subtitleLabel.layer setShadowOffset:CGSizeMake(0, 1)];
-        [_mod addSubview:_subtitleLabel];
-
-        _elapsedLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-        [_elapsedLabel setText:@"1:23"];
-        [_elapsedLabel setTextColor:[UIColor whiteColor]];
-        [_elapsedLabel setFont:[UIFont systemFontOfSize:9.0]];
-        [_mod addSubview:_elapsedLabel];
-
-        _durationLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-        [_durationLabel setText:@"3:45"];
-        [_durationLabel setTextColor:[UIColor whiteColor]];
-        [_durationLabel setFont:[UIFont systemFontOfSize:9.0]];
-        [_mod addSubview:_durationLabel];
-
-        _progTrack = [[UIView alloc] initWithFrame:CGRectZero];
-        [_progTrack setBackgroundColor:[UIColor colorWithWhite:1.0 alpha:0.30]];
-        [_progTrack.layer setCornerRadius:1.4];
-        [_mod addSubview:_progTrack];
-        _progFill = [[UIView alloc] initWithFrame:CGRectZero];
-        [_progFill setBackgroundColor:[UIColor whiteColor]];
-        [_progFill.layer setCornerRadius:1.4];
-        [_mod addSubview:_progFill];
-
-        NSArray *syms = @[@"backward.fill", @"pause.fill", @"forward.fill"];
-        UIImageView *b1 = [[UIImageView alloc] initWithFrame:CGRectZero];
-        UIImageView *b2 = [[UIImageView alloc] initWithFrame:CGRectZero];
-        UIImageView *b3 = [[UIImageView alloc] initWithFrame:CGRectZero];
-        UIImageView *btns[3] = {b1, b2, b3};
-        for (int i = 0; i < 3; i++) {
-            UIImageView *iv = btns[i];
-            UIImage *img = [UIImage systemImageNamed:syms[i]];
-            [iv setImage:img];
-            [iv setContentMode:UIViewContentModeScaleAspectFit];
-            [iv setTintColor:[UIColor whiteColor]];
-            if (i == 0) _btnL = iv;
-            else if (i == 1) _btnC = iv;
-            else _btnR = iv;
-            [_mod addSubview:iv];
-        }
-    }
-    return self;
-}
-
-- (CGSize)moduleSize:(int)m {
-    if (_sizeTable) {
-        NSValue *v = [_sizeTable objectForKey:@(m)];
-        if (v) return [v CGSizeValue];
-    }
-    switch (m) {
-        case 0: return CGSizeMake(164.0, 159.0);
-        case 1: return CGSizeMake(164.0, 238.5);
-        case 2: return CGSizeMake(246.0, 159.0);
-        case 3: return CGSizeMake(328.0, 159.0);
-        default:return CGSizeMake(328.0, 238.5);
-    }
-}
-
-- (void)loadBackgroundMaterial {
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSDictionary *dom = [ud persistentDomainForName:CCP_DOMAIN] ?: @{};
-    NSString *sel = [dom objectForKey:@"PlayingAsset"];
-    BOOL isVideo = NO;
-    NSString *path = CCPResolveMaterial(CCP_BG_DIR_PLAY, sel, &isVideo);
-    if (!path) path = CCPResolveMaterial(CCP_BG_DIR_BACK, nil, &isVideo);
-    CCPLog(@"bg", path ? [NSString stringWithFormat:@"material: %@", path] : @"no material found");
-
-    // 清掉旧背景
-    for (UIView *sv in [_bgHolder subviews]) [sv removeFromSuperview];
-    _player = nil;
-    _looper = nil;
-    _playerLayer = nil;
-
-    if (!path) return;
-
-    // v124: 只显示当前选中素材的静态首帧/图片, 不再播视频
-    // (设置进程里起 AVPlayer 激活音频会话会打断正在放的歌; 静态图由网格库的缓存逻辑秒出)
-    UIImage *img = CCGLoadMaterialThumb(path);
-    if (!img) {
-        CCPLog(@"bg", @"thumb decode failed");
-        return;
-    }
-    UIImageView *iv = [[UIImageView alloc] initWithFrame:_bgHolder.bounds];
-    [iv setImage:img];
-    [iv setContentMode:UIViewContentModeScaleAspectFill];
-    [iv setClipsToBounds:YES];
-    [iv setAutoresizingMask:UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight];
-    [_bgHolder addSubview:iv];
-}
-
-- (void)setThemeImage:(UIImage *)img {
-    [_themeImg setImage:img];
-}
-
-- (void)setNowTitle:(NSString *)t artist:(NSString *)a elapsed:(double)e duration:(double)d artwork:(UIImage *)img live:(BOOL)live {
-    [_titleLabel setText:([t length] ? t : @"歌名示例文本")];
-    [_subtitleLabel setText:([a length] ? a : @"歌手名示例")];
-    if (live && d > 0.5) {
-        int em = (int)e, dm = (int)d;
-        [_elapsedLabel setText:[NSString stringWithFormat:@"%d:%02d", em / 60, em % 60]];
-        [_durationLabel setText:[NSString stringWithFormat:@"%d:%02d", dm / 60, dm % 60]];
-        _fraction = (e > 0 && d > 0) ? MIN(1.0, e / d) : 0.0;
-    } else {
-        [_elapsedLabel setText:@"1:23"];
-        [_durationLabel setText:@"3:45"];
-        _fraction = 0.35;
-    }
-    if (img) [_artView setImage:img];
-    [self setNeedsLayout];
-    [self layoutIfNeeded];
-}
-
-- (void)updateWithModule:(int)module frames:(NSDictionary *)frames fonts:(NSDictionary *)fonts {
-    _module = module;
-    CGSize ms = [self moduleSize:module];
-    double availW = [self bounds].size.width - 16.0;
-    double availH = [self bounds].size.height - 16.0;
-    double sc = MIN(availW / ms.width, availH / ms.height);
-    CGSize show = CGSizeMake(ms.width * sc, ms.height * sc);
-    [_mod setFrame:CGRectMake(([self bounds].size.width - show.width) / 2.0,
-                              ([self bounds].size.height - show.height) / 2.0,
-                              show.width, show.height)];
-    if (_playerLayer) {
-        [(CALayer *)_playerLayer setFrame:_bgHolder.bounds];
-    }
-
-    NSArray *order = @[@"iconFrame", @"titleFrame", @"subTitleFrame", @"elapsedTitleFrame",
-                       @"durationTitleFrame", @"progressFrame", @"leftButtonFrame",
-                       @"centerButtonFrame", @"rightButtonFrame"];
-    UIView *views[9] = {_iconView, _titleLabel, _subtitleLabel, _elapsedLabel, _durationLabel,
-                        _progTrack, _btnL, _btnC, _btnR};
-    for (int i = 0; i < 9; i++) {
-        NSValue *fv = frames[order[i]];
-        UIView *v = views[i];
-        CGRect fr;
-        BOOL unset = NO;
-        if (!fv) {
-            unset = YES;
-        } else {
-            fr = [fv CGRectValue];
-            if (fr.size.width <= 0.5 && fr.size.height <= 0.5 &&
-                fr.origin.x <= 0.5 && fr.origin.y <= 0.5) unset = YES;
-        }
-        // 全部元素常驻显示: 未设置位置的用默认排布, 方便用户看到要调的东西
-        if (unset) fr = [self defaultFrame:i size:ms];
-        [v setHidden:NO];
-        CGRect scaled = CGRectMake(fr.origin.x * sc, fr.origin.y * sc,
-                                   fr.size.width * sc, fr.size.height * sc);
-        [v setFrame:scaled];
-
-        if (i == 0) {
-            // 专辑复合作画: 封面卡片(左, 62%宽) + 黑胶盘(右后半) + 进度环绕盘
-            double w = scaled.size.width, h = scaled.size.height;
-            double discSide = h * 0.92;
-            [_discView setFrame:CGRectMake(w - discSide * 0.72, (h - discSide) / 2.0, discSide, discSide)];
-            [_themeImg setFrame:CGRectMake(0, 0, w, h)];
-            double cardW = w * 0.62;
-            [_artView setFrame:CGRectMake(0, 0, cardW, h)];
-            // 环绕黑胶盘中心
-            double dcx = w - discSide * 0.72 + discSide / 2.0;
-            double dcy = h / 2.0;
-            CGMutablePathRef path = CGPathCreateMutable();
-            double r = discSide / 2.0 - 1.5;
-            CGPathAddEllipseInRect(path, NULL, CGRectMake(dcx - r, dcy - r, r * 2, r * 2));
-            [_ringTrack setPath:path];
-            [_ringProg setPath:path];
-            CGPathRelease(path);
-            [_ringTrack setFrame:CGRectMake(0, 0, _mod.bounds.size.width, _mod.bounds.size.height)];
-            [_ringProg setFrame:CGRectMake(0, 0, _mod.bounds.size.width, _mod.bounds.size.height)];
-            double frac = (_fraction > 0.001) ? _fraction : 0.0;
-            [_ringProg setStrokeStart:0.0];
-            [_ringProg setStrokeEnd:(CGFloat)MAX(frac, 0.02)];
-        } else if (i == 5) {
-            // 进度条: 轨道 + 填充
-            [_progTrack setFrame:scaled];
-            [_progFill setFrame:CGRectMake(scaled.origin.x, scaled.origin.y,
-                                           scaled.size.width * _fraction, scaled.size.height)];
-        }
-    }
-
-    // 进度条填充在轨道之上
-    [_mod bringSubviewToFront:_progFill];
-
-    // 字体
-    double tf = [fonts[@"titleFont"] doubleValue];
-    double sf = [fonts[@"subtitleFont"] doubleValue];
-    double ef = [fonts[@"elapsedTitleFont"] doubleValue];
-    double df = [fonts[@"durationTitleFont"] doubleValue];
-    if (tf >= 4) [_titleLabel setFont:[UIFont systemFontOfSize:tf]];
-    if (sf >= 4) [_subtitleLabel setFont:[UIFont systemFontOfSize:sf]];
-    if (ef >= 4) [_elapsedLabel setFont:[UIFont systemFontOfSize:ef]];
-    if (df >= 4) [_durationLabel setFont:[UIFont systemFontOfSize:df]];
-}
-
-// 未设置 frame 时的默认排布 (与组的默认框分解一致), 让所有元素都可见可调
-- (CGRect)defaultFrame:(int)i size:(CGSize)ms {
-    CGFloat W = ms.width, H = ms.height;
-    switch (i) {
-        case 0: return CGRectMake(0.04 * W, 0.26 * H, 0.26 * W, 0.42 * H);        // 专辑
-        case 1: return CGRectMake(0.34 * W, 0.10 * H, 0.60 * W, 0.22 * H);        // 歌词
-        case 2: return CGRectMake(0.34 * W, 0.36 * H, 0.58 * W, 0.16 * H);        // 歌曲
-        case 3: return CGRectMake(0.24 * W, 0.62 * H, 0.1144 * W, 0.10 * H);      // 当前时间 (进度条组左)
-        case 4: return CGRectMake(0.6456 * W, 0.62 * H, 0.1144 * W, 0.10 * H);    // 总时间 (进度条组右)
-        case 5: return CGRectMake(0.37 * W, 0.62 * H, 0.26 * W, 0.10 * H);        // 进度条
-        case 6: return CGRectMake(0.28 * W, 0.80 * H, 0.1232 * W, 0.14 * H);      // 左按钮
-        case 7: return CGRectMake(0.4296 * W, 0.80 * H, 0.132 * W, 0.14 * H);     // 中按钮
-        case 8: return CGRectMake(0.588 * W, 0.80 * H, 0.1232 * W, 0.14 * H);     // 右按钮
-    }
-    return CGRectZero;
-}
-
-@end
 
 // ---------------- 页面 ----------------
 @interface CCPPageHelper : NSObject
-@property (nonatomic, retain) CCPReplicaView *replica;
+@property (nonatomic, retain) TLPXPlayerContentView *playerView;
 @property (nonatomic, retain) UISegmentedControl *seg;
-@property (nonatomic, retain) NSMutableDictionary *frames;
-@property (nonatomic, retain) NSMutableDictionary *realFrames;   // 真机坐标系 frame (显示用)
-@property (nonatomic, assign) double sx;
-@property (nonatomic, assign) double sy;
-@property (nonatomic, retain) NSMutableDictionary *templates;
-@property (nonatomic, retain) NSMutableArray *groupRects;
+@property (nonatomic, retain) UILabel *sizeHint;
+@property (nonatomic, retain) NSMutableDictionary *frames;      // 配置键 → NSValue(模块点坐标)
+@property (nonatomic, retain) NSMutableDictionary *templates;   // 配置键 → 原始模板串
+@property (nonatomic, retain) NSMutableArray *groupRects;       // 5 组滑条框 (模块点坐标)
 @property (nonatomic, retain) NSMutableArray *sliderRows;
-@property (nonatomic, retain) NSMutableDictionary *sizeTable;
+@property (nonatomic, retain) NSMutableDictionary *sizeTable;   // @(tier) → NSValue(实测尺寸)
 @property (nonatomic, retain) NSMutableSet *touchedGroups;
 @property (nonatomic, retain) NSTimer *saveTimer;
-@property (nonatomic, retain) NSTimer *nowTimer;
 @property (nonatomic, assign) BOOL frameDirty;
-@property (nonatomic, assign) BOOL nowLive;
-@property (nonatomic, copy) NSString *nowTitle;
-@property (nonatomic, copy) NSString *nowArtist;
-@property (nonatomic, assign) double nowElapsed;
-@property (nonatomic, assign) double nowDuration;
-@property (nonatomic, retain) UIImage *nowArt;
+@property (nonatomic, assign) BOOL metricsLoaded;               // 已读到 metrics.plist
 @end
 
 @implementation CCPPageHelper
 
-- (NSDictionary *)currentFonts {
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSDictionary *dom = [ud persistentDomainForName:CCP_DOMAIN] ?: @{};
-    return @{@"titleFont": [dom objectForKey:@"titleFont"] ?: @10.0,
-             @"subtitleFont": [dom objectForKey:@"subtitleFont"] ?: @10.0,
-             @"elapsedTitleFont": [dom objectForKey:@"elapsedTitleFont"] ?: @10.0,
-             @"durationTitleFont": [dom objectForKey:@"durationTitleFont"] ?: @10.0};
+// ---- 档位尺寸: metrics.plist 优先, 缺失退回兜底尺寸并提示 ----
+- (CGSize)sizeForTier:(NSInteger)tier {
+    NSValue *v = [_sizeTable objectForKey:@(tier)];
+    if (v) return [v CGSizeValue];
+    return [TLPXLayoutEngine fallbackSizeForTier:(TLPXTier)tier];
+}
+
+- (void)loadMetricsAndSizes {
+    _sizeTable = [NSMutableDictionary dictionary];
+    _metricsLoaded = NO;
+    @try {
+        NSDictionary *m = [NSDictionary dictionaryWithContentsOfFile:TLPXMetricsPathRootless]
+                          ?: [NSDictionary dictionaryWithContentsOfFile:TLPXMetricsPathRootfs];
+        if ([m count]) {
+            for (int t = 0; t < 5; t++) {
+                NSDictionary *e = [m objectForKey:[@(t) stringValue]];
+                if ([e objectForKey:@"width"] && [e objectForKey:@"height"]) {
+                    CGSize sz = CGSizeMake([[e objectForKey:@"width"] doubleValue],
+                                           [[e objectForKey:@"height"] doubleValue]);
+                    [_sizeTable setObject:[NSValue valueWithCGSize:sz] forKey:@(t)];
+                    _metricsLoaded = YES;
+                }
+            }
+        }
+        if (_metricsLoaded) {
+            CCPLog(@"metrics", [NSString stringWithFormat:@"loaded %@",
+                   NSStringFromClass(_sizeTable.class)] ? [NSString stringWithFormat:@"tiers=%@", [m allKeys]] : @"-");
+        } else {
+            CCPLog(@"metrics", @"metrics.plist missing/empty — fallback sizes in effect");
+        }
+    } @catch (id e) {
+        CCPLog(@"metrics", [NSString stringWithFormat:@"read exception %@", e]);
+    }
 }
 
 - (void)buildOnHost:(CCPContainerView *)host {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSDictionary *dom = [ud persistentDomainForName:CCP_DOMAIN] ?: @{};
-    NSArray *keys = @[@"iconFrame", @"titleFrame", @"subTitleFrame", @"elapsedTitleFrame",
-                      @"durationTitleFrame", @"progressFrame", @"leftButtonFrame",
-                      @"centerButtonFrame", @"rightButtonFrame"];
+    NSDictionary *dom = [ud persistentDomainForName:TLPXPrefsDomain] ?: @{};
+    NSArray *keys = @[TLPXKeyIconFrame, TLPXKeyTitleFrame, TLPXKeySubTitleFrame, TLPXKeyElapsedTitleFrame,
+                      TLPXKeyDurationTitleFrame, TLPXKeyProgressFrame, TLPXKeyLeftButtonFrame,
+                      TLPXKeyCenterButtonFrame, TLPXKeyRightButtonFrame];
     _frames = [NSMutableDictionary dictionary];
     _templates = [NSMutableDictionary dictionary];
     _sliderRows = [NSMutableArray array];
     _groupRects = [NSMutableArray array];
-    for (int i = 0; i < 5; i++) [_groupRects addObject:[NSValue valueWithCGRect:CGRectZero]];
     _touchedGroups = [NSMutableSet set];
-
-    // 真机模块尺寸 (伴随 tweak 导出 ccbounds.txt) -> 各模块尺寸表
-    _sizeTable = [NSMutableDictionary dictionary];
-    @try {
-        NSString *bs = [NSString stringWithContentsOfFile:@"/var/mobile/Documents/ccbounds.txt"
-                                                 encoding:NSUTF8StringEncoding error:nil];
-        CGRect rb = CGRectFromString(bs);
-        NSInteger realLt = [[dom objectForKey:@"LayoutType"] integerValue];
-        if (realLt < 0 || realLt > 4) realLt = 2;
-        if (rb.size.width > 60 && rb.size.height > 40) {
-            int cols[] = {2, 2, 3, 4, 4};
-            int rows[] = {2, 3, 2, 2, 3};
-            double uw = rb.size.width / cols[realLt];
-            double uh = rb.size.height / rows[realLt];
-            for (int mm = 0; mm < 5; mm++) {
-                [_sizeTable setObject:[NSValue valueWithCGSize:CGSizeMake(uw * cols[mm], uh * rows[mm])]
-                               forKey:@(mm)];
-            }
-            CCPLog(@"size", [NSString stringWithFormat:@"real bounds %@ lt=%ld unit=%.1fx%.1f",
-                   NSStringFromCGRect(rb), (long)realLt, uw, uh]);
-        } else {
-            CCPLog(@"size", @"no real bounds yet, using estimates");
-        }
-    } @catch (id e) {}
-    [_replica setSizeTable:_sizeTable];
+    for (int i = 0; i < 5; i++) [_groupRects addObject:[NSValue valueWithCGRect:CGRectZero]];
     for (NSString *k in keys) {
         id v = [dom objectForKey:k];
         double a[4] = {0, 0, 0, 0};
@@ -545,53 +170,13 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
         [_frames setObject:[NSValue valueWithBytes:&a objCType:@encode(CGRect)] forKey:k];
     }
 
-    // ---- 真机实际 frame (伴随 tweak 导出) + 缩放系数换算 ----
-    NSDictionary *rf = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Documents/ccreal_frames.plist"] ?: @{};
-    CGRect realBounds = CGRectFromString([rf objectForKey:@"bounds"] ?: @"");
-    NSArray *pKeys = @[@"iconFrame", @"titleFrame", @"subTitleFrame", @"elapsedTitleFrame",
-                       @"durationTitleFrame", @"progressFrame", @"leftButtonFrame",
-                       @"centerButtonFrame", @"rightButtonFrame"];
-    NSArray *rKeys = @[@"icon", @"title", @"subtitle", @"elapsed", @"duration",
-                       @"progress", @"left", @"center", @"right"];
-    _realFrames = [NSMutableDictionary dictionary];
-    double sx = 0, sy = 0;
-    for (int i = 0; i < 9; i++) {
-        NSString *rs = [rf objectForKey:rKeys[i]];
-        CGRect rr = CGRectFromString(rs ?: @"");
-        CGRect st;
-        [[_frames objectForKey:pKeys[i]] getValue:&st];
-        [_realFrames setObject:[NSValue valueWithCGRect:rr] forKey:pKeys[i]];
-        if (sx <= 0 && rr.size.width > 1 && st.size.width > 1) {
-            sx = rr.size.width / st.size.width;
-            sy = (rr.size.height > 1 && st.size.height > 1 && st.size.height / rr.size.height > 0.01)
-                 ? rr.size.height / st.size.height : sx;
-            if (sy <= 0) sy = sx;
-        }
-    }
-    // 缩放系数: 伴随 tweak 会把存储值按原始点数写回真模块 (非 3x2 模块),
-    // 所以真机显示 = 存储值直接当点数, 预览也必须用 1:1 (v127 推导出的 1.834/2.024 是
-    // 原版布局在伴随覆盖前的瞬时值, 不能作为预览缩放)。
-    _sx = 1.0;
-    _sy = 1.0;
-    CCPLog(@"scale", [NSString stringWithFormat:@"forced 1:1 (companion normalizes real widget to stored points); realBounds=%@",
-           NSStringFromCGRect(realBounds)]);
-    // 真机没导出的元素: stored × S 兜底
-    for (int i = 0; i < 9; i++) {
-        CGRect rr = [[_realFrames objectForKey:pKeys[i]] CGRectValue];
-        if (rr.size.width <= 0.5 && rr.size.height <= 0.5 && rr.origin.x <= 0.5 && rr.origin.y <= 0.5) {
-            CGRect st;
-            [[_frames objectForKey:pKeys[i]] getValue:&st];
-            [_realFrames setObject:[NSValue valueWithCGRect:
-                CGRectMake(st.origin.x * _sx, st.origin.y * _sy, st.size.width * _sx, st.size.height * _sy)]
-                forKey:pKeys[i]];
-        }
-    }
+    [self loadMetricsAndSizes];
 
     CGFloat W = [UIScreen mainScreen].bounds.size.width;
     CGFloat inner = W - 32.0;
 
-    // ---- 固定 header: 预览 + 模块大小 ----
-    CGFloat headerH = 16 + 18 + 4 + 190 + 8 + 18 + 2 + 32 + 10;
+    // ---- 固定 header: 预览 + 同步提示 + 模块大小 + 对齐检查 ----
+    CGFloat headerH = 16 + 18 + 4 + 190 + 8 + 18 + 2 + 32 + 8 + 30 + 10;
     UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, headerH)];
     [header setBackgroundColor:[UIColor colorWithWhite:0.94 alpha:1.0]];
     [header setAutoresizingMask:UIViewAutoresizingFlexibleWidth];
@@ -600,14 +185,38 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     [host setHeaderH:headerH];
 
     UILabel *pt = [[UILabel alloc] initWithFrame:CGRectMake(16, 14, inner, 18)];
-    [pt setText:@"实时预览 (真实素材/主题/字体, 数值随滑条变化)"];
+    [pt setText:@"实时预览 (真机同源引擎, 数值随滑条变化)"];
     [pt setFont:[UIFont systemFontOfSize:12.0]];
     [pt setTextColor:[UIColor grayColor]];
     [header addSubview:pt];
 
-    _replica = [[CCPReplicaView alloc] initWithFrame:CGRectMake(16, 36, inner, 190)];
-    [header addSubview:_replica];
-    [_replica loadBackgroundMaterial];
+    // 预览卡片: 固定可视区, 内容按真机实测尺寸 1:1 建视图后 transform 缩放
+    CGFloat cardW = inner, cardH = 190.0;
+    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(16, 36, cardW, cardH)];
+    [card setClipsToBounds:YES];
+    [card layer].cornerRadius = 12.0;
+    [card layer].masksToBounds = YES;
+    [card setBackgroundColor:[UIColor colorWithWhite:0.85 alpha:1.0]];
+    [header addSubview:card];
+
+    NSInteger curTier = [[dom objectForKey:TLPXKeyLayoutType] integerValue];
+    if (curTier < 0 || curTier > 4) curTier = 2;
+    CGSize realSize = [self sizeForTier:curTier];
+
+    _playerView = [[TLPXPlayerContentView alloc] initWithFrame:CGRectMake(0, 0, realSize.width, realSize.height)];
+    double s = MIN(cardW / realSize.width, cardH / realSize.height);
+    [_playerView setTransform:CGAffineTransformMakeScale((CGFloat)s, (CGFloat)s)];
+    [_playerView setCenter:CGPointMake(cardW / 2.0, cardH / 2.0)];
+    [card addSubview:_playerView];
+
+    if (!_metricsLoaded) {
+        UILabel *warn = [[UILabel alloc] initWithFrame:CGRectMake(8, cardH - 22, cardW - 16, 18)];
+        [warn setText:@"⚠ 请先去控制中心打开一次播放器以同步尺寸 (当前为兜底尺寸)"];
+        [warn setFont:[UIFont systemFontOfSize:10.0]];
+        [warn setTextColor:[UIColor colorWithRed:0.9 green:0.3 blue:0.1 alpha:1.0]];
+        [warn setTextAlignment:NSTextAlignmentCenter];
+        [card addSubview:warn];
+    }
 
     UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(16, 232, inner, 18)];
     [st setText:@"预览模块大小"];
@@ -617,14 +226,23 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
 
     _seg = [[UISegmentedControl alloc] initWithItems:@[@"2x2", @"2x3", @"3x2", @"4x2", @"4x3"]];
     [_seg setFrame:CGRectMake(16, 252, inner, 32)];
-    // 默认显示当前实际使用的模块尺寸 (LayoutType), 而不是固定 3x2
-    NSInteger lt = [[dom objectForKey:@"LayoutType"] integerValue];
-    if (lt < 0 || lt > 4) lt = 2;
-    [_seg setSelectedSegmentIndex:lt];
+    [_seg setSelectedSegmentIndex:curTier];
     [_seg addTarget:self action:@selector(segChanged:) forControlEvents:UIControlEventValueChanged];
     [header addSubview:_seg];
 
-    // ---- 滚动区: 开关 + 滑条 ----
+    // 对齐检查开关 (阶段三)
+    UILabel *al = [[UILabel alloc] initWithFrame:CGRectMake(16, 288, 120, 22)];
+    [al setText:@"对齐检查"];
+    [al setFont:[UIFont systemFontOfSize:13.0]];
+    [header addSubview:al];
+    UISwitch *alsw = [[UISwitch alloc] initWithFrame:CGRectMake(W - 68, 286, 51, 31)];
+    objc_setAssociatedObject(alsw, &_ccp_assoc_key, @"__align__", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [alsw addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
+    [header addSubview:alsw];
+    // 复用 _alignSwitch 引用便于开关时输出对照表
+    objc_setAssociatedObject(self, &_ccp_align_switch, alsw, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    // ---- 滚动区 ----
     UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, headerH, W, host.bounds.size.height - headerH)];
     [scroll setAutoresizingMask:UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight];
     [scroll setAlwaysBounceVertical:YES];
@@ -633,17 +251,17 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     [host setScroll:scroll];
 
     CGFloat y = 14;
-    y = [self addSwitchRowIn:scroll y:y label:@"启用自定义" key:@"isEnableCustomFrame" def:NO width:W];
-    y = [self addSwitchRowIn:scroll y:y label:@"启用颜色调试" key:@"isEnableColor" def:NO width:W];
+    y = [self addSwitchRowIn:scroll y:y label:@"启用自定义" key:TLPXKeyIsEnableCustomFrame def:NO width:W];
+    y = [self addSwitchRowIn:scroll y:y label:@"启用颜色调试" key:TLPXKeyIsEnableColor def:NO width:W];
 
-    // ---- 位置滑条: 5 组 (按钮三键一体 / 进度条含两边时间) ----
+    // ---- 位置滑条: 5 组 ----
     NSArray *groupNames = @[@"专辑", @"歌词", @"歌曲", @"播放按钮 (三键一体)", @"进度条 (含两边时间)"];
     NSArray *groupKeys = @[
-        @[@"iconFrame"],
-        @[@"titleFrame"],
-        @[@"subTitleFrame"],
-        @[@"leftButtonFrame", @"centerButtonFrame", @"rightButtonFrame"],
-        @[@"progressFrame", @"elapsedTitleFrame", @"durationTitleFrame"],
+        @[TLPXKeyIconFrame],
+        @[TLPXKeyTitleFrame],
+        @[TLPXKeySubTitleFrame],
+        @[TLPXKeyLeftButtonFrame, TLPXKeyCenterButtonFrame, TLPXKeyRightButtonFrame],
+        @[TLPXKeyProgressFrame, TLPXKeyElapsedTitleFrame, TLPXKeyDurationTitleFrame],
     ];
     NSArray *dims = @[@"X", @"Y", @"高", @"宽"];
     for (int g = 0; g < 5; g++) {
@@ -654,19 +272,15 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
         [scroll addSubview:h];
         y += 24;
 
-        // 组框 = 组内真机 frame 的包围盒 (WYSIWYG); 没有真机数据用默认排布
         CGRect gr = CGRectNull;
         for (NSString *k in ks) {
             CGRect cur;
-            [[_realFrames objectForKey:k] getValue:&cur];
+            [[_frames objectForKey:k] getValue:&cur];
             if (cur.size.width <= 0.5 && cur.size.height <= 0.5 &&
                 cur.origin.x <= 0.5 && cur.origin.y <= 0.5) continue;
             gr = CGRectIsNull(gr) ? cur : CGRectUnion(gr, cur);
         }
-        if (CGRectIsNull(gr)) {
-            CGSize ms = [self moduleSizeForGroup];
-            gr = [self defaultGroupFrame:g size:ms];
-        }
+        if (CGRectIsNull(gr)) gr = [self defaultGroupFrame:g size:[self sizeForSelectedTier]];
         [_groupRects replaceObjectAtIndex:g withObject:[NSValue valueWithBytes:&gr objCType:@encode(CGRect)]];
 
         for (int d = 0; d < 4; d++) {
@@ -692,15 +306,14 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
         y += 6;
     }
 
-    // 组框 -> 各键 frame (预览与滑条完全一致; 未碰的组不在保存时写出)
-    for (int g = 0; g < 5; g++) [self applyGroupRect:g];
+    [self applyAllGroupRects];
 
     UILabel *fh = [[UILabel alloc] initWithFrame:CGRectMake(16, y, inner, 20)];
     [fh setText:@"字体自定义设置"];
     [fh setFont:[UIFont boldSystemFontOfSize:13.0]];
     [scroll addSubview:fh];
     y += 24;
-    NSArray *fkeys = @[@"titleFont", @"subtitleFont", @"elapsedTitleFont", @"durationTitleFont"];
+    NSArray *fkeys = @[TLPXKeyTitleFont, TLPXKeySubtitleFont, TLPXKeyElapsedTitleFont, TLPXKeyDurationTitleFont];
     NSArray *fnames = @[@"歌词字体", @"歌曲字体", @"当前时长字体", @"总时长字体"];
     for (int i = 0; i < 4; i++) {
         UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 4, 110, 22)];
@@ -726,154 +339,134 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
         y += 38;
     }
 
-    y += 90;   // 底部大余量, 保证最后一行完整可见
+    y += 90;
     [scroll setContentSize:CGSizeMake(W, y + 40)];
 
-    // 主题图 (Vinyl.png 若有)
-    NSString *maskName = [dom objectForKey:@"MaskName"];
+    // 主题遮罩同源加载 (Mask/Underlay/Vinyl)
+    NSString *maskName = [dom objectForKey:TLPXKeyMaskName];
     if ([maskName length]) {
-        NSString *bundleDir = [NSString stringWithFormat:@"%@/%@.bundle", CCP_MASK_DIR, maskName];
-        NSString *vinyl = [bundleDir stringByAppendingPathComponent:@"Vinyl.png"];
-        NSString *under = [bundleDir stringByAppendingPathComponent:@"Underlay.png"];
-        NSString *use = nil;
-        if ([[NSFileManager defaultManager] fileExistsAtPath:vinyl]) use = vinyl;
-        else if ([[NSFileManager defaultManager] fileExistsAtPath:under]) use = under;
-        if (use) {
-            UIImage *img = [UIImage imageWithContentsOfFile:use];
-            [_replica setThemeImage:img];
-            CCPLog(@"theme", [NSString stringWithFormat:@"theme image: %@", use]);
+        NSString *dir = [NSString stringWithFormat:TLPXMaskBundleDirFormat, maskName];
+        [_playerView setMaskBundlePath:dir];
+    }
+
+    // 背景 = 当前选中素材静态首帧
+    NSString *sel = [dom objectForKey:TLPXKeyPlayingAsset] ?: @"";
+    BOOL isVideo = NO;
+    NSString *path = [self resolveMaterial:sel];
+    if (path) {
+        UIImage *thumb = CCGLoadMaterialThumb(path);
+        [_playerView.backgroundImageView setImage:thumb];
+        CCPLog(@"bg", [NSString stringWithFormat:@"material: %@", path]);
+    }
+
+    [self refreshPreview];
+}
+
+static char _ccp_align_switch;
+
+- (NSString *)resolveMaterial:(NSString *)selName {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *vidExts = @[@"mp4", @"mov", @"m4v"];
+    NSArray *imgExts = @[@"png", @"jpg", @"jpeg", @"gif", @"webp", @"heic", @"bmp", @"tiff"];
+    for (NSString *dir in @[TLPXBgDirPlaying, TLPXBgDirBack]) {
+        NSArray *all = [fm contentsOfDirectoryAtPath:dir error:nil];
+        NSString *first = nil;
+        for (NSString *f in all) {
+            if (![f length] || [f hasPrefix:@"."]) continue;
+            NSString *ext = [[f pathExtension] lowercaseString];
+            BOOL isMedia = [vidExts containsObject:ext] || [imgExts containsObject:ext];
+            if (!isMedia) continue;
+            if (!first) first = f;
+            if ([selName length] &&
+                ([f isEqualToString:selName] ||
+                 [[f stringByDeletingPathExtension] isEqualToString:selName] ||
+                 [f hasPrefix:selName])) {
+                return [dir stringByAppendingPathComponent:f];
+            }
         }
+        if (first) return [dir stringByAppendingPathComponent:first];
     }
-
-    [self refreshReplica];
-    [self fetchNowPlaying];
-    // 播放进度不刷新 (用户要求): 只在进入页面时取一次播放信息, 不再起定时器
+    return nil;
 }
 
-- (void)fetchNowPlaying {
-    // 播放信息由 SpringBoard 侧伴随 tweak 导出 (ccnow.plist / ccart.png) —— 设置进程无 MediaRemote 权限
-    @try {
-        NSDictionary *nd = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Documents/ccnow.plist"];
-        _nowTitle = [nd objectForKey:@"title"] ?: @"";
-        _nowArtist = [nd objectForKey:@"artist"] ?: @"";
-        _nowElapsed = [[nd objectForKey:@"elapsed"] doubleValue];
-        _nowDuration = [[nd objectForKey:@"duration"] doubleValue];
-        _nowArt = [UIImage imageWithContentsOfFile:@"/var/mobile/Documents/ccart.png"];
-        BOOL live = (_nowDuration > 0.5 || [_nowTitle length] > 0);
-        [self applyNow:live];
-    } @catch (id e) {
-        [self applyNow:NO];
-    }
-}
-
-- (void)applyNow:(BOOL)live {
-    _nowLive = live;
-    [self refreshReplica];
-}
-
-- (void)refreshReplica {
-    if (!_replica) return;
-    BOOL live = _nowLive && (_nowDuration > 0.5 || [_nowTitle length] > 0);
-    [_replica setNowTitle:_nowTitle artist:_nowArtist
-                  elapsed:_nowElapsed duration:_nowDuration
-                  artwork:_nowArt live:live];
-    [_replica updateWithModule:(int)[_seg selectedSegmentIndex] frames:_realFrames fonts:[self currentFonts]];
-}
-
-- (CGFloat)addSwitchRowIn:(UIScrollView *)scroll y:(CGFloat)y label:(NSString *)label
-                      key:(NSString *)key def:(BOOL)def width:(CGFloat)W {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 6, 180, 24)];
-    [l setText:label];
-    [l setFont:[UIFont systemFontOfSize:14.0]];
-    [scroll addSubview:l];
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSDictionary *dom = [ud persistentDomainForName:CCP_DOMAIN] ?: @{};
-    BOOL on = def;
-    id v = [dom objectForKey:key];
-    if (v) on = [v boolValue];
-    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(W - 68, y + 3, 51, 31)];
-    [sw setOn:on animated:NO];
-    objc_setAssociatedObject(sw, &_ccp_assoc_key, key, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [sw addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
-    [scroll addSubview:sw];
-    return y + 44;
-}
-
-- (void)switchChanged:(UISwitch *)sw {
-    NSString *key = objc_getAssociatedObject(sw, &_ccp_assoc_key);
-    [self cc_write:key value:@([sw isOn])];
-    [self cc_postNote:CCP_NOTE_FRAME];
-}
-
-- (void)segChanged:(UISegmentedControl *)seg {
-    [self refreshReplica];
-}
-
-- (CGSize)moduleSizeForGroup {
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSDictionary *dom = [ud persistentDomainForName:CCP_DOMAIN] ?: @{};
-    NSInteger lt = [[dom objectForKey:@"LayoutType"] integerValue];
-    if (lt < 0 || lt > 4) lt = 2;
-    NSValue *v = [_sizeTable objectForKey:@(lt)];
-    if (v) return [v CGSizeValue];
-    switch (lt) {
-        case 0: return CGSizeMake(164.0, 159.0);
-        case 1: return CGSizeMake(164.0, 238.5);
-        case 2: return CGSizeMake(246.0, 159.0);
-        case 3: return CGSizeMake(328.0, 159.0);
-        default:return CGSizeMake(328.0, 238.5);
-    }
-}
-
-// 未设置时的默认组框 (按模块尺寸比例)
 - (CGRect)defaultGroupFrame:(int)g size:(CGSize)ms {
     CGFloat W = ms.width, H = ms.height;
     switch (g) {
-        case 0: return CGRectMake(0.04 * W, 0.26 * H, 0.26 * W, 0.42 * H);   // 专辑
-        case 1: return CGRectMake(0.34 * W, 0.10 * H, 0.60 * W, 0.22 * H);   // 歌词
-        case 2: return CGRectMake(0.34 * W, 0.36 * H, 0.58 * W, 0.16 * H);   // 歌曲
-        case 3: return CGRectMake(0.28 * W, 0.80 * H, 0.44 * W, 0.14 * H);   // 播放按钮组
-        default:return CGRectMake(0.24 * W, 0.62 * H, 0.52 * W, 0.10 * H);   // 进度条组
+        case 0: return CGRectMake(0.04 * W, 0.26 * H, 0.26 * W, 0.42 * H);
+        case 1: return CGRectMake(0.34 * W, 0.10 * H, 0.60 * W, 0.22 * H);
+        case 2: return CGRectMake(0.34 * W, 0.36 * H, 0.58 * W, 0.16 * H);
+        case 3: return CGRectMake(0.28 * W, 0.80 * H, 0.44 * W, 0.14 * H);
+        default:return CGRectMake(0.24 * W, 0.62 * H, 0.52 * W, 0.10 * H);
     }
 }
 
-// 组框(真机坐标) -> 组内各键: 写 realFrames (显示) + frames (存储 = 真机/缩放)
-- (void)ccpSetKey:(NSString *)k real:(CGRect)rr {
-    [_realFrames setObject:[NSValue valueWithCGRect:rr] forKey:k];
-    CGRect st = CGRectMake(rr.origin.x / _sx, rr.origin.y / _sy,
-                           rr.size.width / _sx, rr.size.height / _sy);
-    [_frames setObject:[NSValue valueWithBytes:&st objCType:@encode(CGRect)] forKey:k];
+- (CGSize)sizeForSelectedTier {
+    NSInteger t = [_seg selectedSegmentIndex];
+    return [self sizeForTier:t];
 }
 
-// 组框 -> 组内各键的实际 frame
+// 组框 -> 组内各键 frame (模块点坐标; 进度组三键为容器局部坐标)
 - (void)applyGroupRect:(int)g {
     NSArray *groupKeys = @[
-        @[@"iconFrame"],
-        @[@"titleFrame"],
-        @[@"subTitleFrame"],
-        @[@"leftButtonFrame", @"centerButtonFrame", @"rightButtonFrame"],
-        @[@"progressFrame", @"elapsedTitleFrame", @"durationTitleFrame"],
+        @[TLPXKeyIconFrame],
+        @[TLPXKeyTitleFrame],
+        @[TLPXKeySubTitleFrame],
+        @[TLPXKeyLeftButtonFrame, TLPXKeyCenterButtonFrame, TLPXKeyRightButtonFrame],
+        @[TLPXKeyProgressFrame, TLPXKeyElapsedTitleFrame, TLPXKeyDurationTitleFrame],
     ];
     CGRect gr;
     [[_groupRects objectAtIndex:g] getValue:&gr];
     CGFloat gx = gr.origin.x, gy = gr.origin.y, gw = gr.size.width, gh = gr.size.height;
     if (g == 3) {
-        // 三键一体: 左(28%) 播放(30%) 右(28%), 间隙 6%
-        [self ccpSetKey:groupKeys[3][0] real:CGRectMake(gx,             gy, gw * 0.28, gh)];
-        [self ccpSetKey:groupKeys[3][1] real:CGRectMake(gx + gw * 0.34, gy, gw * 0.30, gh)];
-        [self ccpSetKey:groupKeys[3][2] real:CGRectMake(gx + gw * 0.70, gy, gw * 0.28, gh)];
+        NSArray *vk = groupKeys[3];
+        [self ccpSetKey:vk[0] value:CGRectMake(gx,             gy, gw * 0.28, gh)];
+        [self ccpSetKey:vk[1] value:CGRectMake(gx + gw * 0.34, gy, gw * 0.30, gh)];
+        [self ccpSetKey:vk[2] value:CGRectMake(gx + gw * 0.70, gy, gw * 0.28, gh)];
         return;
     }
     if (g == 4) {
-        // 进度条组: 时间固定 34pt 宽 (不随组宽压扁), 拉伸只作用于进度条
+        // 时间固定 34pt 宽 (不随组宽压扁), 拉伸只作用于进度条
         CGFloat tw = (gw >= 120.0) ? 34.0 : (gw * 0.22);
         CGFloat gap = 4.0;
-        [self ccpSetKey:groupKeys[4][0] real:CGRectMake(gx + tw + gap, gy, MAX(gw - 2 * (tw + gap), 10.0), gh)];
-        [self ccpSetKey:groupKeys[4][1] real:CGRectMake(gx,             gy, tw, gh)];
-        [self ccpSetKey:groupKeys[4][2] real:CGRectMake(gx + gw - tw,   gy, tw, gh)];
+        [self ccpSetKey:groupKeys[4][0] value:CGRectMake(gx + tw + gap, gy, MAX(gw - 2 * (tw + gap), 10.0), gh)];
+        [self ccpSetKey:groupKeys[4][1] value:CGRectMake(gx,             gy, tw, gh)];
+        [self ccpSetKey:groupKeys[4][2] value:CGRectMake(gx + gw - tw,   gy, tw, gh)];
         return;
     }
-    [self ccpSetKey:groupKeys[g][0] real:gr];
+    [self ccpSetKey:groupKeys[g][0] value:gr];
+}
+
+- (void)ccpSetKey:(NSString *)k value:(CGRect)v {
+    [_frames setObject:[NSValue valueWithCGRect:v] forKey:k];
+}
+
+- (void)applyAllGroupRects {
+    for (int g = 0; g < 5; g++) [self applyGroupRect:g];
+}
+
+- (void)switchChanged:(UISwitch *)sw {
+    NSString *key = objc_getAssociatedObject(sw, &_ccp_assoc_key);
+    if ([key isEqualToString:@"__align__"]) {
+        [_playerView setAlignmentOverlayVisible:[sw isOn]];
+        if ([sw isOn]) [self logDiffTable];
+        return;
+    }
+    [self cc_write:key value:@([sw isOn])];
+    [self cc_postNote:TLPXNoteFrameUpdate];
+}
+
+- (void)segChanged:(UISegmentedControl *)seg {
+    // 切换档位: 重设真机实测尺寸 (无该档位实测则兜底+提示), 重建内容视图
+    NSInteger t = [seg selectedSegmentIndex];
+    CGSize sz = [self sizeForTier:t];
+    [_playerView setFrame:CGRectMake(0, 0, sz.width, sz.height)];
+    UIView *card = [_playerView superview];
+    if (card) {
+        double s = MIN(card.bounds.size.width / sz.width, card.bounds.size.height / sz.height);
+        [_playerView setTransform:CGAffineTransformMakeScale((CGFloat)s, (CGFloat)s)];
+        [_playerView setCenter:CGPointMake(card.bounds.size.width / 2.0, card.bounds.size.height / 2.0)];
+    }
+    [self refreshPreview];
 }
 
 - (void)sliderChanged:(UISlider *)sl {
@@ -895,7 +488,7 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     [_groupRects replaceObjectAtIndex:gi withObject:[NSValue valueWithBytes:&gr objCType:@encode(CGRect)]];
     [_touchedGroups addObject:@(gi)];
     [self applyGroupRect:gi];
-    [self refreshReplica];
+    [self refreshPreview];
     _frameDirty = YES;
     [_saveTimer invalidate];
     _saveTimer = [NSTimer timerWithTimeInterval:0.35 target:self selector:@selector(flushFrameSave)
@@ -907,13 +500,12 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     if (!_frameDirty) return;
     _frameDirty = NO;
     NSArray *groupKeys = @[
-        @[@"iconFrame"],
-        @[@"titleFrame"],
-        @[@"subTitleFrame"],
-        @[@"leftButtonFrame", @"centerButtonFrame", @"rightButtonFrame"],
-        @[@"progressFrame", @"elapsedTitleFrame", @"durationTitleFrame"],
+        @[TLPXKeyIconFrame],
+        @[TLPXKeyTitleFrame],
+        @[TLPXKeySubTitleFrame],
+        @[TLPXKeyLeftButtonFrame, TLPXKeyCenterButtonFrame, TLPXKeyRightButtonFrame],
+        @[TLPXKeyProgressFrame, TLPXKeyElapsedTitleFrame, TLPXKeyDurationTitleFrame],
     ];
-    // 只写用户碰过的组 (未碰的组保持运行时自己的默认排布)
     for (int g = 0; g < 5; g++) {
         if (![_touchedGroups containsObject:@(g)]) continue;
         for (NSString *k in groupKeys[g]) {
@@ -933,7 +525,7 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
             [self cc_write:k value:val];
         }
     }
-    [self cc_postNote:CCP_NOTE_FRAME];
+    [self cc_postNote:TLPXNoteFrameUpdate];
 }
 
 - (void)fontChanged:(UISlider *)sl {
@@ -941,18 +533,89 @@ extern UIImage *CCGLoadMaterialThumb(NSString *path);
     double v = [sl value];
     UILabel *vl = objc_getAssociatedObject(sl, &_ccp_assoc_key);
     if ([vl isKindOfClass:[UILabel class]]) [vl setText:[NSString stringWithFormat:@"%.2f", v]];
-    NSArray *fkeys = @[@"titleFont", @"subtitleFont", @"elapsedTitleFont", @"durationTitleFont"];
+    NSArray *fkeys = @[TLPXKeyTitleFont, TLPXKeySubtitleFont, TLPXKeyElapsedTitleFont, TLPXKeyDurationTitleFont];
     [self cc_write:fkeys[i] value:@(v)];
-    [self cc_postNote:CCP_NOTE_FONT];
-    [self refreshReplica];
+    [self cc_postNote:TLPXNoteFontUpdate];
+    [self refreshPreview];
+}
+
+- (NSDictionary *)currentFonts {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSDictionary *dom = [ud persistentDomainForName:TLPXPrefsDomain] ?: @{};
+    return @{TLPXKeyTitleFont: [dom objectForKey:TLPXKeyTitleFont] ?: @10.0,
+             TLPXKeySubtitleFont: [dom objectForKey:TLPXKeySubtitleFont] ?: @10.0,
+             TLPXKeyElapsedTitleFont: [dom objectForKey:TLPXKeyElapsedTitleFont] ?: @10.0,
+             TLPXKeyDurationTitleFont: [dom objectForKey:TLPXKeyDurationTitleFont] ?: @10.0};
+}
+
+// ---- 预览刷新: 引擎 rectMap → 共享视图; 媒体快照同源取数 ----
+- (void)refreshPreview {
+    if (!_playerView) return;
+    NSInteger tier = [_seg selectedSegmentIndex];
+    NSDictionary *rm = [TLPXLayoutEngine rectMapWithSize:[self sizeForSelectedTier]
+                                                   tier:(TLPXTier)tier
+                                                 frames:_frames
+                                            textSamples:nil];
+    [_playerView applyLayoutWithRectMap:rm];
+    [_playerView applyFonts:[self currentFonts]];
+    [_playerView applyMediaSnapshot:[TLPXMediaSnapshot currentSnapshot]];
+}
+
+// ---- 对照表: 引擎 rectMap (预览) vs 真机实际 frame (伴随 tweak 导出) ----
+- (void)logDiffTable {
+    @try {
+        NSDictionary *rf = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Documents/ccreal_frames.plist"] ?: @{};
+        NSInteger tier = [_seg selectedSegmentIndex];
+        NSDictionary *rm = [TLPXLayoutEngine rectMapWithSize:[self sizeForSelectedTier]
+                                                       tier:(TLPXTier)tier
+                                                     frames:_frames
+                                                textSamples:nil];
+        NSArray *pKeys = @[TLPXKeyIconFrame, TLPXKeyTitleFrame, TLPXKeySubTitleFrame, TLPXKeyElapsedTitleFrame,
+                           TLPXKeyDurationTitleFrame, TLPXKeyProgressFrame, TLPXKeyLeftButtonFrame,
+                           TLPXKeyCenterButtonFrame, TLPXKeyRightButtonFrame];
+        NSArray *rKeys = @[@"icon", @"title", @"subtitle", @"elapsed", @"duration",
+                           @"progress", @"left", @"center", @"right"];
+        CCPLog(@"table", [NSString stringWithFormat:@"=== 对照表 (tier %ld) ===", (long)tier]);
+        for (int i = 0; i < 9; i++) {
+            CGRect real = CGRectFromString([rf objectForKey:rKeys[i]] ?: @"");
+            CGRect prev = [[rm objectForKey:pKeys[i]] CGRectValue];
+            double dx = fabs(real.origin.x - prev.origin.x);
+            double dy = fabs(real.origin.y - prev.origin.y);
+            double dw = fabs(real.size.width - prev.size.width);
+            double dh = fabs(real.size.height - prev.size.height);
+            NSString *verdict = (dx <= 0.5 && dy <= 0.5 && dw <= 0.5 && dh <= 0.5) ? @"OK" : @"FAIL(>0.5)";
+            CCPLog(@"table", [NSString stringWithFormat:@"%@ real=%@ prev=%@ d=(%.1f,%.1f,%.1f,%.1f) %@",
+                             pKeys[i], NSStringFromCGRect(real), NSStringFromCGRect(prev), dx, dy, dw, dh, verdict]);
+        }
+        CCPLog(@"table", @"=== 对照表结束 ===");
+    } @catch (id e) {}
+}
+
+- (CGFloat)addSwitchRowIn:(UIScrollView *)scroll y:(CGFloat)y label:(NSString *)label
+                      key:(NSString *)key def:(BOOL)def width:(CGFloat)W {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 6, 180, 24)];
+    [l setText:label];
+    [l setFont:[UIFont systemFontOfSize:14.0]];
+    [scroll addSubview:l];
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSDictionary *dom = [ud persistentDomainForName:TLPXPrefsDomain] ?: @{};
+    BOOL on = def;
+    id v = [dom objectForKey:key];
+    if (v) on = [v boolValue];
+    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(W - 68, y + 3, 51, 31)];
+    [sw setOn:on animated:NO];
+    objc_setAssociatedObject(sw, &_ccp_assoc_key, key, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [sw addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
+    [scroll addSubview:sw];
+    return y + 44;
 }
 
 - (void)cc_write:(NSString *)key value:(id)val {
     @try {
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        NSMutableDictionary *dom = [[ud persistentDomainForName:CCP_DOMAIN] mutableCopy] ?: [NSMutableDictionary dictionary];
+        NSMutableDictionary *dom = [[ud persistentDomainForName:TLPXPrefsDomain] mutableCopy] ?: [NSMutableDictionary dictionary];
         [dom setObject:val forKey:key];
-        [ud setPersistentDomain:dom forName:CCP_DOMAIN];
+        [ud setPersistentDomain:dom forName:TLPXPrefsDomain];
         [ud synchronize];
     } @catch (id e) {}
 }
@@ -971,22 +634,6 @@ static void (*ccp_orig_vdl)(id, SEL) = NULL;
 static BOOL ccp_via_super = NO;
 static int ccp_tries = 0;
 
-// ---------------- 容器实现 ----------------
-@implementation CCPContainerView
-- (void)layoutSubviews {
-    [super layoutSubviews];
-    [self ccpForceLayout];
-}
-- (void)ccpForceLayout {
-    CGRect b = self.bounds;
-    // 安全区: 设置页视图全屏, 状态栏+导航条是半透明压在上面的, header 要让开
-    CGFloat top = [self safeAreaInsets].top;
-    if (top < 20.0) top = 20.0;
-    [_header setFrame:CGRectMake(0, top, b.size.width, _headerH)];
-    [_scroll setFrame:CGRectMake(0, top + _headerH, b.size.width, MAX(b.size.height - top - _headerH, 100))];
-}
-@end
-
 static void CCPBuildOver(id self) {
     @try {
         if (objc_getAssociatedObject(self, &_ccp_assoc_built)) return;
@@ -996,8 +643,6 @@ static void CCPBuildOver(id self) {
         }
         objc_setAssociatedObject(self, &_ccp_assoc_built, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-        // v121: 容器用自定义布局类, header/scroll 几何在每次 layoutSubviews 强制摆放;
-        // 内容尺寸取屏幕绝对值, 不依赖构建时 host 的状态。
         CCPContainerView *container = [[CCPContainerView alloc] initWithFrame:
             CGRectMake(0, 0, [UIScreen mainScreen].bounds.size.width, [UIScreen mainScreen].bounds.size.height)];
         [container setBackgroundColor:[UIColor colorWithWhite:0.94 alpha:1.0]];
@@ -1007,28 +652,7 @@ static void CCPBuildOver(id self) {
         [helper buildOnHost:container];
 
         ((void(*)(id, SEL, id))objc_msgSend)(self, sel_registerName("setView:"), container);
-
-        CCPLog(@"page", [NSString stringWithFormat:@"view replaced; self.view=%@ frame=%@ header=%@ scroll=%@",
-               [[self view] class], NSStringFromCGRect([[self view] frame]),
-               NSStringFromCGRect([container.header frame]), NSStringFromCGRect([container.scroll frame])]);
-
-        // 0.6s 后复查: 视图层级真相 (self.view 是否还是我们的容器, 在不在窗口上)
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            @try {
-                UIView *v = ((UIView *(*)(id, SEL))objc_msgSend)(self, sel_registerName("view"));
-                UIView *sup = [container superview];
-                CCPLog(@"diag", [NSString stringWithFormat:@"t+0.6s self.view=%@ frame=%@ window=%@ "
-                                 @"containerInWindow=%d container.super=%@ header.frame=%@ scroll.frame=%@ scroll.offset=%@ content=%@",
-                                 [v class], NSStringFromCGRect(v.frame), v.window,
-                                 container.window != nil,
-                                 sup ? NSStringFromClass([sup class]) : @"nil",
-                                 NSStringFromCGRect([container.header frame]),
-                                 NSStringFromCGRect([container.scroll frame]),
-                                 NSStringFromCGPoint([container.scroll contentOffset]),
-                                 NSStringFromCGSize([container.scroll contentSize])]);
-            } @catch (id e) {}
-        });
+        CCPLog(@"page", @"v131 view replaced (shared TLPXPlayerContentView)");
     } @catch (id e) {
         CCPLog(@"page", [NSString stringWithFormat:@"build exception %@", e]);
     }
@@ -1085,6 +709,21 @@ static void CCPRetry(void) {
         });
     }
 }
+
+// ---------------- 容器实现 (header/scroll 强制布局 + 安全区) ----------------
+@implementation CCPContainerView
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    [self ccpForceLayout];
+}
+- (void)ccpForceLayout {
+    CGRect b = self.bounds;
+    CGFloat top = [self safeAreaInsets].top;
+    if (top < 20.0) top = 20.0;
+    [_header setFrame:CGRectMake(0, top, b.size.width, _headerH)];
+    [_scroll setFrame:CGRectMake(0, top + _headerH, b.size.width, MAX(b.size.height - top - _headerH, 100))];
+}
+@end
 
 @interface CCPBootstrap : NSObject
 @end
