@@ -15,6 +15,7 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <dlfcn.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
@@ -132,7 +133,7 @@ static void CCPExportNowPlaying(void) {
 static void CCALLApply(id self) {
     @try {
         // 真机模块 bounds 导出 (设置页预览按真实尺寸对齐); 变化时才写
-        NSString *bs = NSStringFromCGRect(self.bounds);
+        NSString *bs = NSStringFromCGRect([(UIView *)self bounds]);
         if (![bs isEqualToString:ccp_lastBoundsStr]) {
             ccp_lastBoundsStr = bs;
             [bs writeToFile:@"/var/mobile/Documents/ccbounds.txt" atomically:YES];
