@@ -141,6 +141,23 @@ static void CCALLApply(id self) {
                 ccp_lastNowFetch = now;
                 CCPExportNowPlaying();
             }
+            // metrics.plist: 真机实测尺寸回写 (bounds 一变就写, 不依赖 en/type/sig,
+            // 避免被后面 npv KVC 异常跳过 —— v131 的 metrics 缺失根因)
+            @try {
+                CGRect wb = [(UIView *)self bounds];
+                UIEdgeInsets si = [(UIView *)self safeAreaInsets];
+                NSMutableDictionary *metrics = [[NSDictionary dictionaryWithContentsOfFile:TLPXMetricsPathRootless]
+                                                mutableCopy] ?: [NSMutableDictionary dictionary];
+                [metrics setObject:@{
+                    @"width": @(wb.size.width),
+                    @"height": @(wb.size.height),
+                    @"scale": @1.0,
+                    @"safeInsets": [NSString stringWithFormat:@"%f,%f,%f,%f",
+                                    si.top, si.bottom, si.left, si.right],
+                } forKey:[NSString stringWithFormat:@"%ld",
+                         (long)[[(id)self valueForKey:@"type"] integerValue]];
+                [metrics writeToFile:TLPXMetricsPathRootless atomically:YES];
+            } @catch (id e) {}
         }
 
         // 真机各元素实际 frame 导出 (设置页预览 WYSIWYG 对齐; npv 内部元素换算到模块坐标系)
@@ -312,22 +329,6 @@ static void CCALLApply(id self) {
         // ---- 两个时间标签字体 ----
         CCALLApplyFont([self valueForKey:@"elapsedTitleLabel"],  @"elapsedTitleFont",  self);
         CCALLApplyFont([self valueForKey:@"durationTitleLabel"], @"durationTitleFont", self);
-
-        // ---- metrics.plist: 真机实测尺寸回写 (预览按档位读取, 不猜尺寸) ----
-        @try {
-            NSMutableDictionary *metrics = [[NSDictionary dictionaryWithContentsOfFile:TLPXMetricsPathRootless]
-                                            mutableCopy] ?: [NSMutableDictionary dictionary];
-            CGRect wb = [(UIView *)self bounds];
-            UIEdgeInsets si = [(UIView *)self safeAreaInsets];
-            [metrics setObject:@{
-                @"width": @(wb.size.width),
-                @"height": @(wb.size.height),
-                @"scale": @1.0,
-                @"safeInsets": [NSString stringWithFormat:@"%f,%f,%f,%f",
-                                si.top, si.bottom, si.left, si.right],
-            } forKey:[NSString stringWithFormat:@"%ld", (long)type]];
-            [metrics writeToFile:TLPXMetricsPathRootless atomically:YES];
-        } @catch (id e) {}
     } @catch (id e) {}
 }
 
