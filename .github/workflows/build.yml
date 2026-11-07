@@ -6,6 +6,7 @@ on:
       - 'main/**'
       - 'main2/**'
       - 'main3/**'
+      - 'Shared/**'
       - 'Makefile'
       - '.github/workflows/build.yml'
   workflow_dispatch:
