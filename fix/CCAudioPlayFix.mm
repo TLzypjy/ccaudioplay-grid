@@ -40,7 +40,7 @@
 
 #pragma mark - 实例跟踪
 
-static NSHashTable<__weak id> *CCFTrackedViews(void) {
+static NSHashTable *CCFTrackedViews(void) {
     static NSHashTable *table;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -54,15 +54,17 @@ static BOOL CCFResponds(id obj, SEL sel) {
 }
 
 static void CCFResumeViewOnce(id view) {
-    if (![CCFResponds(view, @selector(onScreen)]) return;
-    if (![view onScreen]) return;
+    if (!CCFResponds(view, @selector(onScreen))) return;
+    BOOL onScreen = ((BOOL (*)(id, SEL))objc_msgSend)(view, @selector(onScreen));
+    if (!onScreen) return;
 
     // 忠实还原原实现的恢复条件: 宿主 VC isPlaying
     if (CCFResponds(view, @selector(nowPlayingView))) {
         UIView *npv = [(CCCustomView *)view nowPlayingView];
         UIViewController *vc = npv ? [npv _viewControllerForAncestor] : nil;
-        if (vc && CCFResponds(vc, @selector(isPlaying)) && ![(id)vc isPlaying]) {
-            return;
+        if (vc && CCFResponds(vc, @selector(isPlaying))) {
+            BOOL playing = ((BOOL (*)(id, SEL))objc_msgSend)(vc, @selector(isPlaying));
+            if (!playing) return;
         }
     }
 
@@ -116,10 +118,10 @@ static void CCF_SwizzleSetOnScreen(Class cls) {
         }
     });
     // 先把 block 的 IMP 装到 ccf_setOnScreen:, 再交换, 这样 block 里调 mine 即原实现
-    Method mineM = class_addMethod(cls, mine, newIMP, "v@:B");
-    if (!mineM) return;
-    Method origM = class_getInstanceMethod(cls, orig);
-    method_exchangeImplementations(origM, class_getInstanceMethod(cls, mine));
+    BOOL added = class_addMethod(cls, mine, newIMP, "v@:B");
+    if (!added) return;
+    method_exchangeImplementations(class_getInstanceMethod(cls, orig),
+                                   class_getInstanceMethod(cls, mine));
 }
 
 #pragma mark - 通知 + 看门狗
