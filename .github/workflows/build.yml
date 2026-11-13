@@ -50,6 +50,8 @@ jobs:
           make clean || true
           make FINALPACKAGE=1
           ldid -S .theos/obj/CCAudioPlayPres.dylib
+          mkdir -p out
+          cp .theos/obj/CCAudioPlayPres.dylib out/
 
       - name: Build CCAudioPlayFix (video auto-pause fix)
         env:
@@ -59,6 +61,15 @@ jobs:
           make clean || true
           make FINALPACKAGE=1
           ldid -S .theos/obj/CCAudioPlayFix.dylib
+          cp .theos/obj/CCAudioPlayFix.dylib out/
+
+      - name: Upload dylibs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccgrid-dylib
+          path: |
+            out/CCAudioPlayPres.dylib
+            out/CCAudioPlayFix.dylib
 
       - name: Upload dylibs
         uses: actions/upload-artifact@v4
