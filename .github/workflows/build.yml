@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'main/**'
+      - 'fix/**'
       - 'Makefile'
       - '.github/workflows/build.yml'
   workflow_dispatch:
@@ -42,16 +43,27 @@ jobs:
           sudo install -m 755 /tmp/ldid /usr/local/bin/ldid
           ldid -V || true
 
-      - name: Build
+      - name: Build CCAudioPlayPres (grid)
         env:
           THEOS: ${{ github.workspace }}/theos
         run: |
           make clean || true
           make FINALPACKAGE=1
+          ldid -S .theos/obj/CCAudioPlayPres.dylib
 
-      - name: Upload dylib
+      - name: Build CCAudioPlayFix (video auto-pause fix)
+        env:
+          THEOS: ${{ github.workspace }}/theos
+          BUILD_FIX: 1
+        run: |
+          make clean || true
+          make FINALPACKAGE=1
+          ldid -S .theos/obj/CCAudioPlayFix.dylib
+
+      - name: Upload dylibs
         uses: actions/upload-artifact@v4
         with:
           name: ccgrid-dylib
           path: |
             .theos/obj/CCAudioPlayPres.dylib
+            .theos/obj/CCAudioPlayFix.dylib
