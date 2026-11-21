@@ -1,0 +1,271 @@
+/**
+ * CCAudioPlayRandom — 背景素材「随机洗牌轮播」
+ *
+ * 与设置页网格素材库配套:
+ *   设置页把每个槽位(PlayingAsset 播放时 / BackAsset 未播放时)的
+ *   {enabled, items:[视频完整路径]} 写到共享 plist:
+ *     /var/mobile/Library/Preferences/com.thefool.ccaudioplay.random.plist
+ *   本 tweak 注入 SpringBoard, 读取该 plist。当某槽位 enabled 且有 items 时:
+ *     - 洗牌(items 打乱, 一轮播完重新洗牌, 不连续播放同一条)
+ *     - 接管该槽位的 AVQueuePlayer: 关掉原 AVPlayerLooper(它会让单视频无限循环)
+ *     - 用 AVQueuePlayer 的队列推进实现「播完自动切下一个」:
+ *       当前 item 播完 -> 收到 AVPlayerItemDidPlayToEndTime -> 追加下一个 item
+ *       到队尾并 advanceToNextItem -> 循环
+ *
+ * 不改动原 dylib, 只在收到原生素材更新通知后, 对原 tweak 建好的播放器做运行时接管。
+ * 随机开关关闭 / 列表为空时, 完全不介入(原单素材循环行为不变)。
+ */
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <AVFoundation/AVFoundation.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <CoreFoundation/CoreFoundation.h>
+
+#define RNDLog(fmt, ...) NSLog(@"[CCRandom] " fmt, ##__VA_ARGS__)
+
+static NSString * const kRndPlist = @"/var/mobile/Library/Preferences/com.thefool.ccaudioplay.random.plist";
+
+#pragma mark - 共享 plist
+
+static NSDictionary *RNDConfig(void) {
+    @try {
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kRndPlist];
+        return d ?: @{};
+    } @catch (id e) { return @{}; }
+}
+static BOOL RNDEnabled(NSString *slot) {
+    @try { return [[[RNDConfig() objectForKey:slot] objectForKey:@"enabled"] boolValue]; }
+    @catch (id e) { return NO; }
+}
+static NSArray *RNDItems(NSString *slot) {
+    @try {
+        id v = [[RNDConfig() objectForKey:slot] objectForKey:@"items"];
+        return [v isKindOfClass:[NSArray class]] ? v : @[];
+    } @catch (id e) { return @[]; }
+}
+
+#pragma mark - 洗牌队列(不连续重复)
+
+@interface RNDQueue : NSObject
+@property (nonatomic, strong) NSArray *order;      // 当前轮的顺序(路径)
+@property (nonatomic, assign) NSUInteger idx;       // 当前播放下标
+@property (nonatomic, copy) NSString *lastPath;     // 上一条(防止跨轮连播同一条)
+- (NSString *)next;
+@end
+
+@implementation RNDQueue
+- (NSString *)next {
+    NSArray *items = self.order;
+    if (![items count]) return nil;
+    if (self.idx >= [items count]) {
+        // 一轮播完 -> 重新洗牌; 若洗牌后首条==last, 与末条对调避免连续重复
+        NSMutableArray *shuf = [items mutableCopy];
+        for (NSUInteger i = [shuf count] - 1; i > 0; i--) {
+            NSUInteger j = arc4random_uniform((uint32_t)(i + 1));
+            [shuf exchangeObjectAtIndex:i withObjectAtIndex:j];
+        }
+        if ([shuf count] > 1 && [shuf[0] isEqualToString:self.lastPath]) {
+            [shuf exchangeObjectAtIndex:0 withObjectAtIndex:[shuf count] - 1];
+        }
+        self.order = shuf;
+        self.idx = 0;
+    }
+    NSString *p = [self.order objectAtIndex:self.idx];
+    self.idx++;
+    self.lastPath = p;
+    return p;
+}
+@end
+
+#pragma mark - 每个 CCCustomView 的轮播状态
+
+@interface RNDState : NSObject
+@property (nonatomic, weak) AVQueuePlayer *player;
+@property (nonatomic, strong) RNDQueue *queue;      // 播放时(PlayingAsset)
+@property (nonatomic, strong) RNDQueue *backQueue;  // 未播放(BackAsset)
+@property (nonatomic, weak) id observingItem;       // 当前挂了结束通知的 item
+@property (nonatomic, assign) BOOL playingEnabled;
+@property (nonatomic, assign) BOOL backEnabled;
+- (void)itemDidEnd:(NSNotification *)note;
+@end
+@implementation RNDState
+@end
+
+static const char kRNDStateKey = 0;
+static NSHashTable *RNDViews(void) {
+    static NSHashTable *t;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ t = [NSHashTable weakObjectsHashTable]; });
+    return t;
+}
+
+#pragma mark - 播放器接管
+
+// 把 AVPlayerLooper 关掉(否则 item 播完会自动 seek 到 0 循环, 收不到 DidPlayToEnd)
+static void RNDDisableLooper(id looper) {
+    @try {
+        if (looper && [(NSObject *)looper respondsToSelector:@selector(disableLooping)]) {
+            ((void (*)(id, SEL))objc_msgSend)(looper, @selector(disableLooping));
+        }
+    } @catch (id e) {}
+}
+
+// 指定 item 播完后推进到队列下一条
+static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id view) {
+    NSString *path = [queue next];
+    if (!path.length || !player) return;
+    NSURL *url = [NSURL fileURLWithPath:path];
+    if (!url) return;
+    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:url];
+    if (!item) return;
+
+    // 监听本条播完
+    [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItem];
+    st.observingItem = item;
+    [[NSNotificationCenter defaultCenter] addObserver:st
+                                             selector:@selector(itemDidEnd:)
+                                                 name:AVPlayerItemDidPlayToEndTimeNotification
+                                               object:item];
+
+    // AVQueuePlayer: 先把新 item 插到当前 item 之后, 再推进
+    AVPlayerItem *cur = player.currentItem;
+    @try {
+        if (cur) [player insertItem:item afterItem:cur];
+        else [player insertItem:item afterItem:nil];
+        [player advanceToNextItem];
+        if (player.rate == 0.0) [player play];
+    } @catch (id e) {
+        // 兜底: 直接替换
+        @try { [player replaceCurrentItemWithPlayerItem:item]; [player play]; } @catch (id e2) {}
+    }
+    RNDLog(@"play next -> %@", [path lastPathComponent]);
+}
+
+@implementation RNDState (RNDEnd)
+- (void)itemDidEnd:(NSNotification *)note {
+    @try {
+        // 判断是哪个槽位的 item 结束了
+        AVQueuePlayer *pp = self.player;
+        id view = nil;
+        for (id v in [[RNDViews() allObjects] copy]) {
+            if (objc_getAssociatedObject(v, &kRNDStateKey) == self) { view = v; break; }
+        }
+        if (!view) return;
+        AVQueuePlayer *playing = nil, *back = nil;
+        if ([view respondsToSelector:@selector(playingPlayer)]) playing = ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(view, @selector(playingPlayer));
+        if ([view respondsToSelector:@selector(backPlayer)]) back = ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(view, @selector(backPlayer));
+
+        if (pp == playing && self.playingEnabled) {
+            RNDPlayNext(self, playing, self.queue, view);
+        } else if (pp == back && self.backEnabled) {
+            RNDPlayNext(self, back, self.backQueue, view);
+        }
+    } @catch (id e) { RNDLog(@"itemDidEnd exception: %@", e); }
+}
+@end
+
+#pragma mark - 接管入口
+
+// 在原生素材更新完成后调用: 若该槽位随机启用, 关 looper 并起播第一条
+static void RNDApplyForView(id view, BOOL isBack) {
+    @try {
+        RNDState *st = objc_getAssociatedObject(view, &kRNDStateKey);
+        if (!st) { st = [RNDState new]; objc_setAssociatedObject(view, &kRNDStateKey, st, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+
+        NSString *slot = isBack ? @"BackAsset" : @"PlayingAsset";
+        BOOL en = RNDEnabled(slot);
+        NSArray *items = RNDItems(slot);
+        AVQueuePlayer *player = nil;
+        id looper = nil;
+        if (!isBack) {
+            if ([view respondsToSelector:@selector(playingPlayer)]) player = ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(view, @selector(playingPlayer));
+            if ([view respondsToSelector:@selector(playingLayerLooper)]) looper = ((id (*)(id, SEL))objc_msgSend)(view, @selector(playingLayerLooper));
+            st.playingEnabled = en;
+        } else {
+            if ([view respondsToSelector:@selector(backPlayer)]) player = ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(view, @selector(backPlayer));
+            if ([view respondsToSelector:@selector(backLayerLooper)]) looper = ((id (*)(id, SEL))objc_msgSend)(view, @selector(backLayerLooper));
+            st.backEnabled = en;
+        }
+        st.player = player;
+
+        if (!en || ![items count] || !player) {
+            RNDLog(@"slot=%@ random off/empty -> native behavior", slot);
+            return;
+        }
+        // 关掉 looper, 接管队列
+        RNDDisableLooper(looper);
+        RNDQueue *q = isBack ? st.backQueue : st.queue;
+        if (!q) { q = [RNDQueue new]; if (isBack) st.backQueue = q; else st.queue = q; }
+        // 只在刚开始(队列未起播)时装入第一条; 后续由 itemDidEnd 推进
+        if (q.idx == 0 && !st.observingItem) {
+            RNDPlayNext(st, player, q, view);
+        }
+        RNDLog(@"slot=%@ random ON, %lu items", slot, (unsigned long)[items count]);
+    } @catch (id e) { RNDLog(@"apply exception: %@", e); }
+}
+
+#pragma mark - Darwin 通知重载
+
+static void RNDOnConfigChanged(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    @autoreleasepool {
+        NSString *nm = (__bridge NSString *)name;
+        BOOL isBack = [nm rangeOfString:@"BackAsset"].location != NSNotFound;
+        RNDLog(@"config changed: %@", nm);
+        for (id view in [[RNDViews() allObjects] copy]) {
+            RNDState *st = objc_getAssociatedObject(view, &kRNDStateKey);
+            if (st) {
+                // 重新读开关: 关闭则清空队列状态, 恢复原生循环
+                NSString *slot = isBack ? @"BackAsset" : @"PlayingAsset";
+                if (!RNDEnabled(slot) || ![RNDItems(slot) count]) {
+                    if (isBack) { st.backQueue = nil; st.backEnabled = NO; }
+                    else { st.queue = nil; st.playingEnabled = NO; }
+                    [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItem];
+                    st.observingItem = nil;
+                }
+            }
+            RNDApplyForView(view, isBack);
+        }
+    }
+}
+
+#pragma mark - setOnScreen hook (跟踪实例 + 首帧接管)
+
+static void RNDInstallHooks(void) {
+    Class cls = objc_getClass("CCCustomView");
+    if (!cls) { RNDLog(@"CCCustomView not found"); return; }
+
+    // 跟踪实例: hook setOnScreen:, 模块上屏时尝试接管(原生此时已建好播放器)
+    SEL orig = @selector(setOnScreen:);
+    SEL mine = @selector(rnd_setOnScreen:);
+    Method m = class_getInstanceMethod(cls, orig);
+    if (m && !class_getInstanceMethod(cls, mine)) {
+        IMP imp = imp_implementationWithBlock(^void(id self, BOOL on) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(self, mine, on); // 原实现
+            @synchronized (RNDViews()) { [RNDViews() addObject:self]; }
+            if (on) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    RNDApplyForView(self, NO);
+                    RNDApplyForView(self, YES);
+                });
+            }
+        });
+        if (class_addMethod(cls, mine, imp, "v@:B")) {
+            method_exchangeImplementations(class_getInstanceMethod(cls, orig), class_getInstanceMethod(cls, mine));
+        }
+    }
+
+    // 原生素材更新通知: 它重建播放器后我们再接管
+    CFNotificationCenterRef nc = CFNotificationCenterGetDarwinNotifyCenter();
+    CFNotificationCenterAddObserver(nc, NULL, RNDOnConfigChanged,
+        CFSTR("com.thefool.ccaudioplaypres/updatePlayingAssetNotificationt"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    CFNotificationCenterAddObserver(nc, NULL, RNDOnConfigChanged,
+        CFSTR("com.thefool.ccaudioplaypres/updateBackAssetNotificationt"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    RNDLog(@"installed");
+}
+
+__attribute__((constructor))
+static void RNDEntry(void) {
+    @autoreleasepool { RNDInstallHooks(); }
+}

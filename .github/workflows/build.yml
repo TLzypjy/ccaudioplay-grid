@@ -64,6 +64,16 @@ jobs:
           ldid -S .theos/obj/CCAudioPlayFix.dylib
           cp .theos/obj/CCAudioPlayFix.dylib out/
 
+      - name: Build CCAudioPlayRandom (shuffle playback)
+        env:
+          THEOS: ${{ github.workspace }}/theos
+          BUILD_RANDOM: 1
+        run: |
+          make clean || true
+          make FINALPACKAGE=1
+          ldid -S .theos/obj/CCAudioPlayRandom.dylib
+          cp .theos/obj/CCAudioPlayRandom.dylib out/
+
       - name: Upload dylibs
         uses: actions/upload-artifact@v4
         with:
@@ -71,4 +81,5 @@ jobs:
           path: |
             out/CCAudioPlayPres.dylib
             out/CCAudioPlayFix.dylib
+            out/CCAudioPlayRandom.dylib
           if-no-files-found: error
