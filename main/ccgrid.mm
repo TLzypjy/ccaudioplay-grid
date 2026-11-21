@@ -272,6 +272,52 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     } @catch (id e) {}
 }
 
+// ============ 随机轮播共享配置 ============
+// 设置页写、SpringBoard 端 tweak 读。plist 结构:
+//   { "PlayingAsset": {"enabled": BOOL, "items": [完整路径...]},
+//     "BackAsset":    {"enabled": BOOL, "items": [完整路径...]} }
+// 路径放在 /var/mobile/Library/Preferences/ 下, 两个进程(Preferences/SpringBoard)都能读写。
+static NSString *CCGRandomPlistPath(void) {
+    return @"/var/mobile/Library/Preferences/com.thefool.ccaudioplay.random.plist";
+}
+static NSMutableDictionary *CCGRandomLoad(void) {
+    @try {
+        NSString *p = CCGRandomPlistPath();
+        NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:p];
+        return d ?: [NSMutableDictionary dictionary];
+    } @catch (id e) { return [NSMutableDictionary dictionary]; }
+}
+static void CCGRandomSave(NSMutableDictionary *d) {
+    @try { [d writeToFile:CCGRandomPlistPath() atomically:YES]; } @catch (id e) {}
+}
+static NSArray *CCGRandomItems(NSString *slot) {
+    @try {
+        NSDictionary *d = [CCGRandomLoad() objectForKey:slot];
+        return [[d objectForKey:@"items"] isKindOfClass:[NSArray class]] ? [d objectForKey:@"items"] : @[];
+    } @catch (id e) { return @[]; }
+}
+static BOOL CCGRandomEnabled(NSString *slot) {
+    @try { return [[[CCGRandomLoad() objectForKey:slot] objectForKey:@"enabled"] boolValue]; }
+    @catch (id e) { return NO; }
+}
+static void CCGRandomSet(NSString *slot, BOOL enabled, NSArray *items) {
+    @try {
+        NSMutableDictionary *root = CCGRandomLoad();
+        [root setObject:@{ @"enabled": @(enabled), @"items": items ?: @[] } forKey:slot];
+        CCGRandomSave(root);
+    } @catch (id e) {}
+}
+// 当前 cell 属于哪个槽位(PlayingAsset / BackAsset)
+static NSString *CCGRandomSlot(id cell) {
+    @try {
+        if (cell && [cell respondsToSelector:CCG_SEL("Key")]) {
+            id k = CCG_MSG0(cell, CCG_SEL("Key"));
+            if ([k isKindOfClass:[NSString class]]) return (NSString *)k;
+        }
+    } @catch (id e) {}
+    return @"PlayingAsset";
+}
+
 // ============ 网格素材库 ============
 @interface CCGBrowserViewController : UIViewController <UICollectionViewDataSource, UICollectionViewDelegate,
                                                         UIImagePickerControllerDelegate, UINavigationControllerDelegate,
@@ -303,10 +349,16 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     NSMutableSet *_qlPending;        // QuickLook 异步生成中的素材名(防重复请求)
     NSString *_pendSelPath;          // 去抖: 待执行的点选全路径
     NSString *_pendSelName;          // 去抖: 待执行的点选名
+    // 随机轮播多选模式
+    BOOL _randomMode;
+    NSMutableOrderedSet *_randomSelected;  // 选中的完整路径(有序)
+    NSString *_randomSlot;                 // PlayingAsset / BackAsset
 }
 - (instancetype)initWithCell:(id)cell directory:(NSString *)dir isRoot:(BOOL)root;
 - (void)closeTapped;
 - (void)importTapped;
+- (void)randomTapped;
+- (void)setRandomModeFromParent:(BOOL)on selected:(NSMutableOrderedSet *)sel slot:(NSString *)slot;
 - (void)reloadFiles;
 - (void)qlGotThumb:(UIImage *)img forName:(NSString *)name atIp:(NSIndexPath *)ip;
 - (void)genThumbInBackgroundForName:(NSString *)name path:(NSString *)full isVideo:(BOOL)isVideo ip:(NSIndexPath *)ip;
@@ -323,6 +375,8 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
         _thumbs = [NSMutableDictionary dictionary];
         _qlPending = [NSMutableSet set];
         _lastTapPt = CGPointMake(-9999, -9999);
+        _randomSelected = [NSMutableOrderedSet orderedSet];
+        _randomSlot = [CCGRandomSlot(cell) copy];
     }
     return self;
 }
@@ -337,7 +391,9 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     [self navigationItem].leftBarButtonItem = close;
     UIBarButtonItem *imp = [[UIBarButtonItem alloc] initWithTitle:@"导入" style:UIBarButtonItemStylePlain
                                                            target:self action:@selector(importTapped)];
-    [self navigationItem].rightBarButtonItem = imp;
+    UIBarButtonItem *rnd = [[UIBarButtonItem alloc] initWithTitle:@"随机" style:UIBarButtonItemStylePlain
+                                                           target:self action:@selector(randomTapped)];
+    [self navigationItem].rightBarButtonItems = @[imp, rnd];
 
     // 当前选中素材名: 优先用本界面保存过的点选记录(跨会话稳定), 细胞存储仅作参考
     @try {
@@ -492,7 +548,9 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     [_editLP setEnabled:YES];
     UIBarButtonItem *imp = [[UIBarButtonItem alloc] initWithTitle:@"导入" style:UIBarButtonItemStylePlain
                                                            target:self action:@selector(importTapped)];
-    [self navigationItem].rightBarButtonItem = imp;
+    UIBarButtonItem *rnd = [[UIBarButtonItem alloc] initWithTitle:@"随机" style:UIBarButtonItemStylePlain
+                                                           target:self action:@selector(randomTapped)];
+    [self navigationItem].rightBarButtonItems = @[imp, rnd];
     [self setTitle:[NSString stringWithFormat:@"素材库 (%lu)", (unsigned long)[_files count]]];
     [_cv reloadData];
 }
@@ -744,33 +802,59 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     objc_setAssociatedObject(ng, &kCCGNameKey, name, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     // 选中圆点(目录/编辑态不显示)
-    // 蓝点以用户在本界面实际点选的素材为准(原始细胞存储名格式不可控);
-    // 首次进入时用细胞里读到的名字兜底匹配
+    // 随机模式: 勾号表示该素材已加入随机列表; 普通模式: 蓝点表示当前单选素材
     if (!_editMode && !isDir) {
-        NSString *base = [name stringByDeletingPathExtension];
-        BOOL on = NO;
-        if (_pickedName.length) {
-            on = [[[_pickedName lastPathComponent] stringByDeletingPathExtension] isEqualToString:base];
-        } else if (_selName.length) {
-            on = [[[_selName lastPathComponent] stringByDeletingPathExtension] isEqualToString:base];
-        }
          UIView *dot = [[UIView alloc] initWithFrame:CCGRect(6 + cardW / 2 - 9, imgH + 35, 18, 18)];
          [dot.layer setCornerRadius:9.0];
         [dot.layer setMasksToBounds:YES];
-        [dot setBackgroundColor:on ? [UIColor systemBlueColor] : [UIColor colorWithWhite:0.80 alpha:1.0]];
+        if (_randomMode) {
+            NSString *ext = [[name pathExtension] lowercaseString];
+            BOOL checked = [CCGVideoExts() containsObject:ext] && [_randomSelected containsObject:full];
+            [dot setBackgroundColor:checked ? [UIColor systemGreenColor] : [UIColor colorWithWhite:0.80 alpha:1.0]];
+            if (checked) {
+                UILabel *tick = [[UILabel alloc] initWithFrame:CCGRect(0, -2, 18, 18)];
+                [tick setText:@"✓"]; [tick setTextAlignment:NSTextAlignmentCenter];
+                [tick setTextColor:[UIColor whiteColor]]; [tick setFont:[UIFont boldSystemFontOfSize:13]];
+                [dot addSubview:tick];
+            }
+        } else {
+            NSString *base = [name stringByDeletingPathExtension];
+            BOOL on = NO;
+            if (_pickedName.length) {
+                on = [[[_pickedName lastPathComponent] stringByDeletingPathExtension] isEqualToString:base];
+            } else if (_selName.length) {
+                on = [[[_selName lastPathComponent] stringByDeletingPathExtension] isEqualToString:base];
+            }
+            [dot setBackgroundColor:on ? [UIColor systemBlueColor] : [UIColor colorWithWhite:0.80 alpha:1.0]];
+        }
         [[cell contentView] addSubview:dot];
     }
     return cell;
 }
 
 - (void)collectionView:(UICollectionView *)cv didSelectItemAtIndexPath:(NSIndexPath *)ip {
-    if (_editMode) return;
     NSInteger row = [ip item];
     if (row >= (NSInteger)[_files count]) return;
     NSString *name = [_files objectAtIndex:row];
     NSString *full = [_dir stringByAppendingPathComponent:name];
     BOOL isDir = NO;
     [[NSFileManager defaultManager] fileExistsAtPath:full isDirectory:&isDir];
+
+    // 随机多选模式: 只勾选视频文件, 目录仍可进入浏览
+    if (_randomMode) {
+        if (isDir) {
+            CCGBrowserViewController *sub = [[CCGBrowserViewController alloc] initWithCell:_cell directory:full isRoot:NO];
+            // 子页面继承随机模式与已选集合
+            [sub setRandomModeFromParent:_randomMode selected:_randomSelected slot:_randomSlot];
+            [[self navigationController] pushViewController:sub animated:YES];
+            return;
+        }
+        NSString *ext = [[name pathExtension] lowercaseString];
+        if ([CCGVideoExts() containsObject:ext]) [self randomToggleItem:name];
+        return;
+    }
+
+    if (_editMode) return;
 
     if (isDir) {
         // 子目录: 推入新浏览器(同一 delegate)
@@ -1003,6 +1087,96 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     UIAlertController *al = [UIAlertController alertControllerWithTitle:@"提示" message:msg preferredStyle:UIAlertControllerStyleAlert];
     [al addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:al animated:YES completion:nil];
+}
+
+// ============ 随机轮播多选 ============
+static void CCGPostDarwin(NSString *name) {
+    @try {
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                             (__bridge CFStringRef)name, NULL, NULL, YES);
+    } @catch (id e) {}
+}
+
+- (void)setRandomModeFromParent:(BOOL)on selected:(NSMutableOrderedSet *)sel slot:(NSString *)slot {
+    _randomMode = on;
+    if (sel) _randomSelected = [sel mutableCopy];
+    if (slot) _randomSlot = [slot copy];
+    if (_randomMode) {
+        [_editLP setEnabled:NO];
+        [self setTitle:[NSString stringWithFormat:@"随机播放 (%lu)", (unsigned long)[_randomSelected count]]];
+        UIBarButtonItem *cancel = [[UIBarButtonItem alloc] initWithTitle:@"取消" style:UIBarButtonItemStylePlain
+                                                                  target:self action:@selector(randomCancelTapped)];
+        UIBarButtonItem *done = [[UIBarButtonItem alloc] initWithTitle:@"完成" style:UIBarButtonItemStylePlain
+                                                                target:self action:@selector(randomDoneTapped)];
+        [self navigationItem].leftBarButtonItem = cancel;
+        [self navigationItem].rightBarButtonItems = @[done];
+    }
+}
+
+- (void)randomTapped {
+    // 进入随机多选模式: 载入该槽位已保存的列表作为初始勾选
+    [_randomSelected removeAllObjects];
+    for (NSString *p in CCGRandomItems(_randomSlot)) {
+        if ([p isKindOfClass:[NSString class]] && [[NSFileManager defaultManager] fileExistsAtPath:p]) {
+            [_randomSelected addObject:p];
+        }
+    }
+    _randomMode = YES;
+    [_editLP setEnabled:NO];
+    [self stopJiggling];
+    [self setTitle:[NSString stringWithFormat:@"随机播放 (%lu)", (unsigned long)[_randomSelected count]]];
+    UIBarButtonItem *cancel = [[UIBarButtonItem alloc] initWithTitle:@"取消" style:UIBarButtonItemStylePlain
+                                                              target:self action:@selector(randomCancelTapped)];
+    UIBarButtonItem *done = [[UIBarButtonItem alloc] initWithTitle:@"完成" style:UIBarButtonItemStylePlain
+                                                            target:self action:@selector(randomDoneTapped)];
+    [self navigationItem].leftBarButtonItem = cancel;
+    [self navigationItem].rightBarButtonItems = @[done];
+    [_cv reloadData];
+}
+
+- (void)randomCancelTapped {
+    _randomMode = NO;
+    [_editLP setEnabled:YES];
+    [_randomSelected removeAllObjects];
+    // 恢复工具栏
+    UIBarButtonItem *close = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain
+                                                             target:self action:@selector(closeTapped)];
+    UIBarButtonItem *imp = [[UIBarButtonItem alloc] initWithTitle:@"导入" style:UIBarButtonItemStylePlain
+                                                           target:self action:@selector(importTapped)];
+    UIBarButtonItem *rnd = [[UIBarButtonItem alloc] initWithTitle:@"随机" style:UIBarButtonItemStylePlain
+                                                           target:self action:@selector(randomTapped)];
+    [self navigationItem].leftBarButtonItem = close;
+    [self navigationItem].rightBarButtonItems = @[imp, rnd];
+    [self setTitle:[NSString stringWithFormat:@"素材库 (%lu)", (unsigned long)[_files count]]];
+    [_cv reloadData];
+}
+
+- (void)randomDoneTapped {
+    // 保存列表 + 开启开关, 通知 SpringBoard 重载
+    NSArray *items = [_randomSelected array];
+    if ([items count] == 0) {
+        // 空列表 = 停用随机播放
+        CCGRandomSet(_randomSlot, NO, @[]);
+    } else {
+        CCGRandomSet(_randomSlot, YES, items);
+    }
+    NSString *notify = [_randomSlot isEqualToString:@"BackAsset"]
+        ? @"com.thefool.ccaudioplaypres/updateBackAssetNotificationt"
+        : @"com.thefool.ccaudioplaypres/updatePlayingAssetNotificationt";
+    CCGPostDarwin(notify);
+    [self randomCancelTapped];  // 退出回普通模式
+}
+
+// 随机模式下点素材: 切换勾选
+- (void)randomToggleItem:(NSString *)name {
+    NSString *full = [_dir stringByAppendingPathComponent:name];
+    if ([_randomSelected containsObject:full]) {
+        [_randomSelected removeObject:full];
+    } else {
+        [_randomSelected addObject:full];
+    }
+    [self setTitle:[NSString stringWithFormat:@"随机播放 (%lu)", (unsigned long)[_randomSelected count]]];
+    [_cv reloadData];
 }
 
 // ---------- 关闭 ----------
