@@ -87,8 +87,8 @@ static NSArray *RNDItems(NSString *slot) {
 @property (nonatomic, weak) id observingItem;       // 当前挂了结束通知的 item
 @property (nonatomic, assign) BOOL playingEnabled;
 @property (nonatomic, assign) BOOL backEnabled;
-- (void)itemDidEnd:(NSNotification *)note;
 @end
+// itemDidEnd: 在下方分类中实现; 作为 NSNotificationCenter 的 selector 运行时解析, 无需在此声明
 @implementation RNDState
 @end
 
