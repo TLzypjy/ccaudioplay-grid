@@ -23,7 +23,8 @@ jobs:
       - name: Install host dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential fakeroot rsync curl perl zip git libxml2 libtinfo6 unzip
+          sudo apt-get install -y build-essential fakeroot rsync curl perl zip git libxml2-dev libtinfo6 unzip || \
+            sudo apt-get install -y build-essential fakeroot rsync curl perl zip git libtinfo6 unzip
           sudo update-alternatives --set fakeroot /usr/bin/fakeroot-sysv || true
 
       - name: Set up Theos
@@ -70,11 +71,4 @@ jobs:
           path: |
             out/CCAudioPlayPres.dylib
             out/CCAudioPlayFix.dylib
-
-      - name: Upload dylibs
-        uses: actions/upload-artifact@v4
-        with:
-          name: ccgrid-dylib
-          path: |
-            .theos/obj/CCAudioPlayPres.dylib
-            .theos/obj/CCAudioPlayFix.dylib
+          if-no-files-found: error
