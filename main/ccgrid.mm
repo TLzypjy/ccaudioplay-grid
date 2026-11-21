@@ -274,8 +274,10 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
 
 // ============ 随机轮播共享配置 ============
 // 设置页写、SpringBoard 端 tweak 读。plist 结构:
-//   { "PlayingAsset": {"enabled": BOOL, "items": [完整路径...]},
-//     "BackAsset":    {"enabled": BOOL, "items": [完整路径...]} }
+//   { "PlayingAsset": {"enabled": BOOL, "mode": "fixed|order|random", "items": [完整路径...]},
+//     "BackAsset":    {...} }
+//   enabled: 是否启用多素材轮播(随机按钮完成时置 YES, 空列表置 NO)
+//   mode: fixed=固定单素材(原行为) / order=顺序轮播 / random=洗牌轮播
 // 路径放在 /var/mobile/Library/Preferences/ 下, 两个进程(Preferences/SpringBoard)都能读写。
 static NSString *CCGRandomPlistPath(void) {
     return @"/var/mobile/Library/Preferences/com.thefool.ccaudioplay.random.plist";
@@ -300,10 +302,20 @@ static BOOL CCGRandomEnabled(NSString *slot) {
     @try { return [[[CCGRandomLoad() objectForKey:slot] objectForKey:@"enabled"] boolValue]; }
     @catch (id e) { return NO; }
 }
-static void CCGRandomSet(NSString *slot, BOOL enabled, NSArray *items) {
+static NSString *CCGRandomMode(NSString *slot) {
+    @try {
+        NSString *m = [[[CCGRandomLoad() objectForKey:slot] objectForKey:@"mode"] stringValue];
+        return (m.length > 0) ? m : @"random";
+    } @catch (id e) { return @"random"; }
+}
+static void CCGRandomSet(NSString *slot, BOOL enabled, NSArray *items, NSString *mode) {
     @try {
         NSMutableDictionary *root = CCGRandomLoad();
-        [root setObject:@{ @"enabled": @(enabled), @"items": items ?: @[] } forKey:slot];
+        NSMutableDictionary *slotDict = [[root objectForKey:slot] mutableCopy] ?: [NSMutableDictionary dictionary];
+        [slotDict setObject:@(enabled) forKey:@"enabled"];
+        [slotDict setObject:items ?: @[] forKey:@"items"];
+        [slotDict setObject:(mode ?: @"random") forKey:@"mode"];
+        [root setObject:slotDict forKey:slot];
         CCGRandomSave(root);
     } @catch (id e) {}
 }
@@ -358,6 +370,7 @@ static NSString *CCGRandomSlot(id cell) {
 - (void)closeTapped;
 - (void)importTapped;
 - (void)randomTapped;
+- (void)modeTapped;
 - (void)setRandomModeFromParent:(BOOL)on selected:(NSMutableOrderedSet *)sel slot:(NSString *)slot;
 - (void)reloadFiles;
 - (void)qlGotThumb:(UIImage *)img forName:(NSString *)name atIp:(NSIndexPath *)ip;
@@ -389,11 +402,7 @@ static NSString *CCGRandomSlot(id cell) {
     UIBarButtonItem *close = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain
                                                              target:self action:@selector(closeTapped)];
     [self navigationItem].leftBarButtonItem = close;
-    UIBarButtonItem *imp = [[UIBarButtonItem alloc] initWithTitle:@"导入" style:UIBarButtonItemStylePlain
-                                                           target:self action:@selector(importTapped)];
-    UIBarButtonItem *rnd = [[UIBarButtonItem alloc] initWithTitle:@"随机" style:UIBarButtonItemStylePlain
-                                                           target:self action:@selector(randomTapped)];
-    [self navigationItem].rightBarButtonItems = @[imp, rnd];
+    [self buildNormalToolbar];
 
     // 当前选中素材名: 优先用本界面保存过的点选记录(跨会话稳定), 细胞存储仅作参考
     @try {
@@ -546,11 +555,7 @@ static NSString *CCGRandomSlot(id cell) {
     [self stopJiggling];
     _editMode = NO;
     [_editLP setEnabled:YES];
-    UIBarButtonItem *imp = [[UIBarButtonItem alloc] initWithTitle:@"导入" style:UIBarButtonItemStylePlain
-                                                           target:self action:@selector(importTapped)];
-    UIBarButtonItem *rnd = [[UIBarButtonItem alloc] initWithTitle:@"随机" style:UIBarButtonItemStylePlain
-                                                           target:self action:@selector(randomTapped)];
-    [self navigationItem].rightBarButtonItems = @[imp, rnd];
+    [self buildNormalToolbar];
     [self setTitle:[NSString stringWithFormat:@"素材库 (%lu)", (unsigned long)[_files count]]];
     [_cv reloadData];
 }
@@ -1089,6 +1094,50 @@ static NSString *CCGRandomSlot(id cell) {
     [self presentViewController:al animated:YES completion:nil];
 }
 
+// ============ 工具栏(导入/随机/显示模式) ============
+static NSString *CCGModeLabel(NSString *mode) {
+    if ([mode isEqualToString:@"fixed"]) return @"固定";
+    if ([mode isEqualToString:@"order"]) return @"顺序";
+    return @"随机";
+}
+
+- (void)buildNormalToolbar {
+    UIBarButtonItem *close = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain
+                                                             target:self action:@selector(closeTapped)];
+    UIBarButtonItem *imp = [[UIBarButtonItem alloc] initWithTitle:@"导入" style:UIBarButtonItemStylePlain
+                                                           target:self action:@selector(importTapped)];
+    UIBarButtonItem *rnd = [[UIBarButtonItem alloc] initWithTitle:@"随机" style:UIBarButtonItemStylePlain
+                                                           target:self action:@selector(randomTapped)];
+    NSString *mlabel = [NSString stringWithFormat:@"%@ ▾", CCGModeLabel(CCGRandomMode(_randomSlot))];
+    UIBarButtonItem *mode = [[UIBarButtonItem alloc] initWithTitle:mlabel style:UIBarButtonItemStylePlain
+                                                            target:self action:@selector(modeTapped)];
+    [self navigationItem].leftBarButtonItem = close;
+    [self navigationItem].rightBarButtonItems = @[imp, rnd, mode];
+}
+
+// 显示模式下拉框(仿灵动岛美化): 固定 / 顺序 / 随机
+- (void)modeTapped {
+    UIAlertControllerStyle style = ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad)
+        ? UIAlertControllerStyleAlert : UIAlertControllerStyleActionSheet;
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"显示模式" message:nil preferredStyle:style];
+    NSArray *modes = @[@"fixed", @"order", @"random"];
+    NSArray *labels = @[@"固定显示", @"顺序显示", @"随机显示"];
+    NSString *cur = CCGRandomMode(_randomSlot);
+    for (NSUInteger i = 0; i < [modes count]; i++) {
+        NSString *m = [modes objectAtIndex:i];
+        NSString *title = [[labels objectAtIndex:i] stringByAppendingString:[m isEqualToString:cur] ? @"  ✓" : @""];
+        UIAlertAction *a = [UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *ac) {
+            // 若启用中(items 非空)则写回并保持 enabled; 否则只记 mode(待选素材后生效)
+            NSArray *items = CCGRandomItems(_randomSlot);
+            CCGRandomSet(_randomSlot, [items count] > 0, items, m);
+            [self buildNormalToolbar];
+        }];
+        [sheet addAction:a];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
 // ============ 随机轮播多选 ============
 static void CCGPostDarwin(NSString *name) {
     @try {
@@ -1139,14 +1188,7 @@ static void CCGPostDarwin(NSString *name) {
     [_editLP setEnabled:YES];
     [_randomSelected removeAllObjects];
     // 恢复工具栏
-    UIBarButtonItem *close = [[UIBarButtonItem alloc] initWithTitle:@"关闭" style:UIBarButtonItemStylePlain
-                                                             target:self action:@selector(closeTapped)];
-    UIBarButtonItem *imp = [[UIBarButtonItem alloc] initWithTitle:@"导入" style:UIBarButtonItemStylePlain
-                                                           target:self action:@selector(importTapped)];
-    UIBarButtonItem *rnd = [[UIBarButtonItem alloc] initWithTitle:@"随机" style:UIBarButtonItemStylePlain
-                                                           target:self action:@selector(randomTapped)];
-    [self navigationItem].leftBarButtonItem = close;
-    [self navigationItem].rightBarButtonItems = @[imp, rnd];
+    [self buildNormalToolbar];
     [self setTitle:[NSString stringWithFormat:@"素材库 (%lu)", (unsigned long)[_files count]]];
     [_cv reloadData];
 }
@@ -1155,10 +1197,10 @@ static void CCGPostDarwin(NSString *name) {
     // 保存列表 + 开启开关, 通知 SpringBoard 重载
     NSArray *items = [_randomSelected array];
     if ([items count] == 0) {
-        // 空列表 = 停用随机播放
-        CCGRandomSet(_randomSlot, NO, @[]);
+        // 空列表 = 停用多素材轮播(回到固定单素材)
+        CCGRandomSet(_randomSlot, NO, @[], CCGRandomMode(_randomSlot));
     } else {
-        CCGRandomSet(_randomSlot, YES, items);
+        CCGRandomSet(_randomSlot, YES, items, CCGRandomMode(_randomSlot));
     }
     NSString *notify = [_randomSlot isEqualToString:@"BackAsset"]
         ? @"com.thefool.ccaudioplaypres/updateBackAssetNotificationt"
