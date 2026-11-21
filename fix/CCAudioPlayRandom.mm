@@ -34,9 +34,21 @@ static NSDictionary *RNDConfig(void) {
         return d ?: @{};
     } @catch (id e) { return @{}; }
 }
-static BOOL RNDEnabled(NSString *slot) {
-    @try { return [[[RNDConfig() objectForKey:slot] objectForKey:@"enabled"] boolValue]; }
-    @catch (id e) { return NO; }
+static NSString *RNDMode(NSString *slot) {
+    @try {
+        NSString *m = [[[RNDConfig() objectForKey:slot] objectForKey:@"mode"] stringValue];
+        return m.length ? m : @"random";
+    } @catch (id e) { return @"random"; }
+}
+// 只有启用且模式非 fixed 时才接管播放器(fixed = 原单素材循环行为)
+static BOOL RNDActive(NSString *slot) {
+    @try {
+        NSDictionary *d = [RNDConfig() objectForKey:slot];
+        BOOL en = [[d objectForKey:@"enabled"] boolValue];
+        NSString *m = [[d objectForKey:@"mode"] stringValue];
+        BOOL fixed = [m isEqualToString:@"fixed"];
+        return en && !fixed;
+    } @catch (id e) { return NO; }
 }
 static NSArray *RNDItems(NSString *slot) {
     @try {
@@ -51,25 +63,40 @@ static NSArray *RNDItems(NSString *slot) {
 @property (nonatomic, strong) NSArray *order;      // 当前轮的顺序(路径)
 @property (nonatomic, assign) NSUInteger idx;       // 当前播放下标
 @property (nonatomic, copy) NSString *lastPath;     // 上一条(防止跨轮连播同一条)
+@property (nonatomic, copy) NSString *mode;         // "order" 顺序 / "random" 洗牌
+- (instancetype)initWithItems:(NSArray *)items mode:(NSString *)mode;
 - (NSString *)next;
 @end
 
 @implementation RNDQueue
+- (instancetype)initWithItems:(NSArray *)items mode:(NSString *)m {
+    if ((self = [super init])) {
+        _order = [items copy] ?: @[];
+        _mode = [m copy] ?: @"random";
+        _idx = 0;
+    }
+    return self;
+}
 - (NSString *)next {
     NSArray *items = self.order;
     if (![items count]) return nil;
     if (self.idx >= [items count]) {
-        // 一轮播完 -> 重新洗牌; 若洗牌后首条==last, 与末条对调避免连续重复
-        NSMutableArray *shuf = [items mutableCopy];
-        for (NSUInteger i = [shuf count] - 1; i > 0; i--) {
-            NSUInteger j = arc4random_uniform((uint32_t)(i + 1));
-            [shuf exchangeObjectAtIndex:i withObjectAtIndex:j];
+        if ([self.mode isEqualToString:@"order"]) {
+            // 顺序模式: 一轮播完从头再来(不打乱)
+            self.idx = 0;
+        } else {
+            // 洗牌模式: 一轮播完重新洗牌; 若首条==last, 与末条对调避免连续重复
+            NSMutableArray *shuf = [items mutableCopy];
+            for (NSUInteger i = [shuf count] - 1; i > 0; i--) {
+                NSUInteger j = arc4random_uniform((uint32_t)(i + 1));
+                [shuf exchangeObjectAtIndex:i withObjectAtIndex:j];
+            }
+            if ([shuf count] > 1 && [shuf[0] isEqualToString:self.lastPath]) {
+                [shuf exchangeObjectAtIndex:0 withObjectAtIndex:[shuf count] - 1];
+            }
+            self.order = shuf;
+            self.idx = 0;
         }
-        if ([shuf count] > 1 && [shuf[0] isEqualToString:self.lastPath]) {
-            [shuf exchangeObjectAtIndex:0 withObjectAtIndex:[shuf count] - 1];
-        }
-        self.order = shuf;
-        self.idx = 0;
     }
     NSString *p = [self.order objectAtIndex:self.idx];
     self.idx++;
@@ -174,34 +201,40 @@ static void RNDApplyForView(id view, BOOL isBack) {
         if (!st) { st = [RNDState new]; objc_setAssociatedObject(view, &kRNDStateKey, st, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
 
         NSString *slot = isBack ? @"BackAsset" : @"PlayingAsset";
-        BOOL en = RNDEnabled(slot);
+        BOOL active = RNDActive(slot);
+        NSString *mode = RNDMode(slot);
         NSArray *items = RNDItems(slot);
         AVQueuePlayer *player = nil;
         id looper = nil;
         if (!isBack) {
             if ([view respondsToSelector:@selector(playingPlayer)]) player = ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(view, @selector(playingPlayer));
             if ([view respondsToSelector:@selector(playingLayerLooper)]) looper = ((id (*)(id, SEL))objc_msgSend)(view, @selector(playingLayerLooper));
-            st.playingEnabled = en;
+            st.playingEnabled = active;
         } else {
             if ([view respondsToSelector:@selector(backPlayer)]) player = ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(view, @selector(backPlayer));
             if ([view respondsToSelector:@selector(backLayerLooper)]) looper = ((id (*)(id, SEL))objc_msgSend)(view, @selector(backLayerLooper));
-            st.backEnabled = en;
+            st.backEnabled = active;
         }
         st.player = player;
 
-        if (!en || ![items count] || !player) {
-            RNDLog(@"slot=%@ random off/empty -> native behavior", slot);
+        if (!active || ![items count] || !player) {
+            RNDLog(@"slot=%@ inactive(fixed/off/empty) -> native behavior", slot);
             return;
         }
         // 关掉 looper, 接管队列
         RNDDisableLooper(looper);
         RNDQueue *q = isBack ? st.backQueue : st.queue;
-        if (!q) { q = [RNDQueue new]; if (isBack) st.backQueue = q; else st.queue = q; }
-        // 只在刚开始(队列未起播)时装入第一条; 后续由 itemDidEnd 推进
-        if (q.idx == 0 && !st.observingItem) {
+        // 模式或素材列表变化 -> 重建队列, 从头播
+        if (!q || ![q.mode isEqualToString:mode] || ![q.order isEqualToArray:items]) {
+            q = [[RNDQueue alloc] initWithItems:items mode:mode];
+            if (isBack) st.backQueue = q; else st.queue = q;
+            [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItem];
+            st.observingItem = nil;
+        }
+        if (!st.observingItem) {
             RNDPlayNext(st, player, q, view);
         }
-        RNDLog(@"slot=%@ random ON, %lu items", slot, (unsigned long)[items count]);
+        RNDLog(@"slot=%@ mode=%@ active, %lu items", slot, mode, (unsigned long)[items count]);
     } @catch (id e) { RNDLog(@"apply exception: %@", e); }
 }
 
@@ -217,7 +250,7 @@ static void RNDOnConfigChanged(CFNotificationCenterRef center, void *observer, C
             if (st) {
                 // 重新读开关: 关闭则清空队列状态, 恢复原生循环
                 NSString *slot = isBack ? @"BackAsset" : @"PlayingAsset";
-                if (!RNDEnabled(slot) || ![RNDItems(slot) count]) {
+                if (!RNDActive(slot) || ![RNDItems(slot) count]) {
                     if (isBack) { st.backQueue = nil; st.backEnabled = NO; }
                     else { st.queue = nil; st.playingEnabled = NO; }
                     [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItem];
