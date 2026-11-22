@@ -272,6 +272,20 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     } @catch (id e) {}
 }
 
+// 把当前槽位选中的素材完整路径同步进共享 plist("picked" 字段)。
+// 固定模式下 SpringBoard 端 tweak 靠它知道用户选了哪条素材
+// (roothide 下原生背景槽播放器不重建, 必须由我们自建播放器换片)。
+static void CCGSetPickedPath(NSString *slot, NSString *path) {
+    @try {
+        NSMutableDictionary *root = CCGRandomLoad();
+        NSMutableDictionary *slotDict = [[root objectForKey:slot] mutableCopy] ?: [NSMutableDictionary dictionary];
+        if (path.length) [slotDict setObject:path forKey:@"picked"];
+        else [slotDict removeObjectForKey:@"picked"];
+        [root setObject:slotDict forKey:slot];
+        CCGRandomSave(root);
+    } @catch (id e) {}
+}
+
 // ============ 随机轮播共享配置 ============
 // 设置页写、SpringBoard 端 tweak 读。plist 结构:
 //   { "PlayingAsset": {"enabled": BOOL, "mode": "fixed|order|random", "items": [完整路径...]},
@@ -876,6 +890,7 @@ static NSString *CCGRandomSlot(id cell) {
         _pickedName = name;
         _selName = name;
         CCGSavePicked(_dir, name);   // 持久化, 重进素材库蓝点仍在
+        CCGSetPickedPath(_randomSlot, full);   // 同步给 SpringBoard tweak(固定模式换片用)
         [_cv reloadData];   // 圆点立即切换
 
         _pendSelPath = [full copy];
@@ -910,7 +925,7 @@ static NSString *CCGRandomSlot(id cell) {
         NSString *thumbCache = [self thumbCachePathForFull:full];
         [[NSFileManager defaultManager] removeItemAtPath:full error:nil];
         [_thumbs removeObjectForKey:name];
-        if (_pickedName && [_pickedName isEqualToString:name]) { _pickedName = nil; CCGSavePicked(_dir, nil); }
+        if (_pickedName && [_pickedName isEqualToString:name]) { _pickedName = nil; CCGSavePicked(_dir, nil); CCGSetPickedPath(_randomSlot, nil); }
         if (thumbCache) [[NSFileManager defaultManager] removeItemAtPath:thumbCache error:nil];
         [self reloadFiles];   // 立即刷新列表
         id d = _cell;
@@ -1047,7 +1062,7 @@ static NSString *CCGRandomSlot(id cell) {
     NSError *err = nil;
     if ([fm moveItemAtPath:src toPath:dst error:&err]) {
         [_thumbs removeObjectForKey:old];
-        if (_pickedName && [_pickedName isEqualToString:old]) { _pickedName = newName; CCGSavePicked(_dir, newName); }
+        if (_pickedName && [_pickedName isEqualToString:old]) { _pickedName = newName; CCGSavePicked(_dir, newName); CCGSetPickedPath(_randomSlot, dst); }
         // 同步移动缩略图缓存(同文件 mtime 不变, 仅路径键变化)
         NSString *oldCache = [self thumbCachePathForFull:src];
         NSString *newCache = [self thumbCachePathForFull:dst];
