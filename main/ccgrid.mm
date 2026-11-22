@@ -338,6 +338,23 @@ static void CCGSetPickedPath(NSString *slot, NSString *path) {
 static void CCGSaveSelected(NSString *slot, NSMutableOrderedSet *sel) {
     @try { CCGRandomSet(slot, [sel count] > 0, [sel array], CCGRandomMode(slot)); } @catch (id e) {}
 }
+// 递归收集目录下所有视频文件完整路径(全选用)
+static void CCGCollectVideos(NSString *dir, NSMutableOrderedSet *out) {
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        for (NSString *n in [fm contentsOfDirectoryAtPath:dir error:nil]) {
+            if ([n hasPrefix:@"."]) continue;
+            NSString *full = [dir stringByAppendingPathComponent:n];
+            BOOL isDir = NO;
+            if ([fm fileExistsAtPath:full isDirectory:&isDir] && isDir) {
+                CCGCollectVideos(full, out);
+            } else {
+                NSString *ext = [[n pathExtension] lowercaseString];
+                if ([CCGVideoExts() containsObject:ext]) [out addObject:full];
+            }
+        }
+    } @catch (id e) {}
+}
 // 发原生 Darwin 通知(SpringBoard 端 tweak 收到后重载配置)
 static void CCGPostDarwin(NSString *name) {
     @try {
@@ -398,6 +415,7 @@ static NSString *CCGRandomSlot(id cell) {
 - (void)modeTapped;
 - (void)modeChosen:(id)sender;
 - (void)modeDropdownHide;
+- (void)selectAllTapped;
 - (void)inheritRandomSelection:(NSMutableOrderedSet *)sel slot:(NSString *)slot;
 - (void)reloadFiles;
 - (void)qlGotThumb:(UIImage *)img forName:(NSString *)name atIp:(NSIndexPath *)ip;
@@ -1163,8 +1181,56 @@ static NSString *CCGModeLabel(NSString *mode) {
     [mb sizeToFit];
     _modeBtn = mb;
     UIBarButtonItem *mode = [[UIBarButtonItem alloc] initWithCustomView:mb];
-    [self navigationItem].leftBarButtonItem = close;
+    // 左侧: 关闭 + 全选(仅顺序/随机模式显示; 固定模式单选, 无需全选)
+    NSString *curMode = CCGRandomMode(_randomSlot);
+    if (![curMode isEqualToString:@"fixed"]) {
+        NSMutableOrderedSet *all = [NSMutableOrderedSet orderedSet];
+        CCGCollectVideos(_dir, all);
+        // 判断: 目录下所有视频是否都已在选中集合里
+        BOOL allPicked = NO;
+        if ([all count] > 0) {
+            BOOL miss = NO;
+            for (NSString *p in all) {
+                if (![_randomSelected containsObject:p]) { miss = YES; break; }
+            }
+            allPicked = !miss;
+        }
+        UIButton *sb = [UIButton buttonWithType:UIButtonTypeSystem];
+        [sb setTitle:(allPicked ? @"取消全选" : @"全选") forState:UIControlStateNormal];
+        [sb setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
+        [sb setFont:[UIFont systemFontOfSize:17]];
+        [sb addTarget:self action:@selector(selectAllTapped) forControlEvents:UIControlEventTouchUpInside];
+        [sb sizeToFit];
+        UIBarButtonItem *selAll = [[UIBarButtonItem alloc] initWithCustomView:sb];
+        [self navigationItem].leftBarButtonItems = @[close, selAll];
+    } else {
+        [self navigationItem].leftBarButtonItem = close;
+    }
     [self navigationItem].rightBarButtonItems = @[imp, mode];
+}
+
+// 全选/取消全选: 递归收集当前目录下所有视频, 已全选则从选中集合移除, 否则并入。
+// 即时写盘 + 通知 SpringBoard 换列表 + 刷新绿点。
+- (void)selectAllTapped {
+    NSMutableOrderedSet *all = [NSMutableOrderedSet orderedSet];
+    CCGCollectVideos(_dir, all);
+    if (![all count]) return;
+    BOOL miss = NO;
+    for (NSString *p in all) {
+        if (![_randomSelected containsObject:p]) { miss = YES; break; }
+    }
+    if (miss) {
+        [_randomSelected addObjectsFromArray:[all array]];
+    } else {
+        [_randomSelected removeObjectsInArray:[all array]];
+    }
+    CCGSaveSelected(_randomSlot, _randomSelected);
+    [self buildNormalToolbar];   // 刷新"全选/取消全选"标题
+    [_cv reloadData];
+    NSString *notify = [_randomSlot isEqualToString:@"BackAsset"]
+        ? @"com.thefool.ccaudioplaypres/updateBackAssetNotificationt"
+        : @"com.thefool.ccaudioplaypres/updatePlayingAssetNotificationt";
+    CCGPostDarwin(notify);
 }
 
 // 显示模式下拉框(仿灵动岛美化): 挂在工具栏"模式 ▾"按钮正下方的小下拉弹层。
