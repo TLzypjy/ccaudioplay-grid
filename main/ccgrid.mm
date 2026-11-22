@@ -1170,8 +1170,13 @@ static NSString *CCGModeLabel(NSString *mode) {
 // 显示模式下拉框(仿灵动岛美化): 挂在工具栏"模式 ▾"按钮正下方的小下拉弹层。
 // 选项紧凑白底圆角+阴影, 文字右对齐, 选中项在文字后面带 ✓; 点选项生效, 点空白处收起。
 - (void)modeTapped {
-    // 已弹出 -> 再点一次收起(切换)
+    // 开关切换: 已弹出 -> 只收起, 不再重新弹出
+    BOOL isOpen = NO;
+    for (UIView *sub in [[self view] subviews]) {
+        if (objc_getAssociatedObject(sub, &kCCGDropdownKey)) { isOpen = YES; break; }
+    }
     [self modeDropdownHide];
+    if (isOpen) return;
 
     NSArray *modes = @[@"fixed", @"order", @"random"];
     NSArray *labels = @[@"固定显示", @"顺序显示", @"随机显示"];
@@ -1207,7 +1212,7 @@ static NSString *CCGModeLabel(NSString *mode) {
     if (dropX < 8) dropX = 8;
     if (dropY + rowH * [modes count] > vb.size.height - 60) dropY = vb.size.height - 60 - rowH * [modes count];
 
-    // 外层: 只负责阴影; 内层玻璃: 毛玻璃模糊(UIThUITint + systemUltraThinMaterial, 自动适配深浅色)
+    // 外层: 只负责阴影; 内层: 圆角容器 + 厚材质毛玻璃
     UIView *drop = [[UIView alloc] initWithFrame:CGRectMake(dropX, dropY, dropW, rowH * [modes count])];
     [drop.layer setShadowColor:[UIColor blackColor].CGColor];
     [drop.layer setShadowOpacity:0.18];
@@ -1216,25 +1221,34 @@ static NSString *CCGModeLabel(NSString *mode) {
     objc_setAssociatedObject(drop, &kCCGDropdownKey, @"dropdown", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [wrap addSubview:drop];
 
-    UIVisualEffectView *glass = nil;
-    Class blurCls = NSClassFromString(@"UIBlurEffect");
-    if (blurCls) {
-        id effect = ((id(*)(id, SEL, long))objc_msgSend)(blurCls, sel_registerName("effectWithStyle:"), 24 /* UIBlurEffectStyleSystemUltraThinMaterial */);
-        if (effect) {
-            glass = [[UIVisualEffectView alloc] initWithEffect:effect];
-        } else {
-            id soft = ((id(*)(id, SEL, long))objc_msgSend)(blurCls, sel_registerName("effectWithStyle:"), 3 /* UIBlurEffectStyleExtraLight */);
-            if (soft) glass = [[UIVisualEffectView alloc] initWithEffect:soft];
-        }
-    }
-    UIView *host = glass ?: [[UIView alloc] initWithFrame:drop.bounds];
-    if (!glass) [host setBackgroundColor:[UIColor colorWithWhite:0.97 alpha:0.9]];
-    [host setFrame:drop.bounds];
-    [host.layer setCornerRadius:12.0];
+    // 圆角容器(负责裁切圆角) + 厚材质毛玻璃(强模糊保证可读) + 半透明白提亮
+    UIView *host = [[UIView alloc] initWithFrame:drop.bounds];
+    [host.layer setCornerRadius:14.0];
     [host.layer setMasksToBounds:YES];
     [drop addSubview:host];
-    UIView *content = glass ? [glass contentView] : host;
-    [content setFrame:drop.bounds];
+    UIView *content = host;
+    Class blurCls = NSClassFromString(@"UIBlurEffect");
+    @try {
+        if (blurCls) {
+            // 依次尝试: 厚材质 -> 普通材质 -> Regular -> Light (越靠前模糊越强)
+            long styles[4] = {27 /*SystemThickMaterial*/, 26 /*SystemMaterial*/, 4 /*Regular*/, 1 /*Light*/};
+            for (int k = 0; k < 4; k++) {
+                id effect = ((id(*)(id, SEL, long))objc_msgSend)(blurCls, sel_registerName("effectWithStyle:"), styles[k]);
+                if (!effect) continue;
+                UIVisualEffectView *glass = [[UIVisualEffectView alloc] initWithEffect:effect];
+                [glass setFrame:host.bounds];
+                [host addSubview:glass];
+                // 半透明白提亮层叠在模糊之上, 文字更清楚
+                UIView *ov = [[UIView alloc] initWithFrame:host.bounds];
+                [ov setUserInteractionEnabled:NO];
+                [ov setBackgroundColor:[UIColor colorWithWhite:1.0 alpha:0.35]];
+                [[glass contentView] addSubview:ov];
+                content = [glass contentView];
+                break;
+            }
+        }
+    } @catch (id e) {}
+    if (content == host) [host setBackgroundColor:[UIColor colorWithWhite:0.97 alpha:0.96]];
 
     for (NSUInteger i = 0; i < [modes count]; i++) {
         NSString *m = [modes objectAtIndex:i];
