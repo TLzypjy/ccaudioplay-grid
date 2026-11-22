@@ -194,16 +194,28 @@ static void RNDDisableLooper(id looper) {
     } @catch (id e) {}
 }
 
+// 在视图图层树里找绑定指定 player 的 AVPlayerLayer(过渡动画用)
+static AVPlayerLayer *RNDFindLayerForPlayer(id view, AVQueuePlayer *player) {
+    @try {
+        if (!view || !player) return nil;
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:((UIView *)view).layer];
+        while ([stack count]) {
+            CALayer *l = [stack objectAtIndex:0];
+            [stack removeObjectAtIndex:0];
+            if ([l isKindOfClass:[AVPlayerLayer class]]) {
+                if (((AVPlayerLayer *)l).player == player) return (AVPlayerLayer *)l;
+            }
+            for (CALayer *sub in l.sublayers) [stack addObject:sub];
+        }
+    } @catch (id e) {}
+    return nil;
+}
+
 // 真正执行换片: 清空队列插入新 item 并起播(含探测日志)。
-// 用于初始起播/配置变化/竞态兜底, 会清掉预载引用。
 static void RNDCommitSwap(RNDState *st, AVQueuePlayer *player, AVPlayerItem *item, NSString *path, BOOL isBack) {
     @try {
         if ([player respondsToSelector:@selector(removeAllItems)]) [player removeAllItems];
         [player insertItem:item afterItem:nil];
-        // 允许队列自动推进(预载无缝切换的前提)
-        if ([player respondsToSelector:@selector(setActionAtItemEnd:)]) {
-            ((void (*)(id, SEL, long))objc_msgSend)(player, @selector(setActionAtItemEnd:), 0 /* AVPlayerActionAtItemEndAdvance */);
-        }
         [player play];
     } @catch (id e) {
         @try { [player replaceCurrentItemWithPlayerItem:item]; [player play]; }
@@ -223,77 +235,53 @@ static void RNDCommitSwap(RNDState *st, AVQueuePlayer *player, AVPlayerItem *ite
     });
 }
 
-// 预载下一条: 追加到当前 item 之后, 播完时 AVQueuePlayer 自动无缝推进(不空屏)。
-// 每次推进消耗一次 queue.next(), 与播放条数一一对应。
-static void RNDPreloadNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, BOOL isBack) {
-    NSString *np = [queue next];
-    if (!np.length) return;
-    AVPlayerItem *ni = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:np]];
-    if (!ni) return;
-    @try {
-        if (player.currentItem) {
-            if ([player respondsToSelector:@selector(insertItem:afterItem:)])
-                [player insertItem:ni afterItem:player.currentItem];
-        } else if ([player respondsToSelector:@selector(insertItem:afterItem:)]) {
-            [player insertItem:ni afterItem:nil];
-        } else return;
-    } @catch (id e) { RNDLog(@"preload FAILED: %@", e); return; }
-    if (isBack) { st.nextItemBack = ni; st.nextPathBack = np; }
-    else { st.nextItem = ni; st.nextPath = np; }
-    RNDLog(@"preloaded -> %@ (queue=%lu)", [np lastPathComponent], (unsigned long)[[player items] count]);
-}
+// 参考效果(对照样片): 快速淡黑过渡 —— 旧片 ~0.1s 淡出至黑, 瞬间换片, 新片 ~0.15s 淡入。
+// 总黑屏时长 ~0.15s, 干脆利落不拖沓(v19 慢淡导致空档明显, v20 无过渡硬切, 均弃)。
+#define RND_FADE_OUT_S 0.10
+#define RND_FADE_IN_S  0.15
+#define RND_SWAP_AT_S  0.12
 
-// 一条播完后的推进(无缝): 预载的下一条已由队列自动接上,
-// 移除播完的旧 item -> 观察转到新 item -> 继续预载下一条。
-// 若因竞态没推进成功, 直接把预载 item 换上去兜底(瞬时切换, 不空屏)。
-static void RNDRotate(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, BOOL isBack, id endedItem) {
+// 一条播完后的推进(带快速淡黑过渡)
+static void RNDRotate(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id view, BOOL isBack, id endedItem) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            id nxt = isBack ? st.nextItemBack : st.nextItem;
-            NSString *npath = isBack ? st.nextPathBack : st.nextPath;
-            if (nxt && npath.length && player.currentItem == nxt) {
-                // 正常路径: 已自动推进, 只需清理旧 item / 挪观察 / 继续预载
-                if ([player respondsToSelector:@selector(removeItem:)]) {
-                    void (*rm)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
-                    rm(player, @selector(removeItem:), endedItem);
-                }
-                [[NSNotificationCenter defaultCenter] removeObserver:st
-                    name:AVPlayerItemDidPlayToEndTimeNotification object:endedItem];
-                if (isBack) { st.observingItemBack = nxt; st.nextItemBack = nil; st.nextPathBack = nil; }
-                else { st.observingItem = nxt; st.nextItem = nil; st.nextPath = nil; }
-                [[NSNotificationCenter defaultCenter] addObserver:st
-                                                         selector:@selector(itemDidEnd:)
-                                                             name:AVPlayerItemDidPlayToEndTimeNotification
-                                                           object:nxt];
-                [player play];
-                RNDLog(@"seamless next -> %@ (items=%lu)", [npath lastPathComponent], (unsigned long)[[player items] count]);
-                RNDPreloadNext(st, player, queue, isBack);
+            NSString *path = [queue next];
+            if (!path.length || !player) return;
+            AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]];
+            if (!item) return;
+            // 观察转到新 item
+            [[NSNotificationCenter defaultCenter] removeObserver:st
+                name:AVPlayerItemDidPlayToEndTimeNotification object:endedItem];
+            if (isBack) st.observingItemBack = item; else st.observingItem = item;
+            [[NSNotificationCenter defaultCenter] addObserver:st
+                                                     selector:@selector(itemDidEnd:)
+                                                         name:AVPlayerItemDidPlayToEndTimeNotification
+                                                       object:item];
+
+            AVPlayerLayer *lay = RNDFindLayerForPlayer(view, player);
+            if (lay) {
+                // 快速淡出
+                [CATransaction begin];
+                [CATransaction setAnimationDuration:RND_FADE_OUT_S];
+                lay.opacity = 0.0;
+                [CATransaction commit];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(RND_SWAP_AT_S * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    RNDCommitSwap(st, player, item, path, isBack);
+                    // 快速淡入
+                    [CATransaction begin];
+                    [CATransaction setAnimationDuration:RND_FADE_IN_S];
+                    lay.opacity = 1.0;
+                    [CATransaction commit];
+                });
             } else {
-                // 竞态兜底: 预载在但没推进上 -> 直接换上(瞬时切换); 预载丢失 -> 按路径重建
-                AVPlayerItem *item = nxt;
-                NSString *path = npath;
-                if (!item) {
-                    path = [queue next];
-                    if (!path.length) return;
-                    item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]];
-                }
-                if (!item || !path.length) return;
-                [[NSNotificationCenter defaultCenter] removeObserver:st
-                    name:AVPlayerItemDidPlayToEndTimeNotification object:endedItem];
-                if (isBack) st.observingItemBack = item; else st.observingItem = item;
-                [[NSNotificationCenter defaultCenter] addObserver:st
-                                                         selector:@selector(itemDidEnd:)
-                                                             name:AVPlayerItemDidPlayToEndTimeNotification
-                                                           object:item];
                 RNDCommitSwap(st, player, item, path, isBack);
-                RNDPreloadNext(st, player, queue, isBack);
             }
         } @catch (id e) { RNDLog(@"rotate exception: %@", e); }
     });
 }
 
 // 指定 item 播完后推进到队列下一条(isBack 决定观察挂在哪个槽位)。
-// 无缝切换: 不做渐隐渐显(会空屏), 靠预载自动推进保证画面连续。
+// 初始起播/配置变化用: 立即换片不做过渡(画面本来就在切换点)。
 static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id view, BOOL isBack) {
     NSString *path = [queue next];
     if (!path.length || !player) return;
@@ -314,7 +302,6 @@ static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id
     // 换片动作统一切回主线程执行
     dispatch_async(dispatch_get_main_queue(), ^{
         RNDCommitSwap(st, player, item, path, isBack);
-        RNDPreloadNext(st, player, queue, isBack);
     });
 }
 
@@ -329,9 +316,9 @@ static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id
         if (!view) return;
         // 双槽位独立: 按 item 归属分流(无缝推进)
         if (ended == self.observingItem && self.playingEnabled && self.player) {
-            RNDRotate(self, self.player, self.queue, NO, ended);
+            RNDRotate(self, self.player, self.queue, view, NO, ended);
         } else if (ended == self.observingItemBack && self.backEnabled && self.backPlayerRef) {
-            RNDRotate(self, self.backPlayerRef, self.backQueue, YES, ended);
+            RNDRotate(self, self.backPlayerRef, self.backQueue, view, YES, ended);
         }
     } @catch (id e) { RNDLog(@"itemDidEnd exception: %@", e); }
 }
