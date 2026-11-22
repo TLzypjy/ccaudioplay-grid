@@ -1095,6 +1095,12 @@ static NSString *CCGRandomSlot(id cell) {
 }
 
 // ============ 工具栏(导入/随机/显示模式) ============
+static void CCGPostDarwin(NSString *name) {
+    @try {
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                             (__bridge CFStringRef)name, NULL, NULL, YES);
+    } @catch (id e) {}
+}
 static NSString *CCGModeLabel(NSString *mode) {
     if ([mode isEqualToString:@"fixed"]) return @"固定";
     if ([mode isEqualToString:@"order"]) return @"顺序";
@@ -1131,6 +1137,11 @@ static NSString *CCGModeLabel(NSString *mode) {
             NSArray *items = CCGRandomItems(_randomSlot);
             CCGRandomSet(_randomSlot, [items count] > 0, items, m);
             [self buildNormalToolbar];
+            // 通知 SpringBoard 立即重载配置并切换模式(原先漏了这步, 导致要等下次素材更新才生效)
+            NSString *notify = [_randomSlot isEqualToString:@"BackAsset"]
+                ? @"com.thefool.ccaudioplaypres/updateBackAssetNotificationt"
+                : @"com.thefool.ccaudioplaypres/updatePlayingAssetNotificationt";
+            CCGPostDarwin(notify);
         }];
         [sheet addAction:a];
     }
@@ -1139,13 +1150,6 @@ static NSString *CCGModeLabel(NSString *mode) {
 }
 
 // ============ 随机轮播多选 ============
-static void CCGPostDarwin(NSString *name) {
-    @try {
-        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                             (__bridge CFStringRef)name, NULL, NULL, YES);
-    } @catch (id e) {}
-}
-
 - (void)setRandomModeFromParent:(BOOL)on selected:(NSMutableOrderedSet *)sel slot:(NSString *)slot {
     _randomMode = on;
     if (sel) _randomSelected = [sel mutableCopy];
