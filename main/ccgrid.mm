@@ -332,6 +332,17 @@ static void CCGSetPickedPath(NSString *slot, NSString *path) {
         CCGRandomSave(root);
     } @catch (id e) {}
 }
+// 把多选集合按当前模式写回共享 plist(顺序/随机模式点选即时生效)
+static void CCGSaveSelected(NSString *slot, NSMutableOrderedSet *sel) {
+    @try { CCGRandomSet(slot, [sel count] > 0, [sel array], CCGRandomMode(slot)); } @catch (id e) {}
+}
+// 发原生 Darwin 通知(SpringBoard 端 tweak 收到后重载配置)
+static void CCGPostDarwin(NSString *name) {
+    @try {
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                             (__bridge CFStringRef)name, NULL, NULL, YES);
+    } @catch (id e) {}
+}
 // 当前 cell 属于哪个槽位(PlayingAsset / BackAsset)
 static NSString *CCGRandomSlot(id cell) {
     @try {
@@ -374,17 +385,15 @@ static NSString *CCGRandomSlot(id cell) {
     NSMutableSet *_qlPending;        // QuickLook 异步生成中的素材名(防重复请求)
     NSString *_pendSelPath;          // 去抖: 待执行的点选全路径
     NSString *_pendSelName;          // 去抖: 待执行的点选名
-    // 随机轮播多选模式
-    BOOL _randomMode;
+    // 多选状态(顺序/随机模式): 从共享 plist 恢复, 绿点跨会话保持
     NSMutableOrderedSet *_randomSelected;  // 选中的完整路径(有序)
     NSString *_randomSlot;                 // PlayingAsset / BackAsset
 }
 - (instancetype)initWithCell:(id)cell directory:(NSString *)dir isRoot:(BOOL)root;
 - (void)closeTapped;
 - (void)importTapped;
-- (void)randomTapped;
 - (void)modeTapped;
-- (void)setRandomModeFromParent:(BOOL)on selected:(NSMutableOrderedSet *)sel slot:(NSString *)slot;
+- (void)inheritRandomSelection:(NSMutableOrderedSet *)sel slot:(NSString *)slot;
 - (void)reloadFiles;
 - (void)qlGotThumb:(UIImage *)img forName:(NSString *)name atIp:(NSIndexPath *)ip;
 - (void)genThumbInBackgroundForName:(NSString *)name path:(NSString *)full isVideo:(BOOL)isVideo ip:(NSIndexPath *)ip;
@@ -403,6 +412,12 @@ static NSString *CCGRandomSlot(id cell) {
         _lastTapPt = CGPointMake(-9999, -9999);
         _randomSelected = [NSMutableOrderedSet orderedSet];
         _randomSlot = [CCGRandomSlot(cell) copy];
+        // 顺序/随机模式的已选列表(绿点): 从共享 plist 恢复
+        @try {
+            for (NSString *p in CCGRandomItems(_randomSlot)) {
+                if ([p isKindOfClass:[NSString class]]) [_randomSelected addObject:p];
+            }
+        } @catch (id e) {}
     }
     return self;
 }
@@ -820,12 +835,13 @@ static NSString *CCGRandomSlot(id cell) {
     objc_setAssociatedObject(ng, &kCCGNameKey, name, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     // 选中圆点(目录/编辑态不显示)
-    // 随机模式: 勾号表示该素材已加入随机列表; 普通模式: 蓝点表示当前单选素材
+    // 顺序/随机模式: 绿点 = 已加入多选列表; 固定模式: 蓝点 = 当前单选素材
     if (!_editMode && !isDir) {
          UIView *dot = [[UIView alloc] initWithFrame:CCGRect(6 + cardW / 2 - 9, imgH + 35, 18, 18)];
-         [dot.layer setCornerRadius:9.0];
+        [dot.layer setCornerRadius:9.0];
         [dot.layer setMasksToBounds:YES];
-        if (_randomMode) {
+        NSString *curMode = CCGRandomMode(_randomSlot);
+        if (![curMode isEqualToString:@"fixed"]) {
             NSString *ext = [[name pathExtension] lowercaseString];
             BOOL checked = [CCGVideoExts() containsObject:ext] && [_randomSelected containsObject:full];
             [dot setBackgroundColor:checked ? [UIColor systemGreenColor] : [UIColor colorWithWhite:0.80 alpha:1.0]];
@@ -858,12 +874,13 @@ static NSString *CCGRandomSlot(id cell) {
     BOOL isDir = NO;
     [[NSFileManager defaultManager] fileExistsAtPath:full isDirectory:&isDir];
 
-    // 随机多选模式: 只勾选视频文件, 目录仍可进入浏览
-    if (_randomMode) {
+    // 顺序/随机模式: 点选即多选开关(绿点), 即时写盘生效; 目录仍可进入浏览
+    NSString *curMode = CCGRandomMode(_randomSlot);
+    if (![curMode isEqualToString:@"fixed"]) {
         if (isDir) {
             CCGBrowserViewController *sub = [[CCGBrowserViewController alloc] initWithCell:_cell directory:full isRoot:NO];
-            // 子页面继承随机模式与已选集合
-            [sub setRandomModeFromParent:_randomMode selected:_randomSelected slot:_randomSlot];
+            // 子页面继承父页已选集合(含未刷新的实时状态)
+            [sub inheritRandomSelection:_randomSelected slot:_randomSlot];
             [[self navigationController] pushViewController:sub animated:YES];
             return;
         }
@@ -925,6 +942,14 @@ static NSString *CCGRandomSlot(id cell) {
         [[NSFileManager defaultManager] removeItemAtPath:full error:nil];
         [_thumbs removeObjectForKey:name];
         if (_pickedName && [_pickedName isEqualToString:name]) { _pickedName = nil; CCGSavePicked(_dir, nil); CCGSetPickedPath(_randomSlot, nil); }
+        // 同步多选列表(顺序/随机模式): 移除被删文件并通知 SpringBoard 重建队列
+        if ([_randomSelected containsObject:full]) {
+            [_randomSelected removeObject:full];
+            CCGSaveSelected(_randomSlot, _randomSelected);
+            CCGPostDarwin([_randomSlot isEqualToString:@"BackAsset"]
+                ? @"com.thefool.ccaudioplaypres/updateBackAssetNotificationt"
+                : @"com.thefool.ccaudioplaypres/updatePlayingAssetNotificationt");
+        }
         if (thumbCache) [[NSFileManager defaultManager] removeItemAtPath:thumbCache error:nil];
         [self reloadFiles];   // 立即刷新列表
         id d = _cell;
@@ -1062,6 +1087,15 @@ static NSString *CCGRandomSlot(id cell) {
     if ([fm moveItemAtPath:src toPath:dst error:&err]) {
         [_thumbs removeObjectForKey:old];
         if (_pickedName && [_pickedName isEqualToString:old]) { _pickedName = newName; CCGSavePicked(_dir, newName); CCGSetPickedPath(_randomSlot, dst); }
+        // 同步多选列表(顺序/随机模式): 改名路径替换
+        if ([_randomSelected containsObject:src]) {
+            [_randomSelected removeObject:src];
+            [_randomSelected addObject:dst];
+            CCGSaveSelected(_randomSlot, _randomSelected);
+            CCGPostDarwin([_randomSlot isEqualToString:@"BackAsset"]
+                ? @"com.thefool.ccaudioplaypres/updateBackAssetNotificationt"
+                : @"com.thefool.ccaudioplaypres/updatePlayingAssetNotificationt");
+        }
         // 同步移动缩略图缓存(同文件 mtime 不变, 仅路径键变化)
         NSString *oldCache = [self thumbCachePathForFull:src];
         NSString *newCache = [self thumbCachePathForFull:dst];
@@ -1108,13 +1142,7 @@ static NSString *CCGRandomSlot(id cell) {
     [self presentViewController:al animated:YES completion:nil];
 }
 
-// ============ 工具栏(导入/随机/显示模式) ============
-static void CCGPostDarwin(NSString *name) {
-    @try {
-        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                             (__bridge CFStringRef)name, NULL, NULL, YES);
-    } @catch (id e) {}
-}
+// ============ 工具栏(导入/显示模式) ============
 static NSString *CCGModeLabel(NSString *mode) {
     if ([mode isEqualToString:@"fixed"]) return @"固定";
     if ([mode isEqualToString:@"order"]) return @"顺序";
@@ -1126,13 +1154,11 @@ static NSString *CCGModeLabel(NSString *mode) {
                                                              target:self action:@selector(closeTapped)];
     UIBarButtonItem *imp = [[UIBarButtonItem alloc] initWithTitle:@"导入" style:UIBarButtonItemStylePlain
                                                            target:self action:@selector(importTapped)];
-    UIBarButtonItem *rnd = [[UIBarButtonItem alloc] initWithTitle:@"随机" style:UIBarButtonItemStylePlain
-                                                           target:self action:@selector(randomTapped)];
     NSString *mlabel = [NSString stringWithFormat:@"%@ ▾", CCGModeLabel(CCGRandomMode(_randomSlot))];
     UIBarButtonItem *mode = [[UIBarButtonItem alloc] initWithTitle:mlabel style:UIBarButtonItemStylePlain
                                                             target:self action:@selector(modeTapped)];
     [self navigationItem].leftBarButtonItem = close;
-    [self navigationItem].rightBarButtonItems = @[imp, rnd, mode];
+    [self navigationItem].rightBarButtonItems = @[imp, mode];
 }
 
 // 显示模式下拉框(仿灵动岛美化): 固定 / 顺序 / 随机
@@ -1145,12 +1171,15 @@ static NSString *CCGModeLabel(NSString *mode) {
     NSString *cur = CCGRandomMode(_randomSlot);
     for (NSUInteger i = 0; i < [modes count]; i++) {
         NSString *m = [modes objectAtIndex:i];
-        NSString *title = [[labels objectAtIndex:i] stringByAppendingString:[m isEqualToString:cur] ? @"  ✓" : @""];
+        // 对勾占宽 ≈ 两个空格+勾(约 4 个空格宽): 未选项补 4 个尾随空格,
+        // 让三行总宽一致 -> 居中时中文文字位置对齐(否则打勾那行字会往左偏)
+        NSString *title = [[labels objectAtIndex:i] stringByAppendingString:[m isEqualToString:cur] ? @"  ✓" : @"    "];
         UIAlertAction *a = [UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *ac) {
             // 若启用中(items 非空)则写回并保持 enabled; 否则只记 mode(待选素材后生效)
             NSArray *items = CCGRandomItems(_randomSlot);
             CCGRandomSet(_randomSlot, [items count] > 0, items, m);
             [self buildNormalToolbar];
+            [_cv reloadData];   // 圆点颜色随模式切换(固定=蓝点, 顺序/随机=绿点)
             // 通知 SpringBoard 立即重载配置并切换模式(原先漏了这步, 导致要等下次素材更新才生效)
             NSString *notify = [_randomSlot isEqualToString:@"BackAsset"]
                 ? @"com.thefool.ccaudioplaypres/updateBackAssetNotificationt"
@@ -1163,71 +1192,14 @@ static NSString *CCGModeLabel(NSString *mode) {
     [self presentViewController:sheet animated:YES completion:nil];
 }
 
-// ============ 随机轮播多选 ============
-- (void)setRandomModeFromParent:(BOOL)on selected:(NSMutableOrderedSet *)sel slot:(NSString *)slot {
-    _randomMode = on;
+// ============ 多选状态(顺序/随机模式) ============
+// 子页面继承父页已选集合与槽位(绿点显示与点选一致)
+- (void)inheritRandomSelection:(NSMutableOrderedSet *)sel slot:(NSString *)slot {
     if (sel) _randomSelected = [sel mutableCopy];
     if (slot) _randomSlot = [slot copy];
-    if (_randomMode) {
-        [_editLP setEnabled:NO];
-        [self setTitle:[NSString stringWithFormat:@"随机播放 (%lu)", (unsigned long)[_randomSelected count]]];
-        UIBarButtonItem *cancel = [[UIBarButtonItem alloc] initWithTitle:@"取消" style:UIBarButtonItemStylePlain
-                                                                  target:self action:@selector(randomCancelTapped)];
-        UIBarButtonItem *done = [[UIBarButtonItem alloc] initWithTitle:@"完成" style:UIBarButtonItemStylePlain
-                                                                target:self action:@selector(randomDoneTapped)];
-        [self navigationItem].leftBarButtonItem = cancel;
-        [self navigationItem].rightBarButtonItems = @[done];
-    }
 }
 
-- (void)randomTapped {
-    // 进入随机多选模式: 载入该槽位已保存的列表作为初始勾选
-    [_randomSelected removeAllObjects];
-    for (NSString *p in CCGRandomItems(_randomSlot)) {
-        if ([p isKindOfClass:[NSString class]] && [[NSFileManager defaultManager] fileExistsAtPath:p]) {
-            [_randomSelected addObject:p];
-        }
-    }
-    _randomMode = YES;
-    [_editLP setEnabled:NO];
-    [self stopJiggling];
-    [self setTitle:[NSString stringWithFormat:@"随机播放 (%lu)", (unsigned long)[_randomSelected count]]];
-    UIBarButtonItem *cancel = [[UIBarButtonItem alloc] initWithTitle:@"取消" style:UIBarButtonItemStylePlain
-                                                              target:self action:@selector(randomCancelTapped)];
-    UIBarButtonItem *done = [[UIBarButtonItem alloc] initWithTitle:@"完成" style:UIBarButtonItemStylePlain
-                                                            target:self action:@selector(randomDoneTapped)];
-    [self navigationItem].leftBarButtonItem = cancel;
-    [self navigationItem].rightBarButtonItems = @[done];
-    [_cv reloadData];
-}
-
-- (void)randomCancelTapped {
-    _randomMode = NO;
-    [_editLP setEnabled:YES];
-    [_randomSelected removeAllObjects];
-    // 恢复工具栏
-    [self buildNormalToolbar];
-    [self setTitle:[NSString stringWithFormat:@"素材库 (%lu)", (unsigned long)[_files count]]];
-    [_cv reloadData];
-}
-
-- (void)randomDoneTapped {
-    // 保存列表 + 开启开关, 通知 SpringBoard 重载
-    NSArray *items = [_randomSelected array];
-    if ([items count] == 0) {
-        // 空列表 = 停用多素材轮播(回到固定单素材)
-        CCGRandomSet(_randomSlot, NO, @[], CCGRandomMode(_randomSlot));
-    } else {
-        CCGRandomSet(_randomSlot, YES, items, CCGRandomMode(_randomSlot));
-    }
-    NSString *notify = [_randomSlot isEqualToString:@"BackAsset"]
-        ? @"com.thefool.ccaudioplaypres/updateBackAssetNotificationt"
-        : @"com.thefool.ccaudioplaypres/updatePlayingAssetNotificationt";
-    CCGPostDarwin(notify);
-    [self randomCancelTapped];  // 退出回普通模式
-}
-
-// 随机模式下点素材: 切换勾选
+// 点素材: 切换绿点并即时写盘+通知 SpringBoard 换列表(无"完成"步骤, 点完即生效)
 - (void)randomToggleItem:(NSString *)name {
     NSString *full = [_dir stringByAppendingPathComponent:name];
     if ([_randomSelected containsObject:full]) {
@@ -1235,7 +1207,11 @@ static NSString *CCGModeLabel(NSString *mode) {
     } else {
         [_randomSelected addObject:full];
     }
-    [self setTitle:[NSString stringWithFormat:@"随机播放 (%lu)", (unsigned long)[_randomSelected count]]];
+    CCGSaveSelected(_randomSlot, _randomSelected);
+    NSString *notify = [_randomSlot isEqualToString:@"BackAsset"]
+        ? @"com.thefool.ccaudioplaypres/updateBackAssetNotificationt"
+        : @"com.thefool.ccaudioplaypres/updatePlayingAssetNotificationt";
+    CCGPostDarwin(notify);
     [_cv reloadData];
 }
 
