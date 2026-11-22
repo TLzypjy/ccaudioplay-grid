@@ -245,20 +245,24 @@ static void RNDOnConfigChanged(CFNotificationCenterRef center, void *observer, C
         NSString *nm = (__bridge NSString *)name;
         BOOL isBack = [nm rangeOfString:@"BackAsset"].location != NSNotFound;
         RNDLog(@"config changed: %@", nm);
-        for (id view in [[RNDViews() allObjects] copy]) {
-            RNDState *st = objc_getAssociatedObject(view, &kRNDStateKey);
-            if (st) {
-                // 重新读开关: 关闭则清空队列状态, 恢复原生循环
-                NSString *slot = isBack ? @"BackAsset" : @"PlayingAsset";
-                if (!RNDActive(slot) || ![RNDItems(slot) count]) {
-                    if (isBack) { st.backQueue = nil; st.backEnabled = NO; }
-                    else { st.queue = nil; st.playingEnabled = NO; }
-                    [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItem];
-                    st.observingItem = nil;
+        // 延迟接管: 原 tweak 收到同一通知会重建播放器(读文件/解码, 耗时较重),
+        // 同帧接管会拿到旧 player 或被随后重建覆盖 -> 等它重建完再接管。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            for (id view in [[RNDViews() allObjects] copy]) {
+                RNDState *st = objc_getAssociatedObject(view, &kRNDStateKey);
+                if (st) {
+                    // 关闭则清空队列状态, 恢复原生循环
+                    NSString *slot = isBack ? @"BackAsset" : @"PlayingAsset";
+                    if (!RNDActive(slot) || ![RNDItems(slot) count]) {
+                        if (isBack) { st.backQueue = nil; st.backEnabled = NO; }
+                        else { st.queue = nil; st.playingEnabled = NO; }
+                        [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItem];
+                        st.observingItem = nil;
+                    }
                 }
+                RNDApplyForView(view, isBack);
             }
-            RNDApplyForView(view, isBack);
-        }
+        });
     }
 }
 
