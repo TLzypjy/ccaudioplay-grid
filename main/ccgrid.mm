@@ -254,6 +254,7 @@ static void CCGQLThumbAsync(NSString *path, NSString *name, NSIndexPath *ip, __w
 static const char kCCGDelKey = 0;   // 删除按钮 -> 文件名
 static const char kCCGNameKey = 0;  // 名字点按手势 -> 文件名
 static const char kCCGModeKey = 0;  // 显示模式按钮 -> 模式串(fixed/order/random)
+static const char kCCGDropdownKey = 0;  // 下拉弹层容器标记
 
 // 记住用户点选的素材名(跨会话, 重进素材库蓝点不丢)
 static NSString *CCGPickStoreKey(NSString *dir) {
@@ -395,7 +396,7 @@ static NSString *CCGRandomSlot(id cell) {
 - (void)importTapped;
 - (void)modeTapped;
 - (void)modeChosen:(id)sender;
-- (void)modeCancelTapped;
+- (void)modeDropdownHide;
 - (void)inheritRandomSelection:(NSMutableOrderedSet *)sel slot:(NSString *)slot;
 - (void)reloadFiles;
 - (void)qlGotThumb:(UIImage *)img forName:(NSString *)name atIp:(NSIndexPath *)ip;
@@ -1158,91 +1159,92 @@ static NSString *CCGModeLabel(NSString *mode) {
     [self navigationItem].rightBarButtonItems = @[imp, mode];
 }
 
-// 显示模式选择: 自绘底部弹窗, 三个选项始终左对齐。
-// (本机原生 actionSheet 被样式化为居中排版, 系统控件无法保证左对齐, 故自绘)
+// 在视图树里找标题含 needle 的 UIButton(定位工具栏"模式 ▾"按钮)
+static UIView *CCGFindBarBtn(UIView *root, NSString *needle) {
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    while ([stack count]) {
+        UIView *v = [stack objectAtIndex:0];
+        [stack removeObjectAtIndex:0];
+        if ([v isKindOfClass:[UIButton class]]) {
+            NSString *t = [(UIButton *)v titleForState:UIControlStateNormal] ?: [(UIButton *)v currentTitle];
+            if (t && [t containsString:needle]) return v;
+        }
+        for (UIView *s in [v subviews]) [stack addObject:s];
+    }
+    return nil;
+}
+
+// 显示模式下拉框(仿灵动岛美化): 挂在工具栏"模式 ▾"按钮正下方的小下拉弹层。
+// 选项紧凑白底圆角+阴影, 选中项前面带 ✓; 点选项生效, 点空白处收起。
 - (void)modeTapped {
+    // 已弹出 -> 再点一次收起(切换)
+    [self modeDropdownHide];
+
     NSArray *modes = @[@"fixed", @"order", @"random"];
     NSArray *labels = @[@"固定显示", @"顺序显示", @"随机显示"];
     NSString *cur = CCGRandomMode(_randomSlot);
 
-    UIViewController *vc = [[UIViewController alloc] init];
-    [vc setModalPresentationStyle:UIModalPresentationOverFullScreen];
-    CGRect sb = [UIScreen mainScreen].bounds;
-    UIView *rv = [[UIView alloc] initWithFrame:sb];
-    [rv setBackgroundColor:[UIColor colorWithWhite:0.0 alpha:0.001]];
-    [vc setView:rv];
+    CGFloat rowH = 40.0, dropW = 150.0;
+    CGRect vb = [[self view] bounds];
 
-    UIView *dim = [[UIView alloc] initWithFrame:sb];
-    [dim setBackgroundColor:[UIColor colorWithWhite:0.0 alpha:0.4]];
-    UITapGestureRecognizer *dimTap = [[UITapGestureRecognizer alloc] initWithTarget:self
-                                                                            action:@selector(modeCancelTapped)];
-    [dim addGestureRecognizer:dimTap];
-    [rv addSubview:dim];
+    // 全屏透明遮罩: 点空白收起, 同时挡住下层点击
+    UIView *wrap = [[UIView alloc] initWithFrame:vb];
+    [wrap setBackgroundColor:[UIColor colorWithWhite:0.0 alpha:0.001]];
+    objc_setAssociatedObject(wrap, &kCCGDropdownKey, @"dropdown", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    UITapGestureRecognizer *wrapTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(modeDropdownHide)];
+    [wrap addGestureRecognizer:wrapTap];
+    [[self view] addSubview:wrap];
 
-    CGFloat rowH = 57.0, headH = 44.0, gap = 8.0, bot = 34.0;
-    @try { UIWindow *w = [self view].window; if (w && w.safeAreaInsets.bottom > 0) bot = w.safeAreaInsets.bottom; } @catch (id e) {}
-    CGFloat top = sb.size.height - bot - gap - rowH - (headH + rowH * [modes count]);
+    // 定位: 工具栏"模式 ▾"按钮正下方, 右缘与按钮右缘对齐
+    CGFloat dropY = 90.0, dropX = vb.size.width - dropW - 84.0;
+    @try {
+        UINavigationBar *nav = [[self navigationController] navigationBar];
+        if (nav) {
+            UIView *btn = CCGFindBarBtn(nav, @"▾");
+            if (btn) {
+                CGRect bf = [nav convertRect:[btn frame] toView:[self view]];
+                dropX = CGRectGetMaxX(bf) - dropW;
+                dropY = CGRectGetMaxY(bf) + 6.0;
+            }
+        }
+    } @catch (id e) {}
+    if (dropX < 8) dropX = 8;
+    if (dropY + rowH * [modes count] > vb.size.height - 60) dropY = vb.size.height - 60 - rowH * [modes count];
 
-    // 选项块(标题 + 三个左对齐选项)
-    CGFloat boxW = sb.size.width - 16.0;
-    UIView *box = [[UIView alloc] initWithFrame:CGRectMake(8, top, boxW, headH + rowH * [modes count])];
-    [box setBackgroundColor:[UIColor colorWithWhite:0.97 alpha:1.0]];
-    [box.layer setCornerRadius:14.0];
-    [box.layer setMasksToBounds:YES];
-    [rv addSubview:box];
-
-    UILabel *head = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, boxW, headH)];
-    [head setText:@"显示模式"];
-    [head setTextAlignment:NSTextAlignmentCenter];
-    [head setFont:[UIFont systemFontOfSize:13]];
-    [head setTextColor:[UIColor colorWithWhite:0.45 alpha:1.0]];
-    [box addSubview:head];
+    UIView *drop = [[UIView alloc] initWithFrame:CGRectMake(dropX, dropY, dropW, rowH * [modes count])];
+    [drop setBackgroundColor:[UIColor colorWithWhite:0.99 alpha:1.0]];
+    [drop.layer setCornerRadius:10.0];
+    [drop.layer setShadowColor:[UIColor blackColor].CGColor];
+    [drop.layer setShadowOpacity:0.18];
+    [drop.layer setShadowOffset:CGSizeMake(0, 5)];
+    [drop.layer setShadowRadius:10];
+    objc_setAssociatedObject(drop, &kCCGDropdownKey, @"dropdown", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [wrap addSubview:drop];
 
     for (NSUInteger i = 0; i < [modes count]; i++) {
         NSString *m = [modes objectAtIndex:i];
-        if (i > 0) {
-            UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(0, headH + rowH * i, boxW, 0.5)];
-            [sep setBackgroundColor:[UIColor colorWithWhite:0.82 alpha:1.0]];
-            [box addSubview:sep];
-        }
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(0, headH + rowH * i, boxW, rowH);
-        [b setContentHorizontalAlignment:UIControlContentHorizontalAlignmentLeft];
-        [b setTitleEdgeInsets:UIEdgeInsetsMake(0, 20, 0, 0)];
-        // 左对齐排版, 当前模式在文字后直接跟勾, 文字位置不会偏移
-        [b setTitle:[[labels objectAtIndex:i] stringByAppendingString:[m isEqualToString:cur] ? @"  ✓" : @""]
+        b.frame = CGRectMake(0, rowH * i, dropW, rowH);
+        // 与灵动岛美化下拉一致: 文字居中, 选中项前带 ✓
+        [b setTitle:([m isEqualToString:cur] ? [NSString stringWithFormat:@"✓ %@", [labels objectAtIndex:i]] : [labels objectAtIndex:i])
            forState:UIControlStateNormal];
-        [b setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
-        [b setFont:[UIFont systemFontOfSize:20]];
+        [b setTitleColor:[UIColor colorWithWhite:0.15 alpha:1.0] forState:UIControlStateNormal];
+        [b setFont:[UIFont systemFontOfSize:15]];
         objc_setAssociatedObject(b, &kCCGModeKey, m, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [b addTarget:self action:@selector(modeChosen:) forControlEvents:UIControlEventTouchUpInside];
-        [box addSubview:b];
+        [drop addSubview:b];
     }
-
-    // 取消块
-    UIView *cb = [[UIView alloc] initWithFrame:CGRectMake(8, top + headH + rowH * [modes count] + gap, boxW, rowH)];
-    [cb setBackgroundColor:[UIColor colorWithWhite:0.97 alpha:1.0]];
-    [cb.layer setCornerRadius:14.0];
-    [cb.layer setMasksToBounds:YES];
-    [rv addSubview:cb];
-    UIButton *cancel = [UIButton buttonWithType:UIButtonTypeSystem];
-    cancel.frame = CGRectMake(0, 0, boxW, rowH);
-    [cancel setTitle:@"取消" forState:UIControlStateNormal];
-    [cancel setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
-    [cancel setFont:[UIFont boldSystemFontOfSize:20]];
-    [cancel addTarget:self action:@selector(modeCancelTapped) forControlEvents:UIControlEventTouchUpInside];
-    [cb addSubview:cancel];
-
-    [self presentViewController:vc animated:NO completion:nil];
 }
 
-- (void)modeCancelTapped {
-    [self dismissViewControllerAnimated:YES completion:nil];
+- (void)modeDropdownHide {
+    for (UIView *sub in [[[self view] subviews] copy]) {
+        if (objc_getAssociatedObject(sub, &kCCGDropdownKey)) [sub removeFromSuperview];
+    }
 }
 
 - (void)modeChosen:(id)sender {
     NSString *m = objc_getAssociatedObject(sender, &kCCGModeKey);
-    [self dismissViewControllerAnimated:NO completion:nil];
+    [self modeDropdownHide];
     if (![m isKindOfClass:[NSString class]] || !m.length) return;
     // 若启用中(items 非空)则写回并保持 enabled; 否则只记 mode(待选素材后生效)
     NSArray *items = CCGRandomItems(_randomSlot);
