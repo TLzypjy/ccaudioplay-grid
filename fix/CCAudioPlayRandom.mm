@@ -148,12 +148,16 @@ static NSString *RNDJbRoot(void) {
 #pragma mark - 每个 CCCustomView 的轮播状态
 
 @interface RNDState : NSObject
-@property (nonatomic, weak) AVQueuePlayer *player;
-@property (nonatomic, strong) RNDQueue *queue;      // 播放时(PlayingAsset)
-@property (nonatomic, strong) RNDQueue *backQueue;  // 未播放(BackAsset)
-@property (nonatomic, weak) id observingItem;       // 当前挂了结束通知的 item
+@property (nonatomic, weak) AVQueuePlayer *player;      // 播放槽(PlayingAsset)当前 player
+@property (nonatomic, strong) AVQueuePlayer *backPlayerRef; // 背景槽 player(原生或我们创建, 强持有)
+@property (nonatomic, strong) AVPlayerLayer *createdLayer;  // 我们创建的背景图层(若有)
+@property (nonatomic, strong) RNDQueue *queue;          // 播放时(PlayingAsset)
+@property (nonatomic, strong) RNDQueue *backQueue;      // 未播放(BackAsset)
+@property (nonatomic, weak) id observingItem;           // 播放槽挂了结束通知的 item
+@property (nonatomic, weak) id observingItemBack;       // 背景槽挂了结束通知的 item
 @property (nonatomic, assign) BOOL playingEnabled;
 @property (nonatomic, assign) BOOL backEnabled;
+@property (nonatomic, assign) BOOL treeLogged;          // 一次性诊断标志
 @end
 // itemDidEnd: 在下方分类中实现; 作为 NSNotificationCenter 的 selector 运行时解析, 无需在此声明
 @implementation RNDState
@@ -178,8 +182,8 @@ static void RNDDisableLooper(id looper) {
     } @catch (id e) {}
 }
 
-// 指定 item 播完后推进到队列下一条
-static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id view) {
+// 指定 item 播完后推进到队列下一条(isBack 决定观察挂在哪个槽位)
+static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id view, BOOL isBack) {
     NSString *path = [queue next];
     if (!path.length || !player) return;
     NSURL *url = [NSURL fileURLWithPath:path];
@@ -187,13 +191,14 @@ static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id
     AVPlayerItem *item = [AVPlayerItem playerItemWithURL:url];
     if (!item) return;
 
-    // 监听本条播完
-    [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItem];
-    st.observingItem = item;
+    // 监听本条播完(双槽位独立观察, 互不覆盖)
+    id old = isBack ? st.observingItemBack : st.observingItem;
+    [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:old];
+    if (isBack) st.observingItemBack = item; else st.observingItem = item;
     [[NSNotificationCenter defaultCenter] addObserver:st
                                              selector:@selector(itemDidEnd:)
                                                  name:AVPlayerItemDidPlayToEndTimeNotification
-                                               object:item];
+                                                 object:item];
 
     // 可靠替换: 清空队列再把新 item 插到队首。
     // 不能用 insertItem:afterItem: + advanceToNextItem —— 队列只有 1 条时
@@ -221,27 +226,65 @@ static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id
 @implementation RNDState (RNDEnd)
 - (void)itemDidEnd:(NSNotification *)note {
     @try {
-        // 判断是哪个槽位的 item 结束了
-        AVQueuePlayer *pp = self.player;
+        id ended = note.object;
         id view = nil;
         for (id v in [[RNDViews() allObjects] copy]) {
             if (objc_getAssociatedObject(v, &kRNDStateKey) == self) { view = v; break; }
         }
         if (!view) return;
-        AVQueuePlayer *playing = nil, *back = nil;
-        if ([view respondsToSelector:@selector(playingPlayer)]) playing = ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(view, @selector(playingPlayer));
-        if ([view respondsToSelector:@selector(backPlayer)]) back = ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(view, @selector(backPlayer));
-
-        if (pp == playing && self.playingEnabled) {
-            RNDPlayNext(self, playing, self.queue, view);
-        } else if (pp == back && self.backEnabled) {
-            RNDPlayNext(self, back, self.backQueue, view);
+        // 双槽位独立: 按 item 归属分流
+        if (ended == self.observingItem && self.playingEnabled && self.player) {
+            RNDPlayNext(self, self.player, self.queue, view, NO);
+        } else if (ended == self.observingItemBack && self.backEnabled && self.backPlayerRef) {
+            RNDPlayNext(self, self.backPlayerRef, self.backQueue, view, YES);
         }
     } @catch (id e) { RNDLog(@"itemDidEnd exception: %@", e); }
 }
 @end
 
 #pragma mark - 接管入口
+
+// 列出目录下视频文件(排序, mov/mp4)
+static NSArray *RNDDirVideos(NSString *dir) {
+    NSArray *fs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+    NSMutableArray *out = [NSMutableArray new];
+    for (NSString *f in fs) {
+        NSString *ext = [f pathExtension].lowercaseString;
+        if ([ext isEqualToString:@"mov"] || [ext isEqualToString:@"mp4"]) {
+            [out addObject:[dir stringByAppendingPathComponent:f]];
+        }
+    }
+    return [out sortedArrayUsingSelector:@selector(compare:)];
+}
+
+// 收集图层树摘要(一次性诊断)
+static void RNDWalkLayers(CALayer *layer, int depth, NSMutableString *acc) {
+    if (depth > 5) return;
+    NSString *extra = @"";
+    if ([layer isKindOfClass:[AVPlayerLayer class]]) {
+        AVPlayerLayer *pl = (AVPlayerLayer *)layer;
+        extra = [NSString stringWithFormat:@"player=%@ ready=%d ", pl.player, pl.readyForDisplay];
+    }
+    [acc appendFormat:@"\n  d%d %@ %@f=%@ h=%d", depth, NSStringFromClass([layer class]), extra,
+        NSStringFromCGRect(layer.frame), layer.isHidden];
+    for (CALayer *sub in layer.sublayers) RNDWalkLayers(sub, depth + 1, acc);
+}
+
+// 找背景可用的 AVPlayerLayer: 只接受 player 为 nil 的(未绑定)或已绑定我们自己 player 的;
+// 跳过绑定着其他 player 的图层(那是播放槽的, 不能抢)
+static AVPlayerLayer *RNDFindBackLayer(id view, AVQueuePlayer *ours) {
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:((UIView *)view).layer];
+    while ([stack count]) {
+        CALayer *l = [stack objectAtIndex:0];
+        [stack removeObjectAtIndex:0];
+        if ([l isKindOfClass:[AVPlayerLayer class]]) {
+            AVPlayerLayer *pl = (AVPlayerLayer *)l;
+            if (pl.player == nil || pl.player == ours) return pl;
+        }
+        for (CALayer *sub in l.sublayers) [stack addObject:sub];
+    }
+    return nil;
+}
 
 // 在原生素材更新完成后调用: 若该槽位随机启用, 关 looper 并起播第一条
 static void RNDApplyForView(id view, BOOL isBack) {
@@ -259,12 +302,66 @@ static void RNDApplyForView(id view, BOOL isBack) {
             if ([view respondsToSelector:@selector(playingPlayer)]) player = ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(view, @selector(playingPlayer));
             if ([view respondsToSelector:@selector(playingLayerLooper)]) looper = ((id (*)(id, SEL))objc_msgSend)(view, @selector(playingLayerLooper));
             st.playingEnabled = active;
+            st.player = player;
         } else {
             if ([view respondsToSelector:@selector(backPlayer)]) player = ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(view, @selector(backPlayer));
             if ([view respondsToSelector:@selector(backLayerLooper)]) looper = ((id (*)(id, SEL))objc_msgSend)(view, @selector(backLayerLooper));
             st.backEnabled = active;
+            if (player) st.backPlayerRef = player;
         }
-        st.player = player;
+
+        // ===== 背景槽兜底接管: 原生没建播放器(roothide 下的缺陷)时, 我们自建 =====
+        if (isBack && !player) {
+            if (![items count]) items = RNDDirVideos(@"/var/mobile/CCAudioPlay-BackGround/BackAsset");
+            if (![items count]) {
+                RNDLog(@"slot=BackAsset takeover skip: no files");
+            } else {
+                player = st.backPlayerRef;
+                if (!player) {
+                    player = [[AVQueuePlayer alloc] init];
+                    player.muted = YES; // 背景视频不发声
+                    st.backPlayerRef = player;
+                    RNDLog(@"slot=BackAsset takeover: player created");
+                }
+                AVPlayerLayer *lay = RNDFindBackLayer(view, player);
+                if (!lay) {
+                    lay = st.createdLayer;
+                    if (!lay || !lay.superlayer) {
+                        lay = [AVPlayerLayer layer];
+                        lay.frame = ((UIView *)view).layer.bounds;
+                        lay.videoGravity = AVLayerVideoGravityResizeAspectFill;
+                        [((UIView *)view).layer insertSublayer:lay atIndex:0];
+                        st.createdLayer = lay;
+                        RNDLog(@"slot=BackAsset takeover: layer created");
+                    }
+                }
+                if (lay.player != player) lay.player = player;
+                st.backEnabled = YES; // 播完推进需要
+                RNDQueue *q = st.backQueue;
+                if (!q || ![q.order isEqualToArray:items]) {
+                    q = [[RNDQueue alloc] initWithItems:items mode:mode];
+                    st.backQueue = q;
+                    [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItemBack];
+                    st.observingItemBack = nil;
+                }
+                if (!st.observingItemBack) {
+                    RNDPlayNext(st, player, q, view, YES);
+                } else if (player.rate == 0.0) {
+                    [player play];
+                }
+                if (!st.treeLogged) {
+                    st.treeLogged = YES;
+                    NSMutableString *acc = [NSMutableString stringWithFormat:@"BackAsset layer tree:"];
+                    RNDWalkLayers(((UIView *)view).layer, 0, acc);
+                    RNDLog(@"%@", acc);
+                }
+                RNDLog(@"slot=BackAsset takeover active: %lu files, layer=%@, cur=%@",
+                       (unsigned long)[items count],
+                       lay.player == player ? @"bound" : @"NOT-BOUND",
+                       player.currentItem ? @"yes" : @"no");
+                return;
+            }
+        }
 
         if (!active || ![items count] || !player) {
             // 诊断: fixed 模式下把原生 player 当前 item 的真实路径与状态也打出来
@@ -317,11 +414,11 @@ static void RNDApplyForView(id view, BOOL isBack) {
         if (!q || ![q.mode isEqualToString:mode] || ![q.order isEqualToArray:items]) {
             q = [[RNDQueue alloc] initWithItems:items mode:mode];
             if (isBack) st.backQueue = q; else st.queue = q;
-            [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItem];
-            st.observingItem = nil;
+            [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:(isBack ? st.observingItemBack : st.observingItem)];
+            if (isBack) st.observingItemBack = nil; else st.observingItem = nil;
         }
-        if (!st.observingItem) {
-            RNDPlayNext(st, player, q, view);
+        if (!(isBack ? st.observingItemBack : st.observingItem)) {
+            RNDPlayNext(st, player, q, view, isBack);
         }
         RNDLog(@"slot=%@ mode=%@ active, %lu items, first=%@ exists=%d", slot, mode,
                (unsigned long)[items count], [items firstObject],
@@ -345,10 +442,12 @@ static void RNDOnConfigChanged(CFNotificationCenterRef center, void *observer, C
                     // 关闭则清空队列状态, 恢复原生循环
                     NSString *slot = isBack ? @"BackAsset" : @"PlayingAsset";
                     if (!RNDActive(slot) || ![RNDItems(slot) count]) {
-                        if (isBack) { st.backQueue = nil; st.backEnabled = NO; }
+                        if (isBack) { st.backQueue = nil; }
                         else { st.queue = nil; st.playingEnabled = NO; }
                         [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItem];
                         st.observingItem = nil;
+                        [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItemBack];
+                        st.observingItemBack = nil;
                     }
                 }
                 RNDApplyForView(view, isBack);
