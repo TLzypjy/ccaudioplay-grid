@@ -17,6 +17,7 @@
 #include <limits.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <dirent.h>
 
 static char gJbPrefix[PATH_MAX];
 static int  gComputed = 0;
@@ -53,27 +54,54 @@ static void compute_prefix(void) {
     if (gComputed) return;
     gComputed = 1;
     gJbPrefix[0] = '\0';
+
+    // 策略 1+2: 自身加载路径(展开 .jbroot symlink) / 同目录 .jbroot 链接
     Dl_info info;
+    char selfdir[PATH_MAX];
+    selfdir[0] = '\0';
     if (dladdr((void *)&compute_prefix, &info) && info.dli_fname) {
         char resolved[PATH_MAX];
         const char *probe = info.dli_fname;
         if (realpath(info.dli_fname, resolved) && resolved[0]) probe = resolved;
         extract_prefix(probe, gJbPrefix, sizeof(gJbPrefix));
 
-        // 兜底: 若自身目录下有 .jbroot 符号链接(roothide 会在每个 Mach-O 目录生成),
-        // realpath 它得到 jbroot 真实路径
-        if (!gJbPrefix[0] || !strstr(gJbPrefix, "/.jbroot-")) {
-            char dir[PATH_MAX], sib[PATH_MAX];
-            strlcpy(dir, probe, sizeof(dir));
-            char *s = strrchr(dir, '/');
-            if (s) {
-                *(s + 1) = '\0';
-                snprintf(sib, sizeof(sib), "%s.jbroot", dir);
-                char real[PATH_MAX];
-                if (realpath(sib, real) && real[0]) {
-                    strlcpy(gJbPrefix, real, sizeof(gJbPrefix));
+        strlcpy(selfdir, probe, sizeof(selfdir));
+        char *s = strrchr(selfdir, '/');
+        if (s) {
+            *(s + 1) = '\0';
+            if (!strstr(gJbPrefix, "/.jbroot-")) {
+                char sib[PATH_MAX], real[PATH_MAX];
+                snprintf(sib, sizeof(sib), "%s.jbroot", selfdir);
+                if (realpath(sib, real) && real[0]) strlcpy(gJbPrefix, real, sizeof(gJbPrefix));
+            }
+        }
+    }
+
+    // 策略 3: 扫描 /var/containers/Bundle/Application/.jbroot-*(roothide 主 jbroot
+    //   固定在此目录下, 随机后缀) —— 不依赖任何符号链接, 最可靠
+    if (!strstr(gJbPrefix, "/.jbroot-")) {
+        DIR *d = opendir("/var/containers/Bundle/Application");
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                if (strncmp(e->d_name, ".jbroot-", 8) == 0) {
+                    char full[PATH_MAX], real[PATH_MAX];
+                    snprintf(full, sizeof(full), "/var/containers/Bundle/Application/%s", e->d_name);
+                    if (realpath(full, real) && real[0]) {
+                        strlcpy(gJbPrefix, real, sizeof(gJbPrefix));
+                        break;
+                    }
                 }
             }
+            closedir(d);
+        }
+    }
+
+    // 策略 4: /var/jb 符号链接(本包 postinst 兜底创建), readlink 得真实 jbroot
+    if (!strstr(gJbPrefix, "/.jbroot-")) {
+        char real[PATH_MAX];
+        if (realpath("/var/jb", real) && strstr(real, "/.jbroot-")) {
+            strlcpy(gJbPrefix, real, sizeof(gJbPrefix));
         }
     }
 }

@@ -249,6 +249,19 @@ static void RNDApplyForView(id view, BOOL isBack) {
         st.player = player;
 
         if (!active || ![items count] || !player) {
+            // 诊断: fixed 模式下把原生 player 当前 item 的真实路径与状态也打出来
+            @try {
+                AVPlayerItem *cur = player.currentItem;
+                if (cur && [cur.asset isKindOfClass:[AVURLAsset class]]) {
+                    NSString *up = [(AVURLAsset *)cur.asset URL].path;
+                    RNDLog(@"slot=%@ native item: path=%@ exists=%d status=%ld size=%@",
+                           slot, up ?: @"-", [[NSFileManager defaultManager] fileExistsAtPath:up ?: @""],
+                           (long)cur.status, NSStringFromCGSize(cur.presentationSize));
+                } else {
+                    RNDLog(@"slot=%@ native: player=%@ currentItem=%@ items=%lu", slot,
+                           player ?: @"nil", cur ?: @"nil", (unsigned long)[[player items] count]);
+                }
+            } @catch (id e) {}
             RNDLog(@"slot=%@ inactive(fixed/off/empty) -> native behavior", slot);
             return;
         }
