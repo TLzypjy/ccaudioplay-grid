@@ -199,6 +199,9 @@ static NSString *RNDJbRoot(void) {
 @property (nonatomic, assign) BOOL backEnabled;
 @property (nonatomic, assign) BOOL treeLogged;          // 一次性诊断标志
 @property (nonatomic, assign) NSUInteger skipCount;     // 连续坏片计数(防无限跳条)
+@property (nonatomic, assign) BOOL isOnScreen;          // 模块当前是否上屏(收起状态禁止起播/续播)
+@property (nonatomic, assign) BOOL wePausedFront;       // 收起时我们暂停了播放槽(上屏时恢复)
+@property (nonatomic, assign) BOOL wePausedBack;        // 收起时我们暂停了背景槽(上屏时恢复)
 @end
 // itemDidEnd: 在下方分类中实现; 作为 NSNotificationCenter 的 selector 运行时解析, 无需在此声明
 @implementation RNDState
@@ -261,7 +264,7 @@ static void RNDCommitSwap(RNDState *st, AVQueuePlayer *player, AVPlayerItem *ite
            [[NSFileManager defaultManager] fileExistsAtPath:path]);
     // 1.5s 后探测: 损坏/中途被删的素材自动跳到下一条(连续失败过多次则停下, 防无限循环)
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (player.currentItem == nil) return; // 已被收起释放, 不再跳条
+        if (player.currentItem == nil || !st.isOnScreen) return; // 已收起, 不再跳条
         if (item.status == AVPlayerItemStatusFailed) {
             st.skipCount++;
             if (st.skipCount >= 6) {
@@ -491,9 +494,11 @@ static void RNDApplyForView(id view, BOOL isBack) {
                     st.observingItemBack = nil;
                 }
                 if (!st.observingItemBack) {
-                    RNDPlayNext(st, player, q, view, YES);
+                    if (!st.isOnScreen) RNDLog(@"hidden: defer back start until onScreen");
+                    else RNDPlayNext(st, player, q, view, YES);
                 } else if (player.rate == 0.0) {
-                    [player play];
+                    if (!st.isOnScreen) RNDLog(@"hidden: skip back resume");
+                    else [player play];
                 }
                 if (!st.treeLogged) {
                     st.treeLogged = YES;
@@ -564,10 +569,18 @@ static void RNDApplyForView(id view, BOOL isBack) {
             if (isBack) st.observingItemBack = nil; else st.observingItem = nil;
         }
         if (!(isBack ? st.observingItemBack : st.observingItem)) {
-            RNDPlayNext(st, player, q, view, isBack);
+            if (!st.isOnScreen) {
+                RNDLog(@"hidden: defer %@ start until onScreen", slot);
+            } else {
+                RNDPlayNext(st, player, q, view, isBack);
+            }
         } else if (player.rate == 0.0 && player.currentItem) {
-            [player play]; // 收起期间暂停过, 上屏恢复续播
-            RNDLog(@"slot=%@ resume playback (rate was 0)", slot);
+            if (!st.isOnScreen) {
+                RNDLog(@"hidden: skip %@ resume", slot);
+            } else {
+                [player play]; // 收起期间暂停过, 上屏恢复续播
+                RNDLog(@"slot=%@ resume playback (rate was 0)", slot);
+            }
         }
         // 预载补齐: 观察就绪但预载条被清(竞态/重建)时补上, 保证下一次无缝推进
         if ((isBack ? st.observingItemBack : st.observingItem)
@@ -690,20 +703,45 @@ static void RNDInstallHooks(void) {
         IMP imp = imp_implementationWithBlock(^void(id self, BOOL on) {
             ((void (*)(id, SEL, BOOL))objc_msgSend)(self, mine, on); // 原实现
             @synchronized (RNDViews()) { [RNDViews() addObject:self]; }
+            // 记录上屏状态(收起期间任何路径都不允许起播/续播)
+            RNDState *st = objc_getAssociatedObject(self, &kRNDStateKey);
+            if (!st) {
+                st = [RNDState new];
+                objc_setAssociatedObject(self, &kRNDStateKey, st, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            st.isOnScreen = on;
+            RNDLogE(@"onScreen=%d", on);
             if (on) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    // 恢复收起时由我们暂停的播放器(含 fixed 模式的原生播放器)
+                    AVQueuePlayer *f = [self respondsToSelector:@selector(playingPlayer)]
+                        ? ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(self, @selector(playingPlayer)) : nil;
+                    AVQueuePlayer *b = ([self respondsToSelector:@selector(backPlayer)]
+                        ? ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(self, @selector(backPlayer)) : nil)
+                        ?: st.backPlayerRef;
+                    if (st.wePausedFront) {
+                        st.wePausedFront = NO;
+                        if (f && f.currentItem && f.rate == 0.0) { [f play]; RNDLogE(@"resume front (paused on hide)"); }
+                    }
+                    if (st.wePausedBack) {
+                        st.wePausedBack = NO;
+                        if (b && b.currentItem && b.rate == 0.0) { [b play]; RNDLogE(@"resume back (paused on hide)"); }
+                    }
                     RNDApplyForView(self, NO);
                     RNDApplyForView(self, YES);
                 });
             } else {
-                // 收起控制中心: 仅暂停(保留队列与预载), 下拉上屏后从暂停位置原地续播
+                // 收起控制中心: 暂停所有相关播放器(我们接管的 + fixed 模式的原生), 上屏恢复
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    RNDState *st = objc_getAssociatedObject(self, &kRNDStateKey);
-                    if (!st) return;
+                    AVQueuePlayer *f = [self respondsToSelector:@selector(playingPlayer)]
+                        ? ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(self, @selector(playingPlayer)) : nil;
+                    AVQueuePlayer *b = ([self respondsToSelector:@selector(backPlayer)]
+                        ? ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(self, @selector(backPlayer)) : nil)
+                        ?: st.backPlayerRef;
                     BOOL pf = NO, pb = NO;
-                    if (st.playingEnabled && st.player && st.player.rate != 0.0) { [st.player pause]; pf = YES; }
-                    if (st.backEnabled && st.backPlayerRef && st.backPlayerRef.rate != 0.0) { [st.backPlayerRef pause]; pb = YES; }
-                    if (pf || pb) RNDLog(@"onScreen=NO paused: front=%d back=%d (resume on reopen)", pf, pb);
+                    if (f && f.rate != 0.0) { [f pause]; st.wePausedFront = YES; pf = YES; }
+                    if (b && b.rate != 0.0) { [b pause]; st.wePausedBack = YES; pb = YES; }
+                    if (pf || pb) RNDLogE(@"onScreen=NO paused: front=%d back=%d", pf, pb);
                 });
             }
         });
