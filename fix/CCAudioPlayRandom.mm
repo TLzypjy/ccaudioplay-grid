@@ -79,6 +79,24 @@ static NSArray *RNDItems(NSString *slot) {
     } @catch (id e) { return @[]; }
 }
 
+// 诊断用: 探测 roothide 主 jbroot 根路径(固定在 /var/containers/Bundle/Application 下)
+static NSString *RNDJbRoot(void) {
+    static NSString *r;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *found = @"";
+        NSArray *c = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application" error:nil];
+        for (NSString *n in c) {
+            if ([n hasPrefix:@".jbroot-"]) {
+                found = [@"/var/containers/Bundle/Application" stringByAppendingPathComponent:n];
+                break;
+            }
+        }
+        r = found;
+    });
+    return r;
+}
+
 #pragma mark - 洗牌队列(不连续重复)
 
 @interface RNDQueue : NSObject
@@ -260,6 +278,33 @@ static void RNDApplyForView(id view, BOOL isBack) {
                 } else {
                     RNDLog(@"slot=%@ native: player=%@ currentItem=%@ items=%lu", slot,
                            player ?: @"nil", cur ?: @"nil", (unsigned long)[[player items] count]);
+                    // player 为空时 3 秒后复查一次(原生可能是异步建 player)
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        @try {
+                            AVQueuePlayer *p2 = nil;
+                            if (!isBack) { if ([view respondsToSelector:@selector(playingPlayer)]) p2 = ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(view, @selector(playingPlayer)); }
+                            else { if ([view respondsToSelector:@selector(backPlayer)]) p2 = ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(view, @selector(backPlayer)); }
+                            RNDLog(@"slot=%@ recheck3s: player=%@ items=%lu curStatus=%ld",
+                                   slot, p2 ?: @"nil", (unsigned long)[[p2 items] count],
+                                   p2.currentItem ? (long)p2.currentItem.status : -1L);
+                        } @catch (id e) {}
+                    });
+                }
+            } @catch (id e) {}
+            // 诊断: 列出真实FS与 jbroot 内部两处的素材目录, 判断设置页/tweak 是否读写分离
+            @try {
+                NSString *jb = RNDJbRoot();
+                NSArray *bases = @[@"/var/mobile/CCAudioPlay-BackGround",
+                                   jb.length ? [jb stringByAppendingPathComponent:@"var/mobile/CCAudioPlay-BackGround"] : nil];
+                for (NSString *base in bases) {
+                    if (!base) continue;
+                    NSString *disp = jb.length ? [base stringByReplacingOccurrencesOfString:jb withString:@"<JB>"] : base;
+                    for (NSString *sub in @[@"PlayingAsset", @"BackAsset"]) {
+                        NSString *p = [base stringByAppendingPathComponent:sub];
+                        NSArray *fs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:p error:nil];
+                        RNDLog(@"dirlist %@/%@: %@", disp, sub,
+                               [fs count] ? [NSString stringWithFormat:@"%lu files first=%@", (unsigned long)[fs count], [fs firstObject]] : @"EMPTY/MISSING");
+                    }
                 }
             } @catch (id e) {}
             RNDLog(@"slot=%@ inactive(fixed/off/empty) -> native behavior", slot);
