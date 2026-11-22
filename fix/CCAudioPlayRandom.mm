@@ -471,6 +471,9 @@ static void RNDApplyForView(id view, BOOL isBack) {
         }
         if (!(isBack ? st.observingItemBack : st.observingItem)) {
             RNDPlayNext(st, player, q, view, isBack);
+        } else if (player.rate == 0.0 && player.currentItem) {
+            [player play]; // 收起期间暂停过, 上屏恢复续播
+            RNDLog(@"slot=%@ resume playback (rate was 0)", slot);
         }
         RNDLog(@"slot=%@ mode=%@ active, %lu items, first=%@ exists=%d", slot, mode,
                (unsigned long)[items count], [items firstObject],
@@ -531,6 +534,16 @@ static void RNDInstallHooks(void) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     RNDApplyForView(self, NO);
                     RNDApplyForView(self, YES);
+                });
+            } else {
+                // 收起控制中心: 暂停两个槽位, 不再后台空耗电(RNDApplyForView 上屏时会恢复)
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    RNDState *st = objc_getAssociatedObject(self, &kRNDStateKey);
+                    if (!st) return;
+                    BOOL pf = NO, pb = NO;
+                    if (st.playingEnabled && st.player && st.player.rate != 0.0) { [st.player pause]; pf = YES; }
+                    if (st.backEnabled && st.backPlayerRef && st.backPlayerRef.rate != 0.0) { [st.backPlayerRef pause]; pb = YES; }
+                    RNDLog(@"onScreen=NO pause: front=%d back=%d", pf, pb);
                 });
             }
         });
