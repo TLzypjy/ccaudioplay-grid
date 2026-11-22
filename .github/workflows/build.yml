@@ -5,6 +5,9 @@ on:
     paths:
       - 'main/**'
       - 'fix/**'
+      - 'libroot_shim/**'
+      - 'tools/**'
+      - 'origbin/**'
       - 'Makefile'
       - '.github/workflows/build.yml'
   workflow_dispatch:
@@ -74,6 +77,24 @@ jobs:
           ldid -S .theos/obj/CCAudioPlayRandom.dylib
           cp .theos/obj/CCAudioPlayRandom.dylib out/
 
+      - name: Build libroot shim (roothide jbroot compat)
+        env:
+          THEOS: ${{ github.workspace }}/theos
+          BUILD_LIBROOT: 1
+        run: |
+          make clean || true
+          make FINALPACKAGE=1
+          ldid -S .theos/obj/libroot.dylib
+          cp .theos/obj/libroot.dylib out/
+
+      - name: Patch original binaries rpath for roothide + re-sign
+        run: |
+          python3 tools/patch_rpaths.py
+          ldid -S origbin/CCAudioPlayPresCore
+          ldid -S origbin/CCAudioPlay.dylib
+          cp origbin/CCAudioPlayPresCore out/
+          cp origbin/CCAudioPlay.dylib out/
+
       - name: Upload dylibs
         uses: actions/upload-artifact@v4
         with:
@@ -82,4 +103,7 @@ jobs:
             out/CCAudioPlayPres.dylib
             out/CCAudioPlayFix.dylib
             out/CCAudioPlayRandom.dylib
+            out/libroot.dylib
+            out/CCAudioPlayPresCore
+            out/CCAudioPlay.dylib
           if-no-files-found: error
