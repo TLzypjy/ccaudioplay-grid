@@ -8,9 +8,9 @@
  *   本 tweak 注入 SpringBoard, 读取该 plist。当某槽位 enabled 且有 items 时:
  *     - 洗牌(items 打乱, 一轮播完重新洗牌, 不连续播放同一条)
  *     - 接管该槽位的 AVQueuePlayer: 关掉原 AVPlayerLooper(它会让单视频无限循环)
- *     - 用 AVQueuePlayer 的队列推进实现「播完自动切下一个」:
- *       当前 item 播完 -> 收到 AVPlayerItemDidPlayToEndTime -> 追加下一个 item
- *       到队尾并 advanceToNextItem -> 循环
+ *     - 收到 AVPlayerItemDidPlayToEndTime 后用 removeAllItems + insertItem 替换
+ *       为新 item 并 play, 实现「播完自动切下一个」循环。
+ *       日志落盘: /var/mobile/Documents/ccrandom_debug.log
  *
  * 不改动原 dylib, 只在收到原生素材更新通知后, 对原 tweak 建好的播放器做运行时接管。
  * 随机开关关闭 / 列表为空时, 完全不介入(原单素材循环行为不变)。
@@ -22,7 +22,29 @@
 #import <objc/message.h>
 #import <CoreFoundation/CoreFoundation.h>
 
-#define RNDLog(fmt, ...) NSLog(@"[CCRandom] " fmt, ##__VA_ARGS__)
+// 日志同时写文件, 方便排查(NSLog 只在系统 console, 文件管理器看不到)
+static NSString * const kRndLogPath = @"/var/mobile/Documents/ccrandom_debug.log";
+static void RNDLog(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *body = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *line = [NSString stringWithFormat:@"%@ [CCRandom] %@\n",
+                      [NSDate date], body];
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:kRndLogPath]) {
+            [fm createFileAtPath:kRndLogPath contents:nil attributes:nil];
+        }
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kRndLogPath];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    } @catch (id e) {}
+    NSLog(@"[CCRandom] %@", body);
+}
 
 static NSString * const kRndPlist = @"/var/mobile/Library/Preferences/com.thefool.ccaudioplay.random.plist";
 
@@ -155,18 +177,19 @@ static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id
                                                  name:AVPlayerItemDidPlayToEndTimeNotification
                                                object:item];
 
-    // AVQueuePlayer: 先把新 item 插到当前 item 之后, 再推进
-    AVPlayerItem *cur = player.currentItem;
+    // 可靠替换: 清空队列再把新 item 插到队首。
+    // 不能用 insertItem:afterItem: + advanceToNextItem —— 队列只有 1 条时
+    // advanceToNextItem 会把唯一的 item 移除, player 变空 -> 控制中心成空模块。
     @try {
-        if (cur) [player insertItem:item afterItem:cur];
-        else [player insertItem:item afterItem:nil];
-        [player advanceToNextItem];
-        if (player.rate == 0.0) [player play];
+        if ([player respondsToSelector:@selector(removeAllItems)]) [player removeAllItems];
+        [player insertItem:item afterItem:nil];
+        [player play];
     } @catch (id e) {
-        // 兜底: 直接替换
-        @try { [player replaceCurrentItemWithPlayerItem:item]; [player play]; } @catch (id e2) {}
+        @try { [player replaceCurrentItemWithPlayerItem:item]; [player play]; }
+        @catch (id e2) { RNDLog(@"play next FAILED: %@", e2); }
     }
-    RNDLog(@"play next -> %@", [path lastPathComponent]);
+    RNDLog(@"play next -> %@ (current=%@, items=%lu)", [path lastPathComponent],
+           player.currentItem ? @"ok" : @"NIL", (unsigned long)[[player items] count]);
 }
 
 @implementation RNDState (RNDEnd)
