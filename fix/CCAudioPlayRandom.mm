@@ -78,6 +78,13 @@ static NSArray *RNDItems(NSString *slot) {
         return [v isKindOfClass:[NSArray class]] ? v : @[];
     } @catch (id e) { return @[]; }
 }
+// 固定模式下用户在素材库点选的那一条(设置页写入 "picked" 字段)
+static NSString *RNDPicked(NSString *slot) {
+    @try {
+        NSString *p = [[RNDConfig() objectForKey:slot] objectForKey:@"picked"];
+        return ([p isKindOfClass:[NSString class]] && p.length) ? p : nil;
+    } @catch (id e) { return nil; }
+}
 
 // 诊断用: 探测 roothide 主 jbroot 根路径(固定在 /var/containers/Bundle/Application 下)
 static NSString *RNDJbRoot(void) {
@@ -121,10 +128,7 @@ static NSString *RNDJbRoot(void) {
     NSArray *items = self.order;
     if (![items count]) return nil;
     if (self.idx >= [items count]) {
-        if ([self.mode isEqualToString:@"order"]) {
-            // 顺序模式: 一轮播完从头再来(不打乱)
-            self.idx = 0;
-        } else {
+        if ([self.mode isEqualToString:@"random"]) {
             // 洗牌模式: 一轮播完重新洗牌; 若首条==last, 与末条对调避免连续重复
             NSMutableArray *shuf = [items mutableCopy];
             for (NSUInteger i = [shuf count] - 1; i > 0; i--) {
@@ -135,6 +139,10 @@ static NSString *RNDJbRoot(void) {
                 [shuf exchangeObjectAtIndex:0 withObjectAtIndex:[shuf count] - 1];
             }
             self.order = shuf;
+            self.idx = 0;
+        } else {
+            // order / fixed: 一轮播完从头再来
+            // (修复: fixed 之前两个分支都不命中, idx 越界抛异常 -> 播完一条就卡死)
             self.idx = 0;
         }
     }
@@ -296,6 +304,17 @@ static void RNDApplyForView(id view, BOOL isBack) {
         BOOL active = RNDActive(slot);
         NSString *mode = RNDMode(slot);
         NSArray *items = RNDItems(slot);
+        // 固定模式: 只显示用户在素材库点选的那一条素材。
+        // 切换素材后 picked 变化 -> 下面队列重建逻辑自动换片。
+        // (roothide 下原生背景槽播放器不重建, 换片必须由接管方完成)
+        if ([mode isEqualToString:@"fixed"]) {
+            NSString *pk = RNDPicked(slot);
+            if (pk && [[NSFileManager defaultManager] fileExistsAtPath:pk]) {
+                items = @[pk];
+            }
+            RNDLog(@"slot=%@ fixed picked=%@ exists=%d", slot,
+                   pk ? [pk lastPathComponent] : @"-", pk && [[NSFileManager defaultManager] fileExistsAtPath:pk]);
+        }
         AVQueuePlayer *player = nil;
         id looper = nil;
         if (!isBack) {
@@ -439,15 +458,20 @@ static void RNDOnConfigChanged(CFNotificationCenterRef center, void *observer, C
             for (id view in [[RNDViews() allObjects] copy]) {
                 RNDState *st = objc_getAssociatedObject(view, &kRNDStateKey);
                 if (st) {
-                    // 关闭则清空队列状态, 恢复原生循环
+                    // 关闭/固定/清空则清空该槽位队列状态, 恢复原生行为。
+                    // 只清理本次通知对应的槽位, 不能误杀另一槽位的观察(否则它播完一条就停)。
                     NSString *slot = isBack ? @"BackAsset" : @"PlayingAsset";
                     if (!RNDActive(slot) || ![RNDItems(slot) count]) {
-                        if (isBack) { st.backQueue = nil; }
-                        else { st.queue = nil; st.playingEnabled = NO; }
-                        [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItem];
-                        st.observingItem = nil;
-                        [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItemBack];
-                        st.observingItemBack = nil;
+                        if (isBack) {
+                            st.backQueue = nil;
+                            [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItemBack];
+                            st.observingItemBack = nil;
+                        } else {
+                            st.queue = nil;
+                            st.playingEnabled = NO;
+                            [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItem];
+                            st.observingItem = nil;
+                        }
                     }
                 }
                 RNDApplyForView(view, isBack);
