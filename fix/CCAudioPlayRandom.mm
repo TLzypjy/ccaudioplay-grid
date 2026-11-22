@@ -190,27 +190,25 @@ static void RNDDisableLooper(id looper) {
     } @catch (id e) {}
 }
 
-// 指定 item 播完后推进到队列下一条(isBack 决定观察挂在哪个槽位)
-static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id view, BOOL isBack) {
-    NSString *path = [queue next];
-    if (!path.length || !player) return;
-    NSURL *url = [NSURL fileURLWithPath:path];
-    if (!url) return;
-    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:url];
-    if (!item) return;
+// 在视图图层树里找绑定指定 player 的 AVPlayerLayer(过渡动画用)
+static AVPlayerLayer *RNDFindLayerForPlayer(id view, AVQueuePlayer *player) {
+    @try {
+        if (!view || !player) return nil;
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:((UIView *)view).layer];
+        while ([stack count]) {
+            CALayer *l = [stack objectAtIndex:0];
+            [stack removeObjectAtIndex:0];
+            if ([l isKindOfClass:[AVPlayerLayer class]]) {
+                if (((AVPlayerLayer *)l).player == player) return (AVPlayerLayer *)l;
+            }
+            for (CALayer *sub in l.sublayers) [stack addObject:sub];
+        }
+    } @catch (id e) {}
+    return nil;
+}
 
-    // 监听本条播完(双槽位独立观察, 互不覆盖)
-    id old = isBack ? st.observingItemBack : st.observingItem;
-    [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:old];
-    if (isBack) st.observingItemBack = item; else st.observingItem = item;
-    [[NSNotificationCenter defaultCenter] addObserver:st
-                                             selector:@selector(itemDidEnd:)
-                                                 name:AVPlayerItemDidPlayToEndTimeNotification
-                                                 object:item];
-
-    // 可靠替换: 清空队列再把新 item 插到队首。
-    // 不能用 insertItem:afterItem: + advanceToNextItem —— 队列只有 1 条时
-    // advanceToNextItem 会把唯一的 item 移除, player 变空 -> 控制中心成空模块。
+// 真正执行换片: 清空队列插入新 item 并起播(含探测日志)
+static void RNDCommitSwap(AVQueuePlayer *player, AVPlayerItem *item, NSString *path) {
     @try {
         if ([player respondsToSelector:@selector(removeAllItems)]) [player removeAllItems];
         [player insertItem:item afterItem:nil];
@@ -228,6 +226,50 @@ static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id
                [path lastPathComponent], (long)item.status,
                item.error ?: @"-", (long)player.timeControlStatus, player.rate,
                NSStringFromCGSize(item.presentationSize));
+    });
+}
+
+// 指定 item 播完后推进到队列下一条(isBack 决定观察挂在哪个槽位)。
+// 带交叉过渡: 渐隐(0.35s) -> 换片 -> 渐显(0.35s), 视频衔接更连贯。
+static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id view, BOOL isBack) {
+    NSString *path = [queue next];
+    if (!path.length || !player) return;
+    NSURL *url = [NSURL fileURLWithPath:path];
+    if (!url) return;
+    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:url];
+    if (!item) return;
+
+    // 监听本条播完(双槽位独立观察, 互不覆盖)
+    id old = isBack ? st.observingItemBack : st.observingItem;
+    [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:old];
+    if (isBack) st.observingItemBack = item; else st.observingItem = item;
+    [[NSNotificationCenter defaultCenter] addObserver:st
+                                             selector:@selector(itemDidEnd:)
+                                                 name:AVPlayerItemDidPlayToEndTimeNotification
+                                                 object:item];
+
+    // 换片动作统一切回主线程执行
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // 不能用 insertItem:afterItem: + advanceToNextItem —— 队列只有 1 条时
+        // advanceToNextItem 会把唯一的 item 移除, player 变空 -> 控制中心成空模块。
+        AVPlayerLayer *lay = RNDFindLayerForPlayer(view, player);
+        if (lay) {
+            // 渐隐
+            [CATransaction begin];
+            [CATransaction setAnimationDuration:0.35];
+            lay.opacity = 0.0;
+            [CATransaction commit];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.42 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                RNDCommitSwap(player, item, path);
+                // 渐显
+                [CATransaction begin];
+                [CATransaction setAnimationDuration:0.35];
+                lay.opacity = 1.0;
+                [CATransaction commit];
+            });
+        } else {
+            RNDCommitSwap(player, item, path);
+        }
     });
 }
 
