@@ -696,28 +696,14 @@ static void RNDInstallHooks(void) {
                     RNDApplyForView(self, YES);
                 });
             } else {
-                // 收起控制中心: 停止并彻底释放解码资源(removeAllItems), 上屏时重新起播
+                // 收起控制中心: 仅暂停(保留队列与预载), 下拉上屏后从暂停位置原地续播
                 dispatch_async(dispatch_get_main_queue(), ^{
                     RNDState *st = objc_getAssociatedObject(self, &kRNDStateKey);
                     if (!st) return;
                     BOOL pf = NO, pb = NO;
-                    if (st.playingEnabled && st.player) {
-                        [st.player pause];
-                        [st.player removeAllItems];
-                        [[NSNotificationCenter defaultCenter] removeObserver:st
-                            name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItem];
-                        st.observingItem = nil; st.nextItem = nil; st.nextPath = nil;
-                        pf = YES;
-                    }
-                    if (st.backEnabled && st.backPlayerRef) {
-                        [st.backPlayerRef pause];
-                        [st.backPlayerRef removeAllItems];
-                        [[NSNotificationCenter defaultCenter] removeObserver:st
-                            name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItemBack];
-                        st.observingItemBack = nil; st.nextItemBack = nil; st.nextPathBack = nil;
-                        pb = YES;
-                    }
-                    if (pf || pb) RNDLog(@"onScreen=NO released: front=%d back=%d (replay on reopen)", pf, pb);
+                    if (st.playingEnabled && st.player && st.player.rate != 0.0) { [st.player pause]; pf = YES; }
+                    if (st.backEnabled && st.backPlayerRef && st.backPlayerRef.rate != 0.0) { [st.backPlayerRef pause]; pb = YES; }
+                    if (pf || pb) RNDLog(@"onScreen=NO paused: front=%d back=%d (resume on reopen)", pf, pb);
                 });
             }
         });
