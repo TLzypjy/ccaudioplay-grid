@@ -272,20 +272,6 @@ static void CCGSavePicked(NSString *dir, NSString *name) {
     } @catch (id e) {}
 }
 
-// 把当前槽位选中的素材完整路径同步进共享 plist("picked" 字段)。
-// 固定模式下 SpringBoard 端 tweak 靠它知道用户选了哪条素材
-// (roothide 下原生背景槽播放器不重建, 必须由我们自建播放器换片)。
-static void CCGSetPickedPath(NSString *slot, NSString *path) {
-    @try {
-        NSMutableDictionary *root = CCGRandomLoad();
-        NSMutableDictionary *slotDict = [[root objectForKey:slot] mutableCopy] ?: [NSMutableDictionary dictionary];
-        if (path.length) [slotDict setObject:path forKey:@"picked"];
-        else [slotDict removeObjectForKey:@"picked"];
-        [root setObject:slotDict forKey:slot];
-        CCGRandomSave(root);
-    } @catch (id e) {}
-}
-
 // ============ 随机轮播共享配置 ============
 // 设置页写、SpringBoard 端 tweak 读。plist 结构:
 //   { "PlayingAsset": {"enabled": BOOL, "mode": "fixed|order|random", "items": [完整路径...]},
@@ -329,6 +315,19 @@ static void CCGRandomSet(NSString *slot, BOOL enabled, NSArray *items, NSString 
         [slotDict setObject:@(enabled) forKey:@"enabled"];
         [slotDict setObject:items ?: @[] forKey:@"items"];
         [slotDict setObject:(mode ?: @"random") forKey:@"mode"];
+        [root setObject:slotDict forKey:slot];
+        CCGRandomSave(root);
+    } @catch (id e) {}
+}
+// 把当前槽位选中的素材完整路径同步进共享 plist("picked" 字段)。
+// 固定模式下 SpringBoard 端 tweak 靠它知道用户选了哪条素材
+// (roothide 下原生背景槽播放器不重建, 必须由我们自建播放器换片)。
+static void CCGSetPickedPath(NSString *slot, NSString *path) {
+    @try {
+        NSMutableDictionary *root = CCGRandomLoad();
+        NSMutableDictionary *slotDict = [[root objectForKey:slot] mutableCopy] ?: [NSMutableDictionary dictionary];
+        if (path.length) [slotDict setObject:path forKey:@"picked"];
+        else [slotDict removeObjectForKey:@"picked"];
         [root setObject:slotDict forKey:slot];
         CCGRandomSave(root);
     } @catch (id e) {}
