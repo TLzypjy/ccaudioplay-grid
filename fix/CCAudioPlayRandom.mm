@@ -22,20 +22,20 @@
 #import <objc/message.h>
 #import <CoreFoundation/CoreFoundation.h>
 
-// 日志同时写文件, 方便排查(NSLog 只在系统 console, 文件管理器看不到)
+// 日志同时写文件(默认仅错误级, 详细诊断需在共享 plist 顶层加 "verbose" = YES)。
+// 文件超 1MB 自动重建, 防无限膨胀。
 static NSString * const kRndLogPath = @"/var/mobile/Documents/ccrandom_debug.log";
-static void RNDLog(NSString *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    NSString *body = [[NSString alloc] initWithFormat:fmt arguments:args];
-    va_end(args);
-    NSString *line = [NSString stringWithFormat:@"%@ [CCRandom] %@\n",
-                      [NSDate date], body];
+static BOOL RNDVerboseNow(void); // 定义在 RNDConfig 之后
+static void RNDWriteLine(NSString *body) {
     @try {
         NSFileManager *fm = [NSFileManager defaultManager];
+        NSDictionary *at = [fm attributesOfItemAtPath:kRndLogPath error:nil];
+        if ([at fileSize] > 1024 * 1024) [fm removeItemAtPath:kRndLogPath error:nil];
         if (![fm fileExistsAtPath:kRndLogPath]) {
             [fm createFileAtPath:kRndLogPath contents:nil attributes:nil];
         }
+        NSString *line = [NSString stringWithFormat:@"%@ [CCRandom] %@\n",
+                          [NSDate date], body];
         NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kRndLogPath];
         if (fh) {
             [fh seekToEndOfFile];
@@ -44,6 +44,23 @@ static void RNDLog(NSString *fmt, ...) {
         }
     } @catch (id e) {}
     NSLog(@"[CCRandom] %@", body);
+}
+// 详细日志(verbose 开关控制)
+static void RNDLog(NSString *fmt, ...) {
+    if (!RNDVerboseNow()) return;
+    va_list args;
+    va_start(args, fmt);
+    NSString *body = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    RNDWriteLine(body);
+}
+// 错误日志(始终记录)
+static void RNDLogE(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *body = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    RNDWriteLine(body);
 }
 
 static NSString * const kRndPlist = @"/var/mobile/Library/Preferences/com.thefool.ccaudioplay.random.plist";
@@ -55,6 +72,17 @@ static NSDictionary *RNDConfig(void) {
         NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kRndPlist];
         return d ?: @{};
     } @catch (id e) { return @{}; }
+}
+// verbose 开关(30s 缓存, 改 plist 后最多半分钟生效)
+static BOOL RNDVerboseNow(void) {
+    static BOOL v;
+    static NSTimeInterval t;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - t > 30.0) {
+        t = now;
+        @try { v = [[RNDConfig() objectForKey:@"verbose"] boolValue]; } @catch (id e) { v = NO; }
+    }
+    return v;
 }
 static NSString *RNDMode(NSString *slot) {
     @try {
@@ -170,6 +198,7 @@ static NSString *RNDJbRoot(void) {
 @property (nonatomic, assign) BOOL playingEnabled;
 @property (nonatomic, assign) BOOL backEnabled;
 @property (nonatomic, assign) BOOL treeLogged;          // 一次性诊断标志
+@property (nonatomic, assign) NSUInteger skipCount;     // 连续坏片计数(防无限跳条)
 @end
 // itemDidEnd: 在下方分类中实现; 作为 NSNotificationCenter 的 selector 运行时解析, 无需在此声明
 @implementation RNDState
@@ -194,59 +223,123 @@ static void RNDDisableLooper(id looper) {
     } @catch (id e) {}
 }
 
-// 真正执行换片: 清空队列插入新 item 并起播(含探测日志)。
-static void RNDCommitSwap(RNDState *st, AVQueuePlayer *player, AVPlayerItem *item, NSString *path, BOOL isBack) {
+// 前置声明(probe 失败跳条/预载互相引用)
+static void RNDPreloadNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, BOOL isBack);
+static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id view, BOOL isBack);
+
+// 从队列取下一条可用路径: 文件不存在的自动跳过(最多试 8 条, 全失效返回 nil)
+static NSString *RNDNextValidPath(RNDQueue *queue) {
+    for (int i = 0; i < 8; i++) {
+        NSString *p = [queue next];
+        if (!p.length) return nil;
+        if ([[NSFileManager defaultManager] fileExistsAtPath:p]) return p;
+        RNDLogE(@"skip missing file: %@", p);
+    }
+    return nil;
+}
+
+// 真正执行换片: 清空队列插入新 item 并起播; 开启自动推进(Advance)后,
+// 预载的下一条播完由系统无缝推入(不黑屏)。
+static void RNDCommitSwap(RNDState *st, AVQueuePlayer *player, AVPlayerItem *item, NSString *path, BOOL isBack, RNDQueue *queue) {
     @try {
         if ([player respondsToSelector:@selector(removeAllItems)]) [player removeAllItems];
         [player insertItem:item afterItem:nil];
+        player.actionAtItemEnd = AVPlayerActionAtItemEndAdvance;
         [player play];
     } @catch (id e) {
-        @try { [player replaceCurrentItemWithPlayerItem:item]; [player play]; }
-        @catch (id e2) { RNDLog(@"play next FAILED: %@", e2); }
+        @try {
+            [player replaceCurrentItemWithPlayerItem:item];
+            player.actionAtItemEnd = AVPlayerActionAtItemEndAdvance;
+            [player play];
+        }
+        @catch (id e2) { RNDLogE(@"play next FAILED: %@", e2); }
     }
     if (isBack) { st.nextItemBack = nil; st.nextPathBack = nil; }
     else { st.nextItem = nil; st.nextPath = nil; }
     RNDLog(@"play next -> %@ (current=%@, items=%lu, exists=%d)", [path lastPathComponent],
            player.currentItem ? @"ok" : @"NIL", (unsigned long)[[player items] count],
            [[NSFileManager defaultManager] fileExistsAtPath:path]);
-    // 1.5s 后探测: item 是否真就绪 / player 是否在播 / 有没有错误
+    // 1.5s 后探测: 损坏/中途被删的素材自动跳到下一条(连续失败过多次则停下, 防无限循环)
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        RNDLog(@"probe %@: itemStatus=%ld err=%@ tcs=%ld rate=%.1f size=%@",
-               [path lastPathComponent], (long)item.status,
-               item.error ?: @"-", (long)player.timeControlStatus, player.rate,
-               NSStringFromCGSize(item.presentationSize));
+        if (player.currentItem == nil) return; // 已被收起释放, 不再跳条
+        if (item.status == AVPlayerItemStatusFailed) {
+            st.skipCount++;
+            if (st.skipCount >= 6) {
+                RNDLogE(@"too many broken items, stop rotation");
+                [player pause];
+                return;
+            }
+            RNDLogE(@"item FAILED (%@) -> skip to next", item.error ?: @"-");
+            RNDPlayNext(st, player, queue, nil, isBack);
+        } else if (item.status == AVPlayerItemStatusReadyToPlay) {
+            st.skipCount = 0;
+        }
     });
 }
 
-// 一条播完后的推进(直接换片, 无过渡动画)。
+// 预载下一条: append 到当前 item 之后, 播完系统自动推进(零黑帧无缝)。
+static void RNDPreloadNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, BOOL isBack) {
+    if (!player || !queue || !player.currentItem) return;
+    NSString *path = RNDNextValidPath(queue);
+    if (!path.length) return;
+    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]];
+    if (!item) return;
+    @try {
+        [player insertItem:item afterItem:player.currentItem];
+    } @catch (id e) { return; }
+    if (isBack) { st.nextItemBack = item; st.nextPathBack = path; }
+    else { st.nextItem = item; st.nextPath = path; }
+    RNDLog(@"preload next -> %@", [path lastPathComponent]);
+}
+
+// 一条播完后的推进: 正常情况系统已无缝推到预载条(只做收尾);
+// 预载在但没推上(未就绪/竞态)则瞬时换上; 都没有则从队列取下一条兜底。
 static void RNDRotate(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id view, BOOL isBack, id endedItem) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            NSString *path = [queue next];
-            if (!path.length || !player) return;
-            AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]];
-            if (!item) return;
-            // 观察转到新 item
+            AVPlayerItem *pre = isBack ? st.nextItemBack : st.nextItem;
+            NSString *prePath = isBack ? st.nextPathBack : st.nextPath;
+            AVPlayerItem *cur = player.currentItem;
             [[NSNotificationCenter defaultCenter] removeObserver:st
                 name:AVPlayerItemDidPlayToEndTimeNotification object:endedItem];
-            if (isBack) st.observingItemBack = item; else st.observingItem = item;
-            [[NSNotificationCenter defaultCenter] addObserver:st
-                                                     selector:@selector(itemDidEnd:)
-                                                         name:AVPlayerItemDidPlayToEndTimeNotification
-                                                       object:item];
-            RNDCommitSwap(st, player, item, path, isBack);
-        } @catch (id e) { RNDLog(@"rotate exception: %@", e); }
+            if (pre && cur == pre) {
+                // 系统已无缝推进: 观察挪到新条, 移除播完的旧条, 续预载
+                if (isBack) st.observingItemBack = pre; else st.observingItem = pre;
+                if (isBack) { st.nextItemBack = nil; st.nextPathBack = nil; }
+                else { st.nextItem = nil; st.nextPath = nil; }
+                [player removeItem:endedItem];
+                RNDLog(@"seamless advance -> %@", [prePath lastPathComponent]);
+                RNDPreloadNext(st, player, queue, isBack);
+            } else if (pre) {
+                // 预载条在但系统没推进(还没就绪): 瞬时换上, 不空等
+                if (isBack) st.observingItemBack = pre; else st.observingItem = pre;
+                if (isBack) { st.nextItemBack = nil; st.nextPathBack = nil; }
+                else { st.nextItem = nil; st.nextPath = nil; }
+                RNDCommitSwap(st, player, pre, prePath, isBack, queue);
+                RNDPreloadNext(st, player, queue, isBack);
+            } else {
+                // 无预载(竞态/重建后): 从队列取下一条直接换片
+                NSString *path = RNDNextValidPath(queue);
+                if (!path.length || !player) return;
+                AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]];
+                if (!item) return;
+                if (isBack) st.observingItemBack = item; else st.observingItem = item;
+                RNDCommitSwap(st, player, item, path, isBack, queue);
+                RNDPreloadNext(st, player, queue, isBack);
+            }
+        } @catch (id e) { RNDLogE(@"rotate exception: %@", e); }
     });
 }
 
-// 指定 item 播完后推进到队列下一条(isBack 决定观察挂在哪个槽位)。
-// 初始起播/配置变化用: 立即换片不做过渡(画面本来就在切换点)。
+// 起播下一条(初始起播/配置变化/探测失败跳条用)。
 static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id view, BOOL isBack) {
-    NSString *path = [queue next];
-    if (!path.length || !player) return;
-    NSURL *url = [NSURL fileURLWithPath:path];
-    if (!url) return;
-    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:url];
+    if (!player || !queue) return;
+    NSString *path = RNDNextValidPath(queue);
+    if (!path.length) {
+        RNDLogE(@"no playable item left (slot %@)", isBack ? @"Back" : @"Play");
+        return;
+    }
+    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]];
     if (!item) return;
 
     // 监听本条播完(双槽位独立观察, 互不覆盖)
@@ -258,9 +351,10 @@ static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id
                                                  name:AVPlayerItemDidPlayToEndTimeNotification
                                                  object:item];
 
-    // 换片动作统一切回主线程执行
+    // 换片动作统一切回主线程执行, 换完立即预载下一条
     dispatch_async(dispatch_get_main_queue(), ^{
-        RNDCommitSwap(st, player, item, path, isBack);
+        RNDCommitSwap(st, player, item, path, isBack, queue);
+        RNDPreloadNext(st, player, queue, isBack);
     });
 }
 
@@ -279,7 +373,7 @@ static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id
         } else if (ended == self.observingItemBack && self.backEnabled && self.backPlayerRef) {
             RNDRotate(self, self.backPlayerRef, self.backQueue, view, YES, ended);
         }
-    } @catch (id e) { RNDLog(@"itemDidEnd exception: %@", e); }
+    } @catch (id e) { RNDLogE(@"itemDidEnd exception: %@", e); }
 }
 @end
 
@@ -475,10 +569,16 @@ static void RNDApplyForView(id view, BOOL isBack) {
             [player play]; // 收起期间暂停过, 上屏恢复续播
             RNDLog(@"slot=%@ resume playback (rate was 0)", slot);
         }
+        // 预载补齐: 观察就绪但预载条被清(竞态/重建)时补上, 保证下一次无缝推进
+        if ((isBack ? st.observingItemBack : st.observingItem)
+            && !(isBack ? st.nextItemBack : st.nextItem)
+            && [[player items] count] == 1) {
+            RNDPreloadNext(st, player, q, isBack);
+        }
         RNDLog(@"slot=%@ mode=%@ active, %lu items, first=%@ exists=%d", slot, mode,
                (unsigned long)[items count], [items firstObject],
                [[NSFileManager defaultManager] fileExistsAtPath:[items firstObject]]);
-    } @catch (id e) { RNDLog(@"apply exception: %@", e); }
+    } @catch (id e) { RNDLogE(@"apply exception: %@", e); }
 }
 
 #pragma mark - Darwin 通知重载
@@ -516,6 +616,66 @@ static void RNDOnConfigChanged(CFNotificationCenterRef center, void *observer, C
     }
 }
 
+#pragma mark - 素材/plist 变化监听(实时刷新队列)
+
+static void RNDApplyAllViews(void) {
+    for (id view in [[RNDViews() allObjects] copy]) {
+        RNDApplyForView(view, NO);
+        RNDApplyForView(view, YES);
+    }
+}
+
+// 防抖: 短时间多次变化只触发一次刷新(1s)
+static dispatch_source_t kRNDDebounce;
+static void RNDScheduleApply(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (kRNDDebounce) { dispatch_source_cancel(kRNDDebounce); kRNDDebounce = nil; }
+        dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), DISPATCH_TIME_FOREVER, 0);
+        dispatch_source_set_event_handler(t, ^{
+            if (kRNDDebounce == t) kRNDDebounce = nil;
+            dispatch_source_cancel(t);
+            RNDApplyAllViews();
+            RNDLog(@"assets/config changed -> queues refreshed");
+        });
+        kRNDDebounce = t;
+        dispatch_resume(t);
+    });
+}
+
+// 单个路径的 vnode 监听(事件后重新挂载, vnode 监听是一次性的)
+static void RNDWatchPath(NSString *path, NSUInteger idx) {
+    dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE,
+        (uintptr_t)idx,
+        DISPATCH_VNODE_WRITE | DISPATCH_VNODE_DELETE | DISPATCH_VNODE_RENAME,
+        dispatch_get_main_queue());
+    dispatch_source_set_event_handler(src, ^{
+        dispatch_source_cancel(src);
+        RNDScheduleApply();
+        RNDWatchPath(path, idx); // 重新挂载
+    });
+    dispatch_resume(src);
+}
+
+static void RNDInstallWatchers(void) {
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSArray *paths = @[kRndPlist,
+                           @"/var/mobile/CCAudioPlay-BackGround/PlayingAsset",
+                           @"/var/mobile/CCAudioPlay-BackGround/BackAsset"];
+        NSUInteger idx = 0;
+        for (NSString *p in paths) {
+            BOOL isDir = NO;
+            if (![fm fileExistsAtPath:p isDirectory:&isDir]) {
+                if ([p hasSuffix:@".plist"]) continue; // plist 未建时等设置页首写, 不强建
+                [fm createDirectoryAtPath:p withIntermediateDirectories:YES attributes:nil error:nil];
+            }
+            RNDWatchPath(p, idx++);
+        }
+        RNDLog(@"watchers installed (%lu paths)", (unsigned long)idx);
+    } @catch (id e) { RNDLogE(@"watcher install exception: %@", e); }
+}
+
 #pragma mark - setOnScreen hook (跟踪实例 + 首帧接管)
 
 static void RNDInstallHooks(void) {
@@ -536,14 +696,28 @@ static void RNDInstallHooks(void) {
                     RNDApplyForView(self, YES);
                 });
             } else {
-                // 收起控制中心: 暂停两个槽位, 不再后台空耗电(RNDApplyForView 上屏时会恢复)
+                // 收起控制中心: 停止并彻底释放解码资源(removeAllItems), 上屏时重新起播
                 dispatch_async(dispatch_get_main_queue(), ^{
                     RNDState *st = objc_getAssociatedObject(self, &kRNDStateKey);
                     if (!st) return;
                     BOOL pf = NO, pb = NO;
-                    if (st.playingEnabled && st.player && st.player.rate != 0.0) { [st.player pause]; pf = YES; }
-                    if (st.backEnabled && st.backPlayerRef && st.backPlayerRef.rate != 0.0) { [st.backPlayerRef pause]; pb = YES; }
-                    RNDLog(@"onScreen=NO pause: front=%d back=%d", pf, pb);
+                    if (st.playingEnabled && st.player) {
+                        [st.player pause];
+                        [st.player removeAllItems];
+                        [[NSNotificationCenter defaultCenter] removeObserver:st
+                            name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItem];
+                        st.observingItem = nil; st.nextItem = nil; st.nextPath = nil;
+                        pf = YES;
+                    }
+                    if (st.backEnabled && st.backPlayerRef) {
+                        [st.backPlayerRef pause];
+                        [st.backPlayerRef removeAllItems];
+                        [[NSNotificationCenter defaultCenter] removeObserver:st
+                            name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItemBack];
+                        st.observingItemBack = nil; st.nextItemBack = nil; st.nextPathBack = nil;
+                        pb = YES;
+                    }
+                    if (pf || pb) RNDLog(@"onScreen=NO released: front=%d back=%d (replay on reopen)", pf, pb);
                 });
             }
         });
@@ -558,6 +732,9 @@ static void RNDInstallHooks(void) {
         CFSTR("com.thefool.ccaudioplaypres/updatePlayingAssetNotificationt"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(nc, NULL, RNDOnConfigChanged,
         CFSTR("com.thefool.ccaudioplaypres/updateBackAssetNotificationt"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    // 素材目录/plist 变化监听: 播放中往目录加删文件也实时刷新队列
+    RNDInstallWatchers();
 
     RNDLog(@"installed");
 }
