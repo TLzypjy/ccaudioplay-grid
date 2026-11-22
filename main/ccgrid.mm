@@ -1159,23 +1159,8 @@ static NSString *CCGModeLabel(NSString *mode) {
     [self navigationItem].rightBarButtonItems = @[imp, mode];
 }
 
-// 在视图树里找标题含 needle 的 UIButton(定位工具栏"模式 ▾"按钮)
-static UIView *CCGFindBarBtn(UIView *root, NSString *needle) {
-    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
-    while ([stack count]) {
-        UIView *v = [stack objectAtIndex:0];
-        [stack removeObjectAtIndex:0];
-        if ([v isKindOfClass:[UIButton class]]) {
-            NSString *t = [(UIButton *)v titleForState:UIControlStateNormal] ?: [(UIButton *)v currentTitle];
-            if (t && [t containsString:needle]) return v;
-        }
-        for (UIView *s in [v subviews]) [stack addObject:s];
-    }
-    return nil;
-}
-
 // 显示模式下拉框(仿灵动岛美化): 挂在工具栏"模式 ▾"按钮正下方的小下拉弹层。
-// 选项紧凑白底圆角+阴影, 选中项前面带 ✓; 点选项生效, 点空白处收起。
+// 选项紧凑白底圆角+阴影, 文字右对齐, 选中项在文字后面带 ✓; 点选项生效, 点空白处收起。
 - (void)modeTapped {
     // 已弹出 -> 再点一次收起(切换)
     [self modeDropdownHide];
@@ -1195,19 +1180,14 @@ static UIView *CCGFindBarBtn(UIView *root, NSString *needle) {
     [wrap addGestureRecognizer:wrapTap];
     [[self view] addSubview:wrap];
 
-    // 定位: 工具栏"模式 ▾"按钮正下方, 右缘与按钮右缘对齐
-    CGFloat dropY = 90.0, dropX = vb.size.width - dropW - 84.0;
+    // 定位: 导航栏正下方, 右缘对齐"模式 ▾"按钮。
+    // 右侧两个按钮 = [导入, 模式▾], 模式按钮右缘 ≈ 屏宽 - 右边距16 - 导入宽(≈56) - 间距(≈8)
+    CGFloat dropY = 90.0;
     @try {
         UINavigationBar *nav = [[self navigationController] navigationBar];
-        if (nav) {
-            UIView *btn = CCGFindBarBtn(nav, @"▾");
-            if (btn) {
-                CGRect bf = [nav convertRect:[btn frame] toView:[self view]];
-                dropX = CGRectGetMaxX(bf) - dropW;
-                dropY = CGRectGetMaxY(bf) + 6.0;
-            }
-        }
+        if (nav) dropY = CGRectGetMaxY([nav convertRect:nav.frame toView:[self view]]) + 6.0;
     } @catch (id e) {}
+    CGFloat dropX = vb.size.width - dropW - 56.0;
     if (dropX < 8) dropX = 8;
     if (dropY + rowH * [modes count] > vb.size.height - 60) dropY = vb.size.height - 60 - rowH * [modes count];
 
@@ -1225,8 +1205,10 @@ static UIView *CCGFindBarBtn(UIView *root, NSString *needle) {
         NSString *m = [modes objectAtIndex:i];
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
         b.frame = CGRectMake(0, rowH * i, dropW, rowH);
-        // 与灵动岛美化下拉一致: 文字居中, 选中项前带 ✓
-        [b setTitle:([m isEqualToString:cur] ? [NSString stringWithFormat:@"✓ %@", [labels objectAtIndex:i]] : [labels objectAtIndex:i])
+        // 文字右对齐, 选中项勾在文字后面(如 "固定显示 ✓"), 右缘留 14pt
+        [b setContentHorizontalAlignment:UIControlContentHorizontalAlignmentRight];
+        [b setTitleEdgeInsets:UIEdgeInsetsMake(0, 0, 0, 14)];
+        [b setTitle:([m isEqualToString:cur] ? [NSString stringWithFormat:@"%@ ✓", [labels objectAtIndex:i]] : [labels objectAtIndex:i])
            forState:UIControlStateNormal];
         [b setTitleColor:[UIColor colorWithWhite:0.15 alpha:1.0] forState:UIControlStateNormal];
         [b setFont:[UIFont systemFontOfSize:15]];
