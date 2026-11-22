@@ -194,23 +194,6 @@ static void RNDDisableLooper(id looper) {
     } @catch (id e) {}
 }
 
-// 在视图图层树里找绑定指定 player 的 AVPlayerLayer(过渡动画用)
-static AVPlayerLayer *RNDFindLayerForPlayer(id view, AVQueuePlayer *player) {
-    @try {
-        if (!view || !player) return nil;
-        NSMutableArray *stack = [NSMutableArray arrayWithObject:((UIView *)view).layer];
-        while ([stack count]) {
-            CALayer *l = [stack objectAtIndex:0];
-            [stack removeObjectAtIndex:0];
-            if ([l isKindOfClass:[AVPlayerLayer class]]) {
-                if (((AVPlayerLayer *)l).player == player) return (AVPlayerLayer *)l;
-            }
-            for (CALayer *sub in l.sublayers) [stack addObject:sub];
-        }
-    } @catch (id e) {}
-    return nil;
-}
-
 // 真正执行换片: 清空队列插入新 item 并起播(含探测日志)。
 static void RNDCommitSwap(RNDState *st, AVQueuePlayer *player, AVPlayerItem *item, NSString *path, BOOL isBack) {
     @try {
@@ -235,13 +218,7 @@ static void RNDCommitSwap(RNDState *st, AVQueuePlayer *player, AVPlayerItem *ite
     });
 }
 
-// 参考效果(对照样片): 快速淡黑过渡 —— 旧片 ~0.1s 淡出至黑, 瞬间换片, 新片 ~0.15s 淡入。
-// 总黑屏时长 ~0.15s, 干脆利落不拖沓(v19 慢淡导致空档明显, v20 无过渡硬切, 均弃)。
-#define RND_FADE_OUT_S 0.10
-#define RND_FADE_IN_S  0.15
-#define RND_SWAP_AT_S  0.12
-
-// 一条播完后的推进(带快速淡黑过渡)
+// 一条播完后的推进(直接换片, 无过渡动画)。
 static void RNDRotate(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id view, BOOL isBack, id endedItem) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
@@ -257,25 +234,7 @@ static void RNDRotate(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id v
                                                      selector:@selector(itemDidEnd:)
                                                          name:AVPlayerItemDidPlayToEndTimeNotification
                                                        object:item];
-
-            AVPlayerLayer *lay = RNDFindLayerForPlayer(view, player);
-            if (lay) {
-                // 快速淡出
-                [CATransaction begin];
-                [CATransaction setAnimationDuration:RND_FADE_OUT_S];
-                lay.opacity = 0.0;
-                [CATransaction commit];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(RND_SWAP_AT_S * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    RNDCommitSwap(st, player, item, path, isBack);
-                    // 快速淡入
-                    [CATransaction begin];
-                    [CATransaction setAnimationDuration:RND_FADE_IN_S];
-                    lay.opacity = 1.0;
-                    [CATransaction commit];
-                });
-            } else {
-                RNDCommitSwap(st, player, item, path, isBack);
-            }
+            RNDCommitSwap(st, player, item, path, isBack);
         } @catch (id e) { RNDLog(@"rotate exception: %@", e); }
     });
 }
