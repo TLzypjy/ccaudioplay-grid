@@ -1169,7 +1169,14 @@ static NSString *CCGModeLabel(NSString *mode) {
     NSArray *labels = @[@"固定显示", @"顺序显示", @"随机显示"];
     NSString *cur = CCGRandomMode(_randomSlot);
 
-    CGFloat rowH = 40.0, dropW = 150.0;
+    CGFloat rowH = 40.0;
+    // 框宽自适应: 最宽文字 + 勾区(22) + 左右留白(10+14), 避免大片空白
+    CGFloat textW = 0;
+    for (NSString *lb in labels) {
+        CGFloat w = [[NSString stringWithFormat:@"%@ ✓", lb] sizeWithAttributes:@{NSFontAttributeName: [UIFont systemFontOfSize:15]}].width;
+        if (w > textW) textW = w;
+    }
+    CGFloat dropW = textW + 46.0;
     CGRect vb = [[self view] bounds];
 
     // 全屏透明遮罩: 点空白收起, 同时挡住下层点击
@@ -1203,18 +1210,33 @@ static NSString *CCGModeLabel(NSString *mode) {
 
     for (NSUInteger i = 0; i < [modes count]; i++) {
         NSString *m = [modes objectAtIndex:i];
+        // 文字区: 右缘固定在 dropW-34 (勾区之外), 无论选中与否文字位置纹丝不动
+        CGFloat textRight = dropW - 34.0;
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(0, rowH * i, dropW, rowH);
-        // 文字右对齐, 选中项勾在文字后面(如 "固定显示 ✓"), 右缘留 14pt
+        b.frame = CGRectMake(0, rowH * i, textRight, rowH);
         [b setContentHorizontalAlignment:UIControlContentHorizontalAlignmentRight];
-        [b setTitleEdgeInsets:UIEdgeInsetsMake(0, 0, 0, 14)];
-        [b setTitle:([m isEqualToString:cur] ? [NSString stringWithFormat:@"%@ ✓", [labels objectAtIndex:i]] : [labels objectAtIndex:i])
-           forState:UIControlStateNormal];
+        [b setTitleEdgeInsets:UIEdgeInsetsMake(0, 0, 0, 0)];
+        [b setTitle:[labels objectAtIndex:i] forState:UIControlStateNormal];
         [b setTitleColor:[UIColor colorWithWhite:0.15 alpha:1.0] forState:UIControlStateNormal];
         [b setFont:[UIFont systemFontOfSize:15]];
         objc_setAssociatedObject(b, &kCCGModeKey, m, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [b addTarget:self action:@selector(modeChosen:) forControlEvents:UIControlEventTouchUpInside];
         [drop addSubview:b];
+        // 让文字右侧整块都可点(勾区点击也算选这一行)
+        UIButton *pad = [UIButton buttonWithType:UIButtonTypeSystem];
+        pad.frame = CGRectMake(textRight, rowH * i, dropW - textRight, rowH);
+        objc_setAssociatedObject(pad, &kCCGModeKey, m, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [pad addTarget:self action:@selector(modeChosen:) forControlEvents:UIControlEventTouchUpInside];
+        [drop addSubview:pad];
+        // 勾: 独立固定位置标签, 画在文字右侧, 不占文字宽度
+        if ([m isEqualToString:cur]) {
+            UILabel *tick = [[UILabel alloc] initWithFrame:CGRectMake(textRight + 4, rowH * i, 26, rowH)];
+            [tick setText:@"✓"];
+            [tick setTextAlignment:NSTextAlignmentLeft];
+            [tick setTextColor:[UIColor colorWithWhite:0.15 alpha:1.0]];
+            [tick setFont:[UIFont systemFontOfSize:15]];
+            [drop addSubview:tick];
+        }
     }
 }
 
