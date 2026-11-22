@@ -6,8 +6,10 @@
 import struct, sys, os
 
 LC_RPATH_REQ = 0x8000001c  # LC_RPATH | LC_REQ_DYLD
+LC_LOAD_DYLIB = 0x0c
 
-def patch_file(path, replacements):
+def patch_cmd_strings(path, patches_by_cmd):
+    """patches_by_cmd: {cmd_id: {old_string: new_string}}"""
     b = bytearray(open(path, 'rb').read())
     magic, = struct.unpack_from('<I', b, 0)
     if magic != 0xfeedfacf:
@@ -18,16 +20,16 @@ def patch_file(path, replacements):
     changed = []
     for _ in range(ncmds):
         cmd, cs = struct.unpack_from('<II', b, off)
-        if cmd == LC_RPATH_REQ:
+        if cmd in patches_by_cmd:
             po, = struct.unpack_from('<I', b, off + 8)
             start = off + po
             end = off + cs
             old = bytes(b[start:end]).split(b'\0')[0].decode('utf-8', 'replace')
-            if old in replacements:
-                new = replacements[old]
+            if old in patches_by_cmd[cmd]:
+                new = patches_by_cmd[cmd][old]
                 nb = new.encode() + b'\0'
                 if len(nb) > (end - start):
-                    raise SystemExit(f"FATAL: new rpath longer than region: {old!r} -> {new!r}")
+                    raise SystemExit(f"FATAL: new string longer than region: {old!r} -> {new!r}")
                 b[start:start + len(nb)] = nb
                 for i in range(start + len(nb), start + len(old.encode()) + 1):
                     b[i] = 0
@@ -36,7 +38,7 @@ def patch_file(path, replacements):
     open(path, 'wb').write(bytes(b))
     print(f"PATCHED {os.path.basename(path)}: {changed}")
     if not changed:
-        print(f"WARNING: no rpath replaced in {path}")
+        print(f"WARNING: nothing replaced in {path}")
 
 if __name__ == '__main__':
     here = os.path.dirname(os.path.abspath(__file__))
@@ -49,10 +51,21 @@ if __name__ == '__main__':
     #   rpath2 "/var/jb/usr/lib"(15) -> "@loader_path"(12): 兜底(自身同目录)
     # 注: 二进制自带 @loader_path/.jbroot/Library/Frameworks 与 .../usr/lib 两条 rpath,
     #     我们在 jbroot/Library/Frameworks/ 也放一份 libroot.dylib, 双保险。
-    patch_file(os.path.join(orig, 'CCAudioPlayPresCore'), {
-        '/var/jb/Library/Frameworks': '@loader_path/.jbroot',
-        '/var/jb/usr/lib': '@loader_path',
+    patch_cmd_strings(os.path.join(orig, 'CCAudioPlayPresCore'), {
+        LC_RPATH_REQ: {
+            '/var/jb/Library/Frameworks': '@loader_path/.jbroot',
+            '/var/jb/usr/lib': '@loader_path',
+        },
     })
-    # CCAudioPlay.dylib 不打补丁: 其自带 @loader_path/.jbroot/... rpath 在 roothide 上
-    # 可直接解析(dpkg 会在 Mach-O 目录生成 .jbroot symlink), CydiaSubstrate 照常找到。
+
+    # CCAudioPlay.dylib(主 tweak, 注入 SpringBoard):
+    #   LC_LOAD_DYLIB "@rpath/CydiaSubstrate.framework/CydiaSubstrate"(46)
+    #     -> "@rpath/libsubstrate.dylib"(26):
+    #     roothide jbroot 没有 CydiaSubstrate.framework, 只有 usr/lib/libsubstrate.dylib;
+    #     经自带 rpath "@loader_path/.jbroot/usr/lib" 解析, MSHookMessageEx 照常导出。
+    patch_cmd_strings(os.path.join(orig, 'CCAudioPlay.dylib'), {
+        LC_LOAD_DYLIB: {
+            '@rpath/CydiaSubstrate.framework/CydiaSubstrate': '@rpath/libsubstrate.dylib',
+        },
+    })
 
