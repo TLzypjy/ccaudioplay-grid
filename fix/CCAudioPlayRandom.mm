@@ -188,8 +188,16 @@ static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id
         @try { [player replaceCurrentItemWithPlayerItem:item]; [player play]; }
         @catch (id e2) { RNDLog(@"play next FAILED: %@", e2); }
     }
-    RNDLog(@"play next -> %@ (current=%@, items=%lu)", [path lastPathComponent],
-           player.currentItem ? @"ok" : @"NIL", (unsigned long)[[player items] count]);
+    RNDLog(@"play next -> %@ (current=%@, items=%lu, exists=%d)", [path lastPathComponent],
+           player.currentItem ? @"ok" : @"NIL", (unsigned long)[[player items] count],
+           [[NSFileManager defaultManager] fileExistsAtPath:path]);
+    // 1.5s 后探测: item 是否真就绪 / player 是否在播 / 有没有错误
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        RNDLog(@"probe %@: itemStatus=%ld err=%@ tcs=%ld rate=%.1f size=%@",
+               [path lastPathComponent], (long)item.status,
+               item.error ?: @"-", (long)player.timeControlStatus, player.rate,
+               NSStringFromCGSize(item.presentationSize));
+    });
 }
 
 @implementation RNDState (RNDEnd)
@@ -257,7 +265,9 @@ static void RNDApplyForView(id view, BOOL isBack) {
         if (!st.observingItem) {
             RNDPlayNext(st, player, q, view);
         }
-        RNDLog(@"slot=%@ mode=%@ active, %lu items", slot, mode, (unsigned long)[items count]);
+        RNDLog(@"slot=%@ mode=%@ active, %lu items, first=%@ exists=%d", slot, mode,
+               (unsigned long)[items count], [items firstObject],
+               [[NSFileManager defaultManager] fileExistsAtPath:[items firstObject]]);
     } @catch (id e) { RNDLog(@"apply exception: %@", e); }
 }
 
