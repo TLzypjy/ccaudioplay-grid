@@ -375,6 +375,7 @@ static NSString *CCGRandomSlot(id cell) {
     // 编辑态
     BOOL _editMode;
     UILongPressGestureRecognizer *_editLP;
+    UIButton *_modeBtn;               // 工具栏"模式 ▾"自定义视图按钮(下拉框锚定用)
     UITextField *_activeField;
     NSString *_activeName;
     id _activeCell;
@@ -1153,8 +1154,15 @@ static NSString *CCGModeLabel(NSString *mode) {
     UIBarButtonItem *imp = [[UIBarButtonItem alloc] initWithTitle:@"导入" style:UIBarButtonItemStylePlain
                                                            target:self action:@selector(importTapped)];
     NSString *mlabel = [NSString stringWithFormat:@"%@ ▾", CCGModeLabel(CCGRandomMode(_randomSlot))];
-    UIBarButtonItem *mode = [[UIBarButtonItem alloc] initWithTitle:mlabel style:UIBarButtonItemStylePlain
-                                                            target:self action:@selector(modeTapped)];
+    // 自定义视图按钮: 下拉框可以直接拿它的真实 frame 锚定(系统 UIBarButtonItem 拿不到视图)
+    UIButton *mb = [UIButton buttonWithType:UIButtonTypeSystem];
+    [mb setTitle:mlabel forState:UIControlStateNormal];
+    [mb setTitleColor:[UIColor systemBlueColor] forState:UIControlStateNormal];
+    [mb setFont:[UIFont systemFontOfSize:17]];
+    [mb addTarget:self action:@selector(modeTapped) forControlEvents:UIControlEventTouchUpInside];
+    [mb sizeToFit];
+    _modeBtn = mb;
+    UIBarButtonItem *mode = [[UIBarButtonItem alloc] initWithCustomView:mb];
     [self navigationItem].leftBarButtonItem = close;
     [self navigationItem].rightBarButtonItems = @[imp, mode];
 }
@@ -1187,26 +1195,46 @@ static NSString *CCGModeLabel(NSString *mode) {
     [wrap addGestureRecognizer:wrapTap];
     [[self view] addSubview:wrap];
 
-    // 定位: 导航栏正下方, 右缘对齐"模式 ▾"按钮。
-    // 右侧两个按钮 = [导入, 模式▾], 模式按钮右缘 ≈ 屏宽 - 右边距16 - 导入宽(≈56) - 间距(≈8)
-    CGFloat dropY = 90.0;
+    // 定位: 锚定工具栏"模式 ▾"自定义视图按钮的真实 frame(右缘对齐 + 正下方 6pt)
+    CGFloat dropY = 90.0, dropX = vb.size.width - dropW - 16.0;
     @try {
-        UINavigationBar *nav = [[self navigationController] navigationBar];
-        if (nav) dropY = CGRectGetMaxY([nav convertRect:nav.frame toView:[self view]]) + 6.0;
+        if (_modeBtn && [_modeBtn window]) {
+            CGRect bf = [[self view] convertRect:[_modeBtn frame] fromView:[_modeBtn superview]];
+            dropX = CGRectGetMaxX(bf) - dropW;
+            dropY = CGRectGetMaxY(bf) + 6.0;
+        }
     } @catch (id e) {}
-    CGFloat dropX = vb.size.width - dropW - 56.0;
     if (dropX < 8) dropX = 8;
     if (dropY + rowH * [modes count] > vb.size.height - 60) dropY = vb.size.height - 60 - rowH * [modes count];
 
+    // 外层: 只负责阴影; 内层玻璃: 毛玻璃模糊(UIThUITint + systemUltraThinMaterial, 自动适配深浅色)
     UIView *drop = [[UIView alloc] initWithFrame:CGRectMake(dropX, dropY, dropW, rowH * [modes count])];
-    [drop setBackgroundColor:[UIColor colorWithWhite:0.99 alpha:1.0]];
-    [drop.layer setCornerRadius:10.0];
     [drop.layer setShadowColor:[UIColor blackColor].CGColor];
     [drop.layer setShadowOpacity:0.18];
     [drop.layer setShadowOffset:CGSizeMake(0, 5)];
     [drop.layer setShadowRadius:10];
     objc_setAssociatedObject(drop, &kCCGDropdownKey, @"dropdown", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [wrap addSubview:drop];
+
+    UIVisualEffectView *glass = nil;
+    Class blurCls = NSClassFromString(@"UIBlurEffect");
+    if (blurCls) {
+        id effect = ((id(*)(id, SEL, long))objc_msgSend)(blurCls, sel_registerName("effectWithStyle:"), 24 /* UIBlurEffectStyleSystemUltraThinMaterial */);
+        if (effect) {
+            glass = [[UIVisualEffectView alloc] initWithEffect:effect];
+        } else {
+            id soft = ((id(*)(id, SEL, long))objc_msgSend)(blurCls, sel_registerName("effectWithStyle:"), 3 /* UIBlurEffectStyleExtraLight */);
+            if (soft) glass = [[UIVisualEffectView alloc] initWithEffect:soft];
+        }
+    }
+    UIView *host = glass ?: [[UIView alloc] initWithFrame:drop.bounds];
+    if (!glass) [host setBackgroundColor:[UIColor colorWithWhite:0.97 alpha:0.9]];
+    [host setFrame:drop.bounds];
+    [host.layer setCornerRadius:12.0];
+    [host.layer setMasksToBounds:YES];
+    [drop addSubview:host];
+    UIView *content = glass ? [glass contentView] : host;
+    [content setFrame:drop.bounds];
 
     for (NSUInteger i = 0; i < [modes count]; i++) {
         NSString *m = [modes objectAtIndex:i];
@@ -1221,13 +1249,13 @@ static NSString *CCGModeLabel(NSString *mode) {
         [b setFont:[UIFont systemFontOfSize:15]];
         objc_setAssociatedObject(b, &kCCGModeKey, m, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [b addTarget:self action:@selector(modeChosen:) forControlEvents:UIControlEventTouchUpInside];
-        [drop addSubview:b];
+        [content addSubview:b];
         // 让文字右侧整块都可点(勾区点击也算选这一行)
         UIButton *pad = [UIButton buttonWithType:UIButtonTypeSystem];
         pad.frame = CGRectMake(textRight, rowH * i, dropW - textRight, rowH);
         objc_setAssociatedObject(pad, &kCCGModeKey, m, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [pad addTarget:self action:@selector(modeChosen:) forControlEvents:UIControlEventTouchUpInside];
-        [drop addSubview:pad];
+        [content addSubview:pad];
         // 勾: 独立固定位置标签, 画在文字右侧, 不占文字宽度
         if ([m isEqualToString:cur]) {
             UILabel *tick = [[UILabel alloc] initWithFrame:CGRectMake(textRight + 4, rowH * i, 26, rowH)];
@@ -1235,7 +1263,7 @@ static NSString *CCGModeLabel(NSString *mode) {
             [tick setTextAlignment:NSTextAlignmentLeft];
             [tick setTextColor:[UIColor colorWithWhite:0.15 alpha:1.0]];
             [tick setFont:[UIFont systemFontOfSize:15]];
-            [drop addSubview:tick];
+            [content addSubview:tick];
         }
     }
 }
