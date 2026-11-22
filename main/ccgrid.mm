@@ -334,9 +334,32 @@ static void CCGSetPickedPath(NSString *slot, NSString *path) {
         CCGRandomSave(root);
     } @catch (id e) {}
 }
-// 把多选集合按当前模式写回共享 plist(顺序/随机模式点选即时生效)
+// 把多选集合按当前模式写回共享 plist。
+// 顺序/随机模式的选择相互独立: 分别存 "orderItems" / "randomItems";
+// "items" 始终镜像当前激活模式的列表(SpringBoard 端 tweak 只读 items)。
 static void CCGSaveSelected(NSString *slot, NSMutableOrderedSet *sel) {
-    @try { CCGRandomSet(slot, [sel count] > 0, [sel array], CCGRandomMode(slot)); } @catch (id e) {}
+    @try {
+        NSString *mode = CCGRandomMode(slot);
+        NSMutableDictionary *root = CCGRandomLoad();
+        NSMutableDictionary *slotDict = [[root objectForKey:slot] mutableCopy] ?: [NSMutableDictionary dictionary];
+        NSArray *arr = [sel array];
+        [slotDict setObject:arr forKey:([mode isEqualToString:@"order"] ? @"orderItems" : @"randomItems")];
+        [slotDict setObject:arr forKey:@"items"];
+        [slotDict setObject:@([arr count] > 0) forKey:@"enabled"];
+        [root setObject:slotDict forKey:slot];
+        CCGRandomSave(root);
+    } @catch (id e) {}
+}
+// 读取"当前模式"的独立选择列表(顺序/随机分开; 旧版本无分库字段时回退 items)
+static NSArray *CCGModeItems(NSString *slot) {
+    @try {
+        NSString *mode = CCGRandomMode(slot);
+        NSString *key = [mode isEqualToString:@"order"] ? @"orderItems" : @"randomItems";
+        NSDictionary *d = [CCGRandomLoad() objectForKey:slot];
+        id v = [d objectForKey:key];
+        if (![v isKindOfClass:[NSArray class]]) v = [d objectForKey:@"items"];
+        return [v isKindOfClass:[NSArray class]] ? v : @[];
+    } @catch (id e) { return @[]; }
 }
 // 递归收集目录下所有视频文件完整路径(全选用)
 static void CCGCollectVideos(NSString *dir, NSMutableOrderedSet *out) {
@@ -435,9 +458,9 @@ static NSString *CCGRandomSlot(id cell) {
         _lastTapPt = CGPointMake(-9999, -9999);
         _randomSelected = [NSMutableOrderedSet orderedSet];
         _randomSlot = [CCGRandomSlot(cell) copy];
-        // 顺序/随机模式的已选列表(绿点): 从共享 plist 恢复
+        // 顺序/随机模式的已选列表(绿点): 按当前模式从共享 plist 恢复(两模式相互独立)
         @try {
-            for (NSString *p in CCGRandomItems(_randomSlot)) {
+            for (NSString *p in CCGModeItems(_randomSlot)) {
                 if ([p isKindOfClass:[NSString class]]) [_randomSelected addObject:p];
             }
         } @catch (id e) {}
@@ -1204,7 +1227,8 @@ static NSString *CCGModeLabel(NSString *mode) {
         UIBarButtonItem *selAll = [[UIBarButtonItem alloc] initWithCustomView:sb];
         [self navigationItem].leftBarButtonItems = @[close, selAll];
     } else {
-        [self navigationItem].leftBarButtonItem = close;
+        // 注意: 必须统一用 leftBarButtonItems 赋值, 混用 leftBarButtonItem 无法清掉旧 items 数组
+        [self navigationItem].leftBarButtonItems = @[close];
     }
     [self navigationItem].rightBarButtonItems = @[imp, mode];
 }
@@ -1358,11 +1382,23 @@ static NSString *CCGModeLabel(NSString *mode) {
     NSString *m = objc_getAssociatedObject(sender, &kCCGModeKey);
     [self modeDropdownHide];
     if (![m isKindOfClass:[NSString class]] || !m.length) return;
-    // 若启用中(items 非空)则写回并保持 enabled; 否则只记 mode(待选素材后生效)
-    NSArray *items = CCGRandomItems(_randomSlot);
-    CCGRandomSet(_randomSlot, [items count] > 0, items, m);
+    if ([m isEqualToString:@"fixed"]) {
+        // 固定模式: items 原样保留(模块端改用 picked 单选)
+        NSArray *items = CCGRandomItems(_randomSlot);
+        CCGRandomSet(_randomSlot, [items count] > 0, items, @"fixed");
+    } else {
+        // 顺序/随机: 各模式有独立选择列表, 切过去时载入该模式自己的列表
+        // (旧版本数据无分库字段时回退 items)
+        NSDictionary *d = [CCGRandomLoad() objectForKey:_randomSlot] ?: @{};
+        NSString *key = [m isEqualToString:@"order"] ? @"orderItems" : @"randomItems";
+        id v = [d objectForKey:key];
+        if (![v isKindOfClass:[NSArray class]]) v = [d objectForKey:@"items"];
+        NSArray *items = [v isKindOfClass:[NSArray class]] ? v : @[];
+        _randomSelected = [NSMutableOrderedSet orderedSetWithArray:items];
+        CCGRandomSet(_randomSlot, [items count] > 0, items, m);   // items 镜像当前模式列表
+    }
     [self buildNormalToolbar];
-    [_cv reloadData];   // 圆点颜色随模式切换(固定=蓝点, 顺序/随机=绿点)
+    [_cv reloadData];   // 圆点颜色随模式切换(固定=蓝点, 顺序/随机=绿点); 绿点列表也随模式切换
     // 通知 SpringBoard 立即重载配置并切换模式
     NSString *notify = [_randomSlot isEqualToString:@"BackAsset"]
         ? @"com.thefool.ccaudioplaypres/updateBackAssetNotificationt"
