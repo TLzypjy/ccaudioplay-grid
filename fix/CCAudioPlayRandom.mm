@@ -84,6 +84,37 @@ static BOOL RNDVerboseNow(void) {
     }
     return v;
 }
+
+#pragma mark - 播放位置存档(跨模块回收/重启续播)
+
+// 状态文件: 记录每个槽位 {path, time}。暂停/换片时写, 全新起播时读。
+// 模块实例被系统回收或 SpringBoard 重启后, 靠它恢复到上次播放的那条那一秒。
+static NSString * const kRndStatePath = @"/var/mobile/Library/Preferences/com.thefool.ccaudioplay.random.state.plist";
+static NSString *RNDSlotStateKey(BOOL isBack, NSString *field) {
+    return [NSString stringWithFormat:@"%@.%@", isBack ? @"Back" : @"Play", field];
+}
+static NSMutableDictionary *RNDLoadStateDict(void) {
+    @try {
+        NSMutableDictionary *d = [[NSMutableDictionary dictionaryWithContentsOfFile:kRndStatePath] mutableCopy];
+        return d ?: [NSMutableDictionary dictionary];
+    } @catch (id e) { return [NSMutableDictionary dictionary]; }
+}
+static void RNDSaveSlotState(BOOL isBack, NSString *path, double t) {
+    @try {
+        NSMutableDictionary *d = RNDLoadStateDict();
+        NSString *pk = RNDSlotStateKey(isBack, @"path"), *tk = RNDSlotStateKey(isBack, @"time");
+        if (path.length) { d[pk] = path; d[tk] = @(t); }
+        else { [d removeObjectForKey:pk]; [d removeObjectForKey:tk]; }
+        [d writeToFile:kRndStatePath atomically:YES];
+    } @catch (id e) {}
+}
+static NSString *RNDLoadSlotPath(BOOL isBack) {
+    return [RNDLoadStateDict() objectForKey:RNDSlotStateKey(isBack, @"path")];
+}
+static double RNDLoadSlotTime(BOOL isBack) {
+    NSNumber *n = [RNDLoadStateDict() objectForKey:RNDSlotStateKey(isBack, @"time")];
+    return n ? [n doubleValue] : 0.0;
+}
 static NSString *RNDMode(NSString *slot) {
     @try {
         NSString *m = [[[RNDConfig() objectForKey:slot] objectForKey:@"mode"] stringValue];
@@ -204,6 +235,8 @@ static NSString *RNDJbRoot(void) {
 @property (nonatomic, assign) BOOL isOnScreen;          // 模块当前是否上屏(收起状态禁止起播/续播)
 @property (nonatomic, assign) BOOL wePausedFront;       // 收起时我们暂停了播放槽(上屏时恢复)
 @property (nonatomic, assign) BOOL wePausedBack;        // 收起时我们暂停了背景槽(上屏时恢复)
+@property (nonatomic, assign) BOOL startedFront;        // 本实例是否已起播过播放槽(决定是否读档续播)
+@property (nonatomic, assign) BOOL startedBack;         // 本实例是否已起播过背景槽
 @end
 // itemDidEnd: 在下方分类中实现; 作为 NSNotificationCenter 的 selector 运行时解析, 无需在此声明
 @implementation RNDState
@@ -231,6 +264,7 @@ static void RNDDisableLooper(id looper) {
 // 前置声明(probe 失败跳条/预载互相引用)
 static void RNDPreloadNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, BOOL isBack);
 static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id view, BOOL isBack);
+static void RNDRestart(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id view, BOOL isBack);
 
 // 从队列取下一条可用路径: 文件不存在的自动跳过(最多试 8 条, 全失效返回 nil)
 static NSString *RNDNextValidPath(RNDQueue *queue) {
@@ -244,23 +278,32 @@ static NSString *RNDNextValidPath(RNDQueue *queue) {
 }
 
 // 真正执行换片: 清空队列插入新 item 并起播; 开启自动推进(Advance)后,
-// 预载的下一条播完由系统无缝推入(不黑屏)。
-static void RNDCommitSwap(RNDState *st, AVQueuePlayer *player, AVPlayerItem *item, NSString *path, BOOL isBack, RNDQueue *queue) {
+// 预载的下一条播完由系统无缝推入(不黑屏)。seekTo>0 时跳到指定秒数(读档续播用)。
+static void RNDCommitSwap(RNDState *st, AVQueuePlayer *player, AVPlayerItem *item, NSString *path, BOOL isBack, RNDQueue *queue, double seekTo) {
     @try {
         if ([player respondsToSelector:@selector(removeAllItems)]) [player removeAllItems];
         [player insertItem:item afterItem:nil];
         player.actionAtItemEnd = AVPlayerActionAtItemEndAdvance;
         [player play];
+        if (seekTo > 1.0) {
+            [player seekToTime:CMTimeMakeWithSeconds(seekTo, 600)
+               toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+        }
     } @catch (id e) {
         @try {
             [player replaceCurrentItemWithPlayerItem:item];
             player.actionAtItemEnd = AVPlayerActionAtItemEndAdvance;
             [player play];
+            if (seekTo > 1.0) {
+                [player seekToTime:CMTimeMakeWithSeconds(seekTo, 600)
+                   toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+            }
         }
         @catch (id e2) { RNDLogE(@"play next FAILED: %@", e2); }
     }
     if (isBack) { st.nextItemBack = nil; st.nextPathBack = nil; }
     else { st.nextItem = nil; st.nextPath = nil; }
+    RNDSaveSlotState(isBack, path, seekTo > 1.0 ? seekTo : 0.0); // 换片即存档
     RNDLog(@"play next -> %@ (current=%@, items=%lu, exists=%d)", [path lastPathComponent],
            player.currentItem ? @"ok" : @"NIL", (unsigned long)[[player items] count],
            [[NSFileManager defaultManager] fileExistsAtPath:path]);
@@ -320,7 +363,7 @@ static void RNDRotate(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id v
                 if (isBack) st.observingItemBack = pre; else st.observingItem = pre;
                 if (isBack) { st.nextItemBack = nil; st.nextPathBack = nil; }
                 else { st.nextItem = nil; st.nextPath = nil; }
-                RNDCommitSwap(st, player, pre, prePath, isBack, queue);
+                RNDCommitSwap(st, player, pre, prePath, isBack, queue, 0.0);
                 RNDPreloadNext(st, player, queue, isBack);
             } else {
                 // 无预载(竞态/重建后): 从队列取下一条直接换片
@@ -329,7 +372,7 @@ static void RNDRotate(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id v
                 AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:path]];
                 if (!item) return;
                 if (isBack) st.observingItemBack = item; else st.observingItem = item;
-                RNDCommitSwap(st, player, item, path, isBack, queue);
+                RNDCommitSwap(st, player, item, path, isBack, queue, 0.0);
                 RNDPreloadNext(st, player, queue, isBack);
             }
         } @catch (id e) { RNDLogE(@"rotate exception: %@", e); }
@@ -358,9 +401,50 @@ static void RNDPlayNext(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id
 
     // 换片动作统一切回主线程执行, 换完立即预载下一条
     dispatch_async(dispatch_get_main_queue(), ^{
-        RNDCommitSwap(st, player, item, path, isBack, queue);
+        RNDCommitSwap(st, player, item, path, isBack, queue, 0.0);
         RNDPreloadNext(st, player, queue, isBack);
     });
+    if (isBack) st.startedBack = YES; else st.startedFront = YES;
+}
+
+// 全新起播(实例刚建好, 观察为空): 先查播放位置存档——
+// 上次播的那条还在当前素材列表里且进度>1s, 就从那条那一秒续播,
+// 并把队列从它的下一条接上; 没有存档则按队列正常起播。
+static void RNDRestart(RNDState *st, AVQueuePlayer *player, RNDQueue *queue, id view, BOOL isBack) {
+    NSString *sp = RNDLoadSlotPath(isBack);
+    double sTime = RNDLoadSlotTime(isBack);
+    BOOL resumed = NO;
+    if (sp.length && sTime > 1.0
+        && [queue.source containsObject:sp]
+        && [[NSFileManager defaultManager] fileExistsAtPath:sp]) {
+        AVPlayerItem *item = [AVPlayerItem playerItemWithURL:[NSURL fileURLWithPath:sp]];
+        if (item) {
+            // 队列顺序改为"从存档条开始", 下标指向它的下一条
+            NSUInteger pos = [queue.source indexOfObject:sp];
+            NSMutableArray *ord = [NSMutableArray array];
+            for (NSUInteger i = 0; i < [queue.source count]; i++) {
+                [ord addObject:[queue.source objectAtIndex:(pos + i) % [queue.source count]]];
+            }
+            queue.order = ord;
+            queue.idx = 1 % [ord count];
+            queue.lastPath = sp;
+            id old = isBack ? st.observingItemBack : st.observingItem;
+            [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:old];
+            if (isBack) st.observingItemBack = item; else st.observingItem = item;
+            [[NSNotificationCenter defaultCenter] addObserver:st
+                                                     selector:@selector(itemDidEnd:)
+                                                         name:AVPlayerItemDidPlayToEndTimeNotification
+                                                       object:item];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                RNDCommitSwap(st, player, item, sp, isBack, queue, sTime);
+                RNDPreloadNext(st, player, queue, isBack);
+            });
+            resumed = YES;
+            RNDLogE(@"resume from state: %@ @ %.1fs", [sp lastPathComponent], sTime);
+        }
+    }
+    if (!resumed) RNDPlayNext(st, player, queue, view, isBack);
+    else if (isBack) st.startedBack = YES; else st.startedFront = YES;
 }
 
 @implementation RNDState (RNDEnd)
@@ -497,6 +581,7 @@ static void RNDApplyForView(id view, BOOL isBack) {
                 }
                 if (!st.observingItemBack) {
                     if (!st.isOnScreen) RNDLog(@"hidden: defer back start until onScreen");
+                    else if (!st.startedBack) RNDRestart(st, player, q, view, YES);
                     else RNDPlayNext(st, player, q, view, YES);
                 } else if (player.rate == 0.0) {
                     if (!st.isOnScreen) RNDLog(@"hidden: skip back resume");
@@ -573,6 +658,8 @@ static void RNDApplyForView(id view, BOOL isBack) {
         if (!(isBack ? st.observingItemBack : st.observingItem)) {
             if (!st.isOnScreen) {
                 RNDLog(@"hidden: defer %@ start until onScreen", slot);
+            } else if (!(isBack ? st.startedFront : st.startedBack)) {
+                RNDRestart(st, player, q, view, isBack); // 全新起播: 先查位置存档
             } else {
                 RNDPlayNext(st, player, q, view, isBack);
             }
@@ -741,8 +828,23 @@ static void RNDInstallHooks(void) {
                         ? ((AVQueuePlayer *(*)(id, SEL))objc_msgSend)(self, @selector(backPlayer)) : nil)
                         ?: st.backPlayerRef;
                     BOOL pf = NO, pb = NO;
-                    if (f && f.rate != 0.0) { [f pause]; st.wePausedFront = YES; pf = YES; }
-                    if (b && b.rate != 0.0) { [b pause]; st.wePausedBack = YES; pb = YES; }
+                    if (f && f.rate != 0.0) {
+                        [f pause]; st.wePausedFront = YES; pf = YES;
+                        // 存档播放位置(模块被回收后靠它续播)
+                        AVPlayerItem *ci = f.currentItem;
+                        if (ci && [ci.asset isKindOfClass:[AVURLAsset class]]) {
+                            NSString *cp = [(AVURLAsset *)ci.asset URL].path;
+                            if (cp.length) RNDSaveSlotState(NO, cp, CMTimeGetSeconds([f currentTime]));
+                        }
+                    }
+                    if (b && b.rate != 0.0) {
+                        [b pause]; st.wePausedBack = YES; pb = YES;
+                        AVPlayerItem *ci = b.currentItem;
+                        if (ci && [ci.asset isKindOfClass:[AVURLAsset class]]) {
+                            NSString *cp = [(AVURLAsset *)ci.asset URL].path;
+                            if (cp.length) RNDSaveSlotState(YES, cp, CMTimeGetSeconds([b currentTime]));
+                        }
+                    }
                     if (pf || pb) RNDLogE(@"onScreen=NO paused: front=%d back=%d", pf, pb);
                 });
             }
@@ -762,7 +864,7 @@ static void RNDInstallHooks(void) {
     // 素材目录/plist 变化监听: 播放中往目录加删文件也实时刷新队列
     RNDInstallWatchers();
 
-    RNDLogE(@"installed v27 (queue-rebuild fix + hide-pause)");
+    RNDLogE(@"installed v28 (persisted playback position + resume on fresh start)");
 }
 
 __attribute__((constructor))
