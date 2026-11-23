@@ -135,7 +135,8 @@ static NSString *RNDJbRoot(void) {
 #pragma mark - 洗牌队列(不连续重复)
 
 @interface RNDQueue : NSObject
-@property (nonatomic, strong) NSArray *order;      // 当前轮的顺序(路径)
+@property (nonatomic, strong) NSArray *order;      // 当前轮的顺序(路径, 随机模式会被洗牌)
+@property (nonatomic, strong) NSArray *source;     // 构建队列时的原始素材列表(变化检测用, 与洗牌无关)
 @property (nonatomic, assign) NSUInteger idx;       // 当前播放下标
 @property (nonatomic, copy) NSString *lastPath;     // 上一条(防止跨轮连播同一条)
 @property (nonatomic, copy) NSString *mode;         // "order" 顺序 / "random" 洗牌
@@ -147,6 +148,7 @@ static NSString *RNDJbRoot(void) {
 - (instancetype)initWithItems:(NSArray *)items mode:(NSString *)m {
     if ((self = [super init])) {
         _order = [items copy] ?: @[];
+        _source = [items copy] ?: @[];
         _mode = [m copy] ?: @"random";
         _idx = 0;
     }
@@ -487,7 +489,7 @@ static void RNDApplyForView(id view, BOOL isBack) {
                 if (lay.player != player) lay.player = player;
                 st.backEnabled = YES; // 播完推进需要
                 RNDQueue *q = st.backQueue;
-                if (!q || ![q.order isEqualToArray:items]) {
+                if (!q || ![q.source isEqualToArray:items]) {
                     q = [[RNDQueue alloc] initWithItems:items mode:mode];
                     st.backQueue = q;
                     [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:st.observingItemBack];
@@ -562,7 +564,7 @@ static void RNDApplyForView(id view, BOOL isBack) {
         RNDDisableLooper(looper);
         RNDQueue *q = isBack ? st.backQueue : st.queue;
         // 模式或素材列表变化 -> 重建队列, 从头播
-        if (!q || ![q.mode isEqualToString:mode] || ![q.order isEqualToArray:items]) {
+        if (!q || ![q.mode isEqualToString:mode] || ![q.source isEqualToArray:items]) {
             q = [[RNDQueue alloc] initWithItems:items mode:mode];
             if (isBack) st.backQueue = q; else st.queue = q;
             [[NSNotificationCenter defaultCenter] removeObserver:st name:AVPlayerItemDidPlayToEndTimeNotification object:(isBack ? st.observingItemBack : st.observingItem)];
@@ -760,7 +762,7 @@ static void RNDInstallHooks(void) {
     // 素材目录/plist 变化监听: 播放中往目录加删文件也实时刷新队列
     RNDInstallWatchers();
 
-    RNDLog(@"installed");
+    RNDLogE(@"installed v27 (queue-rebuild fix + hide-pause)");
 }
 
 __attribute__((constructor))
